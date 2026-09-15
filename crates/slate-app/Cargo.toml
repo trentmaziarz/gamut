@@ -7,3 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui_dock = { workspace = true }
+env_logger = { workspace = true }
+image = { workspace = true }
+log = { workspace = true }
+slate-core = { path = "../slate-core" }
+slate-gpu = { path = "../slate-gpu" }
