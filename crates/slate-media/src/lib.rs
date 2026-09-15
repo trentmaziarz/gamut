@@ -4,6 +4,10 @@
 //! rawler covers RAW, and the image crate covers JPEG and PNG. cpal plays back
 //! and rubato resamples. A frame cache runs per source, and optional 1080p
 //! proxies are generated on import for 4K sources.
+//!
+//! The [`fixtures`] module locates the sample photos the tests open.
+
+pub mod fixtures;
 
 #[cfg(test)]
 mod tests {
