@@ -12,10 +12,33 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Point at the runner's vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "VCPKGRS_DYNAMIC=1" >> $env:GITHUB_ENV
+          "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin" >> $env:GITHUB_PATH
+      - name: Restore libheif
+        id: libheif
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}\installed
+          key: vcpkg-libheif-core-x64-windows-2026.07.29
+      - name: Build libheif
+        if: steps.libheif.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: vcpkg install "libheif[core]:x64-windows"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Download the fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download fixtures-m1 -p '*' -D fixtures
+          "SLATE_FIXTURES=$env:GITHUB_WORKSPACE\fixtures" >> $env:GITHUB_ENV
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint
@@ -24,3 +47,5 @@ jobs:
         run: cargo test --workspace
       - name: Build the release app
         run: cargo build --release -p slate-app
+      - name: Time the develop render
+        run: cargo test -p slate-gpu --release --test develop_timing -- --nocapture
