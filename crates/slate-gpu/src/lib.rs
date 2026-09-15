@@ -5,13 +5,16 @@
 //! draws into an offscreen texture that egui then draws as an image. The
 //! picture never leaves the GPU.
 //!
-//! In M0 the graph holds one pass, the [`test_image`] and
-//! the [`headless`] context that runs it without a window.
+//! In M0 the graph holds one pass, the [`test_image`], the [`readback`] that
+//! turns it into bytes, and the [`headless`] context that runs both without
+//! a window.
 
 pub mod headless;
+pub mod readback;
 pub mod test_image;
 
 pub use headless::Headless;
+pub use readback::Readback;
 pub use test_image::TestImage;
 
 /// A fullscreen triangle: three vertices, no vertex buffer. Every pass that
