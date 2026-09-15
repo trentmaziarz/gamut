@@ -107,6 +107,8 @@ impl eframe::App for SlateApp {
         DockArea::new(&mut self.dock)
             .style(style)
             .show_close_buttons(false)
+            .show_leaf_close_all_buttons(false)
+            .show_leaf_collapse_buttons(false)
             .show_inside(ui, &mut tabs);
     }
 }
