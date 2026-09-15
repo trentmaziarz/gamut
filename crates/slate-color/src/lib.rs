@@ -5,7 +5,16 @@
 //! through moxcms. It also holds ACEScct, the log encoding slate runs its
 //! curves and wheels in. Every operator in this crate is the reference its
 //! GPU shader is tested against.
+//!
+//! In M1: [`matrices`], [`transfer`], [`bradford`], [`daylight`], the six
+//! Basic operators in [`basic`], and the ICC classifier in [`icc`].
 
+pub mod basic;
+pub mod bradford;
+pub mod daylight;
 pub mod icc;
+pub mod matrices;
+pub mod transfer;
 
 pub use icc::SourceSpace;
+pub use matrices::Mat3;

@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod crop;
+
+pub use crop::{Crop, CropAspect, CropRect};
+
 /// The edit parameters of one photo: the Basic panel of M1.
 ///
 /// Every field is a slider. Zero is the neutral position for each of them,
