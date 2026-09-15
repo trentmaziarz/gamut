@@ -1,0 +1,9 @@
+[package]
+name = "slate-media"
+description = "Decode and encode: ffmpeg with NVDEC and NVENC, HEIC, RAW, JPEG, PNG, audio playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

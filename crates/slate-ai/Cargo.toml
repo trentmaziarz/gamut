@@ -1,0 +1,12 @@
+[package]
+name = "slate-ai"
+description = "ONNX Runtime through DirectML for subject masks, and whisper for captions, behind a feature flag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+[features]
+default = []
+ai = []

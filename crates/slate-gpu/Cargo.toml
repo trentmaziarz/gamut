@@ -1,0 +1,9 @@
+[package]
+name = "slate-gpu"
+description = "wgpu render graph and WGSL shaders: the offscreen frame egui draws and the readback for export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
