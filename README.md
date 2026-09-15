@@ -6,12 +6,13 @@ and DaVinci Resolve to post a 4:5 still and a 9:16 reel on Instagram, without a
 subscription. The photo editor and the video editor are the same program. slate
 runs on Windows only and is written in Rust.
 
-slate is pre-release, milestone 0: the window opens and draws a test image,
-nothing edits yet. The test image is a red-to-blue gradient under a
-checkerboard. A milestone is a tagged release that adds something a user can do,
-and milestone 0 is the first of the nine that make version 0.1. The design
-document at docs/design.md in this repository lists all nine. Bugs and questions
-go to the issues page at github.com/trentmaziarz/slate.
+slate is pre-release, milestone 1: a phone photo opens, the Basic sliders
+develop it and it exports as a JPEG for Instagram. With no photo open the window
+shows the test image, a red-to-blue gradient under a checkerboard. A milestone is
+a tagged release that adds something a user can do, and milestone 1 is the second
+of the nine, numbered 0 to 8, that make version 0.1. The design document at
+docs/design.md in this repository lists all nine. Bugs and questions go to the
+issues page at github.com/trentmaziarz/slate.
 
 ## Build from source
 
@@ -19,11 +20,15 @@ go to the issues page at github.com/trentmaziarz/slate.
 2. Install Rust stable through rustup.
 3. Install Visual Studio Build Tools 2022 with the "Desktop development with C++"
    workload, which supplies the MSVC linker and the Windows SDK.
-4. Run `cargo run -p slate-app` to open the window.
-5. Run `cargo test --workspace` to run the tests.
+4. Install vcpkg in a folder of your choice, run
+   `vcpkg install libheif[core]:x64-windows`, set VCPKG_ROOT to that folder, set
+   VCPKGRS_DYNAMIC to 1, and add the `installed\x64-windows\bin` folder under it
+   to PATH.
+5. `cargo run -p slate-app` opens the window.
+6. `cargo test --workspace` runs the tests.
 
-`cargo run -p slate-app -- --screenshot out.png` renders the test image to a PNG.
-Scripts and the build use it to see the picture without opening a window.
+`cargo run -p slate-app -- --screenshot out.png` renders the test image to a PNG,
+which is how scripts and the build see the picture without opening a window.
 
 ## License
 
