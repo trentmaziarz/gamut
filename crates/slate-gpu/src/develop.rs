@@ -513,6 +513,15 @@ impl Develop {
     }
 }
 
+/// The size to render the whole photo at so that `crop` lands on an output
+/// of `output` pixels one to one.
+pub fn render_size_for_crop(crop: CropRect, output: (u32, u32)) -> (u32, u32) {
+    (
+        (output.0 as f32 / crop.width.max(1e-6)).round().max(1.0) as u32,
+        (output.1 as f32 / crop.height.max(1e-6)).round().max(1.0) as u32,
+    )
+}
+
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

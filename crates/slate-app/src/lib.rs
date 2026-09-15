@@ -2,11 +2,15 @@
 //! view and a Video view over the same engine, the phone-frame preview, the
 //! export dialog. Startup target is under 2 seconds.
 //!
-//! In M0 the window holds three docked tabs and the Viewer draws the
-//! slate-gpu test image. The [`screenshot`] path renders the same image
-//! without a window.
+//! In M1 the window opens a photo three ways (the command line, a dropped
+//! file, File > Open), the [`adjust`] tab binds the Basic sliders and the
+//! crop, the [`viewer`] draws the developed picture under the phone frame,
+//! and the [`screenshot`] path renders the same picture without a window.
 
+pub mod adjust;
 pub mod app;
 pub mod screenshot;
+pub mod sidecar;
+pub mod viewer;
 
 pub use app::{SlateApp, WINDOW_TITLE, native_options};

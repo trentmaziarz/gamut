@@ -14,5 +14,8 @@ egui_dock = { workspace = true }
 env_logger = { workspace = true }
 image = { workspace = true }
 log = { workspace = true }
+rfd = { workspace = true }
+slate-color = { path = "../slate-color" }
 slate-core = { path = "../slate-core" }
 slate-gpu = { path = "../slate-gpu" }
+slate-media = { path = "../slate-media" }
