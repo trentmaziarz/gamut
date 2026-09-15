@@ -6,11 +6,6 @@
 //! curves and wheels in. Every operator in this crate is the reference its
 //! GPU shader is tested against.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_links() {
-        // The crate compiles and its test harness runs. Real tests arrive
-        // with the milestone that fills the crate.
-    }
-}
+pub mod icc;
+
+pub use icc::SourceSpace;

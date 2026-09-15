@@ -5,15 +5,10 @@
 //! and rubato resamples. A frame cache runs per source, and optional 1080p
 //! proxies are generated on import for 4K sources.
 //!
-//! The [`fixtures`] module locates the sample photos the tests open.
+//! In M1 the [`photo`] module opens JPEG, PNG and HEIC as oriented RGBA and
+//! the [`fixtures`] module locates the sample photos the tests open.
 
 pub mod fixtures;
+pub mod photo;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_links() {
-        // The crate compiles and its test harness runs. Real tests arrive
-        // with the milestone that fills the crate.
-    }
-}
+pub use photo::{Photo, PhotoError, SourceSpace, open_photo};

@@ -7,3 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+image = { workspace = true }
+libheif-rs = { workspace = true }
+log = { workspace = true }
+slate-color = { path = "../slate-color" }
+thiserror = { workspace = true }
