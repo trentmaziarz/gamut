@@ -1,6 +1,8 @@
 //! 3 by 3 matrices and the RGB to XYZ matrices of the spaces M1 meets. All
 //! three are the D65 versions, so no adaptation sits between them.
 
+use std::ops::Mul;
+
 use crate::SourceSpace;
 
 /// A 3 by 3 matrix, row major, kept in f64 so that products and inverses
@@ -19,17 +21,6 @@ impl Mat3 {
     /// From f32 rows, as an ICC matrix arrives.
     pub fn from_rows_f32(rows: [[f32; 3]; 3]) -> Mat3 {
         Mat3(rows.map(|row| row.map(f64::from)))
-    }
-
-    /// `self` times `other`: apply `other` first, then `self`.
-    pub fn mul(self, other: Mat3) -> Mat3 {
-        let mut out = [[0.0; 3]; 3];
-        for (r, row) in out.iter_mut().enumerate() {
-            for (c, value) in row.iter_mut().enumerate() {
-                *value = (0..3).map(|k| self.0[r][k] * other.0[k][c]).sum();
-            }
-        }
-        Mat3(out)
     }
 
     /// The matrix applied to a column vector.
@@ -94,6 +85,21 @@ impl Mat3 {
     }
 }
 
+impl Mul for Mat3 {
+    type Output = Mat3;
+
+    /// `self` times `other`: apply `other` first, then `self`.
+    fn mul(self, other: Mat3) -> Mat3 {
+        let mut out = [[0.0; 3]; 3];
+        for (r, row) in out.iter_mut().enumerate() {
+            for (c, value) in row.iter_mut().enumerate() {
+                *value = (0..3).map(|k| self.0[r][k] * other.0[k][c]).sum();
+            }
+        }
+        Mat3(out)
+    }
+}
+
 /// sRGB (and Rec.709) linear RGB to XYZ, D65.
 pub const SRGB_TO_XYZ: Mat3 = Mat3([
     [0.4123908, 0.3575843, 0.1804808],
@@ -128,15 +134,15 @@ pub fn xyz_to_rec2020() -> Mat3 {
 }
 
 pub fn srgb_to_rec2020() -> Mat3 {
-    xyz_to_rec2020().mul(SRGB_TO_XYZ)
+    xyz_to_rec2020() * SRGB_TO_XYZ
 }
 
 pub fn display_p3_to_rec2020() -> Mat3 {
-    xyz_to_rec2020().mul(DISPLAY_P3_TO_XYZ)
+    xyz_to_rec2020() * DISPLAY_P3_TO_XYZ
 }
 
 pub fn rec2020_to_srgb() -> Mat3 {
-    xyz_to_srgb().mul(REC2020_TO_XYZ)
+    xyz_to_srgb() * REC2020_TO_XYZ
 }
 
 /// The matrix from a source space's linear RGB to linear Rec.2020.
@@ -171,13 +177,13 @@ mod tests {
     #[test]
     fn a_matrix_times_its_inverse_is_the_identity() {
         for m in [SRGB_TO_XYZ, DISPLAY_P3_TO_XYZ, REC2020_TO_XYZ] {
-            assert_near(m.mul(m.inverse()), Mat3::IDENTITY, 1e-9);
+            assert_near(m * m.inverse(), Mat3::IDENTITY, 1e-9);
         }
     }
 
     #[test]
     fn srgb_round_trips_through_rec2020() {
-        let there_and_back = rec2020_to_srgb().mul(srgb_to_rec2020());
+        let there_and_back = rec2020_to_srgb() * srgb_to_rec2020();
         assert_near(there_and_back, Mat3::IDENTITY, 1e-6);
         let px = srgb_to_rec2020().apply([0.2, 0.5, 0.9]);
         let back = rec2020_to_srgb().apply(px);

@@ -16,7 +16,7 @@ pub fn adaptation(source_white: [f64; 3], destination_white: [f64; 3]) -> Mat3 {
     let s = BRADFORD.apply_f64(source_white);
     let d = BRADFORD.apply_f64(destination_white);
     let scale = Mat3::diagonal([d[0] / s[0], d[1] / s[1], d[2] / s[2]]);
-    BRADFORD.inverse().mul(scale).mul(BRADFORD)
+    BRADFORD.inverse() * scale * BRADFORD
 }
 
 #[cfg(test)]
@@ -56,9 +56,9 @@ mod tests {
             [-0.0282895, 1.0099416, 0.0210077],
             [0.0122982, -0.0204830, 1.3299098],
         ];
-        for r in 0..3 {
-            for c in 0..3 {
-                assert!((m.0[r][c] - published[r][c]).abs() < 1e-3, "{m:?}");
+        for (row, expected) in m.0.iter().zip(published) {
+            for (value, wanted) in row.iter().zip(expected) {
+                assert!((value - wanted).abs() < 1e-3, "{m:?}");
             }
         }
     }

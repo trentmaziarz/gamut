@@ -83,9 +83,7 @@ pub fn white_balance_matrix(temperature: f32, tint: f32) -> Mat3 {
     let y = y + f64::from(tint) / 100.0 * TINT_RANGE;
     let (nx, ny) = daylight_xy(NEUTRAL_CCT);
     let adapt = bradford::adaptation(xyz_from_xy(x, y), xyz_from_xy(nx, ny));
-    matrices::xyz_to_rec2020()
-        .mul(adapt)
-        .mul(matrices::REC2020_TO_XYZ)
+    matrices::xyz_to_rec2020() * adapt * matrices::REC2020_TO_XYZ
 }
 
 /// White balance: see [`white_balance_matrix`].
