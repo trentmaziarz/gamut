@@ -5,14 +5,16 @@
 //! draws into an offscreen texture that egui then draws as an image. The
 //! picture never leaves the GPU.
 //!
-//! In M0 the graph holds one pass, the [`test_image`], the [`readback`] that
-//! turns it into bytes, and the [`headless`] context that runs both without
-//! a window.
+//! M0 added the [`test_image`] pass, the [`readback`] that turns a texture
+//! into bytes, and the [`headless`] context that runs without a window. M1
+//! adds the [`develop`] graph that turns a photo into a picture.
 
+pub mod develop;
 pub mod headless;
 pub mod readback;
 pub mod test_image;
 
+pub use develop::Develop;
 pub use headless::Headless;
 pub use readback::Readback;
 pub use test_image::TestImage;

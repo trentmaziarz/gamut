@@ -2361,8 +2361,13 @@ dependencies = [
 name = "slate-gpu"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
+ "half",
  "log",
  "pollster 0.4.0",
+ "slate-color",
+ "slate-core",
+ "slate-media",
  "wgpu",
 ]
 
