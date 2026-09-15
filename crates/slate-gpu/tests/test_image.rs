@@ -31,7 +31,7 @@ fn test_image_reads_back_as_a_gradient_under_a_checker() {
     // cell on the right edge sits in row 0 or row 32 depending on how
     // many cells fit across.
     let right_column_cell = (WIDTH - 1) / CHECKER_CELL;
-    let right_bright_row = if right_column_cell % 2 == 0 {
+    let right_bright_row = if right_column_cell.is_multiple_of(2) {
         0
     } else {
         CHECKER_CELL
