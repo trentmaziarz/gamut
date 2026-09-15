@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use slate_app::{SlateApp, WINDOW_TITLE, native_options, screenshot};
+use slate_app::{SlateApp, WINDOW_TITLE, export, native_options, screenshot};
+use slate_core::ExportPreset;
 
 const USAGE: &str = "usage: slate-app [<photo>]
-       slate-app [--open <photo>] --screenshot <out.png> [--edit <sidecar.json>]";
+       slate-app [--open <photo>] --screenshot <out.png> [--edit <sidecar.json>]
+       slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [--edit <sidecar.json>]";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -16,6 +18,12 @@ enum Command {
         edit: Option<PathBuf>,
         out: PathBuf,
     },
+    Export {
+        photo: PathBuf,
+        edit: Option<PathBuf>,
+        preset: ExportPreset,
+        out: PathBuf,
+    },
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
@@ -23,6 +31,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     let mut photo = None;
     let mut edit = None;
     let mut screenshot = None;
+    let mut export = None;
     while let Some(arg) = args.next() {
         let mut value = |slot: &mut Option<PathBuf>| match args.next() {
             Some(path) if slot.is_none() => {
@@ -35,15 +44,33 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             "--open" => value(&mut photo)?,
             "--screenshot" => value(&mut screenshot)?,
             "--edit" => value(&mut edit)?,
+            "--export" => {
+                let preset = args.next().and_then(|p| ExportPreset::parse(&p));
+                match (preset, args.next(), &export) {
+                    (Some(preset), Some(out), None) => {
+                        export = Some((preset, PathBuf::from(out)));
+                    }
+                    _ => return Err(USAGE),
+                }
+            }
             flag if flag.starts_with("--") => return Err(USAGE),
             path if photo.is_none() => photo = Some(PathBuf::from(path)),
             _ => return Err(USAGE),
         }
     }
-    match (screenshot, edit) {
-        (Some(out), edit) => Ok(Command::Screenshot { photo, edit, out }),
-        (None, None) => Ok(Command::Window { photo }),
-        (None, Some(_)) => Err(USAGE),
+    match (screenshot, export, edit) {
+        (Some(out), None, edit) => Ok(Command::Screenshot { photo, edit, out }),
+        (None, Some((preset, out)), edit) => match photo {
+            Some(photo) => Ok(Command::Export {
+                photo,
+                edit,
+                preset,
+                out,
+            }),
+            None => Err(USAGE),
+        },
+        (None, None, None) => Ok(Command::Window { photo }),
+        _ => Err(USAGE),
     }
 }
 
@@ -66,6 +93,14 @@ fn main() -> ExitCode {
         Command::Screenshot {
             photo: None, out, ..
         } => screenshot::write(&out).map_err(|error| error.to_string()),
+        Command::Export {
+            photo,
+            edit,
+            preset,
+            out,
+        } => {
+            export::write(&photo, edit.as_deref(), preset, &out).map_err(|error| error.to_string())
+        }
         Command::Window { photo } => eframe::run_native(
             WINDOW_TITLE,
             native_options(),
@@ -85,6 +120,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{Command, parse};
+    use slate_core::ExportPreset;
     use std::path::PathBuf;
 
     fn parsed(args: &[&str]) -> Result<Command, &'static str> {
@@ -134,10 +170,27 @@ mod tests {
     }
 
     #[test]
+    fn export_takes_a_preset_and_a_path() {
+        assert_eq!(
+            parsed(&["--open", "a.heic", "--export", "9x16", "o.jpg"]),
+            Ok(Command::Export {
+                photo: PathBuf::from("a.heic"),
+                edit: None,
+                preset: ExportPreset::Story9x16,
+                out: PathBuf::from("o.jpg"),
+            })
+        );
+        assert!(parsed(&["--export", "9x16", "o.jpg"]).is_err());
+        assert!(parsed(&["--open", "a.heic", "--export", "16x9", "o.jpg"]).is_err());
+        assert!(parsed(&["--open", "a.heic", "--export", "9x16"]).is_err());
+    }
+
+    #[test]
     fn bad_arguments_print_the_usage() {
         assert!(parsed(&["--screenshot"]).is_err());
         assert!(parsed(&["--edit", "e.json"]).is_err());
         assert!(parsed(&["a.jpg", "b.jpg"]).is_err());
         assert!(parsed(&["--nope"]).is_err());
+        assert!(parsed(&["--screenshot", "o.png", "--export", "4x5", "o.jpg"]).is_err());
     }
 }

@@ -10,9 +10,11 @@
 use serde::{Deserialize, Serialize};
 
 pub mod crop;
+pub mod export;
 pub mod sidecar;
 
 pub use crop::{Crop, CropAspect, CropRect};
+pub use export::ExportPreset;
 pub use sidecar::Sidecar;
 
 /// The edit parameters of one photo: the Basic panel of M1.

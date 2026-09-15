@@ -23,10 +23,10 @@ use bytemuck::{Pod, Zeroable};
 use slate_color::SourceSpace;
 use slate_color::basic;
 use slate_color::matrices;
-use slate_core::{CropRect, PhotoEdit};
+use slate_core::{CropRect, ExportPreset, PhotoEdit};
 use slate_media::Photo;
 
-use crate::{FULLSCREEN_VERTICES, fullscreen_primitive};
+use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
 /// The working-space format: linear Rec.2020 in half floats.
 pub const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -162,11 +162,13 @@ pub struct Develop {
     develop_uniform: wgpu::Buffer,
     output_uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    readback: Readback,
     source: Option<Source>,
     frame: Option<Frame>,
     out: Option<Output>,
     generation: u64,
     frame_generation: u64,
+    out_generation: u64,
 }
 
 impl Develop {
@@ -230,11 +232,13 @@ impl Develop {
             develop_uniform: uniform("develop uniform", size_of::<DevelopUniform>() as u64),
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
             sampler,
+            readback: Readback::new(device),
             source: None,
             frame: None,
             out: None,
             generation: 0,
             frame_generation: 0,
+            out_generation: 0,
         }
     }
 
@@ -423,6 +427,7 @@ impl Develop {
                 bind,
                 frame_generation: self.frame_generation,
             });
+            self.out_generation += 1;
         }
         let out = self.out.as_ref().expect("output built above");
         self.queue.write_buffer(
@@ -452,6 +457,109 @@ impl Develop {
     /// The size of the last output.
     pub fn output_size(&self) -> Option<(u32, u32)> {
         self.out.as_ref().map(|o| (o.target.width, o.target.height))
+    }
+
+    /// Counts up every time the output texture is replaced, so a caller
+    /// that registered the view elsewhere knows to register it again.
+    pub fn output_generation(&self) -> u64 {
+        self.out_generation
+    }
+
+    /// Renders `crop` at the full source resolution, resamples it to the
+    /// preset's size with linear filtering (halving first while the ratio
+    /// is above 2, so no step skips pixels) and reads it back as sRGB RGBA
+    /// bytes. Returns `None` when no source is set. The viewer's frame is
+    /// replaced by the full-size one, so the next viewer render rebuilds.
+    pub fn render_export(
+        &mut self,
+        edit: &PhotoEdit,
+        crop: CropRect,
+        preset: ExportPreset,
+    ) -> Option<Vec<u8>> {
+        let (source_width, source_height) = self.source_size()?;
+        let crop_size = crop.pixel_size(source_width, source_height);
+        self.render(edit, crop, (source_width, source_height), crop_size)?;
+        let target = preset.size();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("export encoder"),
+            });
+        let mut view = self.out.as_ref()?.target.view.clone();
+        let mut size = crop_size;
+        let mut steps = Vec::new();
+        while size.0 > target.0 * 2 && size.1 > target.1 * 2 {
+            size = (size.0.div_ceil(2), size.1.div_ceil(2));
+            let step = self.resample(&mut encoder, &view, size);
+            view = step.0.view.clone();
+            steps.push(step);
+        }
+        let last = self.resample(&mut encoder, &view, target);
+        steps.push(last);
+        self.queue.submit(Some(encoder.finish()));
+        let (final_target, _, _) = steps.last().expect("at least one step");
+        log::info!(
+            "exported {crop_size:?} of {source_width}x{source_height} to {target:?} in {} steps",
+            steps.len()
+        );
+        Some(self.readback.read(
+            &self.device,
+            &self.queue,
+            &final_target.view,
+            target.0,
+            target.1,
+        ))
+    }
+
+    /// One linear resample of `source` into a new sRGB target of `size`,
+    /// through the output pass with the identity matrix.
+    fn resample(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        size: (u32, u32),
+    ) -> (Target, wgpu::Buffer, wgpu::BindGroup) {
+        let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resample uniform"),
+            size: size_of::<OutputUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(
+            &uniform,
+            0,
+            bytemuck::bytes_of(&OutputUniform {
+                matrix: matrices::Mat3::IDENTITY.to_wgsl_columns(),
+                crop: [0.0, 0.0, 1.0, 1.0],
+            }),
+        );
+        let target = create_target(
+            &self.device,
+            "resample target",
+            OUTPUT_FORMAT,
+            size.0,
+            size.1,
+        );
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resample bind group"),
+            layout: &self.output.layout,
+            entries: &[
+                buffer_binding(0, &uniform),
+                texture_binding(1, source),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        draw(
+            encoder,
+            "resample",
+            &self.output.pipeline,
+            &bind,
+            &target.view,
+        );
+        (target, uniform, bind)
     }
 
     fn build_frame(&self, source: &Source, width: u32, height: u32) -> Frame {

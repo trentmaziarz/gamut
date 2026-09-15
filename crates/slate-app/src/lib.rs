@@ -5,10 +5,14 @@
 //! In M1 the window opens a photo three ways (the command line, a dropped
 //! file, File > Open), the [`adjust`] tab binds the Basic sliders and the
 //! crop, the [`viewer`] draws the developed picture under the phone frame,
-//! and the [`screenshot`] path renders the same picture without a window.
+//! the edit is saved as a [`sidecar`] next to the photo, and the
+//! [`screenshot`] and [`export`] paths render the same picture without a
+//! window.
 
 pub mod adjust;
 pub mod app;
+pub mod export;
+pub mod headless;
 pub mod screenshot;
 pub mod sidecar;
 pub mod viewer;

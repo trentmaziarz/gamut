@@ -6,7 +6,7 @@ use egui::load::SizedTexture;
 use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind};
 use egui_wgpu::RenderState;
 use egui_wgpu::wgpu;
-use slate_core::{CropAspect, CropRect};
+use slate_core::{CropAspect, CropRect, ExportPreset, PhotoEdit};
 use slate_gpu::{Develop, TestImage};
 use slate_media::Photo;
 
@@ -26,7 +26,8 @@ pub const SAFE_ZONE: (f32, f32, f32) = (0.14, 0.35, 0.06);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shown {
     Placeholder((u32, u32)),
-    Photo((u32, u32)),
+    /// The developed photo at a pixel size, from a given output texture.
+    Photo((u32, u32), u64),
 }
 
 /// The offscreen picture and the egui texture that shows it.
@@ -63,6 +64,17 @@ impl Viewer {
         self.develop.set_source(photo);
     }
 
+    /// Renders the crop for a preset at full resolution and returns the
+    /// sRGB bytes, on the same device the viewer draws with.
+    pub fn export(
+        &mut self,
+        edit: &PhotoEdit,
+        crop: CropRect,
+        preset: ExportPreset,
+    ) -> Option<Vec<u8>> {
+        self.develop.render_export(edit, crop, preset)
+    }
+
     /// Draws the picture at the largest size of its aspect that fits the
     /// tab, then the crop and the frame over it. The develop graph runs
     /// only when the session is dirty or the pixel size changed.
@@ -92,25 +104,27 @@ impl Viewer {
     }
 
     fn show_photo(&mut self, wanted: (u32, u32), session: &mut Session) {
-        let resized = self.shown != Shown::Photo(wanted);
-        if !resized && !session.develop_dirty {
+        let current = Shown::Photo(wanted, self.develop.output_generation());
+        if self.shown == current && !session.develop_dirty {
             return;
         }
         let view = self
             .develop
             .render(&session.edit, CropRect::FULL, wanted, wanted)
-            .expect("a photo is set");
-        if resized {
+            .expect("a photo is set")
+            .clone();
+        let now = Shown::Photo(wanted, self.develop.output_generation());
+        if self.shown != now {
             self.render_state
                 .renderer
                 .write()
                 .update_egui_texture_from_wgpu_texture(
                     &self.render_state.device,
-                    view,
+                    &view,
                     wgpu::FilterMode::Linear,
                     self.texture_id,
                 );
-            self.shown = Shown::Photo(wanted);
+            self.shown = now;
         }
         session.develop_dirty = false;
     }
