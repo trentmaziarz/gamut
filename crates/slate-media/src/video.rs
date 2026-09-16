@@ -27,53 +27,7 @@ pub enum Decoder {
     Software,
 }
 
-/// The layout of a decoded frame's planes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlaneFormat {
-    /// 8 bit luma, then interleaved 8 bit Cb and Cr at half size.
-    Nv12,
-    /// 16 bit words holding 10 bit luma, then interleaved Cb and Cr.
-    P010,
-}
-
-impl PlaneFormat {
-    /// Bytes per sample in each plane.
-    pub fn bytes_per_sample(self) -> usize {
-        match self {
-            PlaneFormat::Nv12 => 1,
-            PlaneFormat::P010 => 2,
-        }
-    }
-}
-
-/// The YCbCr matrix and the primaries of a stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum YuvSpace {
-    /// BT.709, the SDR default; its primaries equal sRGB's.
-    Bt709,
-    /// BT.2020, what phone HDR clips carry.
-    Bt2020,
-}
-
-/// The transfer function of a stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transfer {
-    /// BT.709 or unspecified: decoded with the sRGB curve as the photos are.
-    Sdr,
-    /// Hybrid log gamma, ARIB STD-B67, what iPhones record.
-    Hlg,
-    /// PQ, SMPTE ST 2084. Decoded as HLG until T-8 lands the tone map.
-    Pq,
-}
-
-/// The colour tags of a stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VideoColour {
-    pub space: YuvSpace,
-    pub transfer: Transfer,
-    /// Full range (0 to 255) rather than the limited 16 to 235.
-    pub full_range: bool,
-}
+pub use slate_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace};
 
 /// One decoded frame in system memory, planes tightly packed.
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +60,26 @@ impl VideoFrame {
             self.sample(&self.uv, self.uv_stride, 2 * x, y),
             self.sample(&self.uv, self.uv_stride, 2 * x + 1, y),
         )
+    }
+
+    /// The luma code at `x`, `y` in the plane's bit depth: 0 to 255 for
+    /// NV12, 0 to 1023 for P010.
+    pub fn luma_code(&self, x: u32, y: u32) -> u32 {
+        self.code(self.luma(x, y))
+    }
+
+    /// The Cb and Cr codes of the chroma block at `x`, `y` in the plane's
+    /// bit depth.
+    pub fn chroma_code(&self, x: u32, y: u32) -> (u32, u32) {
+        let (cb, cr) = self.chroma(x, y);
+        (self.code(cb), self.code(cr))
+    }
+
+    fn code(&self, word: u16) -> u32 {
+        match self.format {
+            PlaneFormat::Nv12 => u32::from(word),
+            PlaneFormat::P010 => u32::from(word >> 6),
+        }
     }
 
     fn sample(&self, plane: &[u8], stride: usize, x: u32, y: u32) -> u16 {

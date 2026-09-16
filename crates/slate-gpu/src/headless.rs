@@ -22,6 +22,7 @@ impl Headless {
             request_adapter(&instance, false).or_else(|| request_adapter(&instance, true))?;
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("slate headless device"),
+            required_features: crate::video::wanted_features(&adapter),
             ..Default::default()
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).ok()?;

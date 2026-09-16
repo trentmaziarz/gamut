@@ -7,12 +7,15 @@
 //!
 //! M0 added the [`test_image`] pass, the [`readback`] that turns a texture
 //! into bytes, and the [`headless`] context that runs without a window. M1
-//! adds the [`develop`] graph that turns a photo into a picture.
+//! adds the [`develop`] graph that turns a photo into a picture. M2 adds
+//! the [`video`] planes and the YUV pass that lets a decoded frame stand in
+//! for the photo at the head of the same graph.
 
 pub mod develop;
 pub mod headless;
 pub mod readback;
 pub mod test_image;
+pub mod video;
 
 pub use develop::Develop;
 pub use headless::Headless;

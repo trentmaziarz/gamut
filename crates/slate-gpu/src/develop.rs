@@ -18,14 +18,23 @@
 //!
 //! Passes 2 and 3 depend only on the source and the render size, so they
 //! run again only when one of those changes. A slider change runs 4 and 5.
+//!
+//! M2 lets a decoded video frame stand in for the photo: the source is
+//! then the two plane textures of [`crate::video::VideoSource`] and pass 2
+//! is `yuv_to_working.wgsl`, which writes the same linear Rec.2020 working
+//! texture. Passes 3 to 5 do not know the difference. A new frame of the
+//! same size rewrites the planes and reruns passes 2 and 3 without
+//! rebuilding any texture.
 
 use bytemuck::{Pod, Zeroable};
 use slate_color::SourceSpace;
 use slate_color::basic;
 use slate_color::matrices;
+use slate_color::video::VideoColour;
 use slate_core::{CropRect, ExportPreset, PhotoEdit};
-use slate_media::Photo;
+use slate_media::{Photo, VideoFrame};
 
+use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
 /// The working-space format: linear Rec.2020 in half floats.
@@ -118,12 +127,26 @@ struct Target {
     height: u32,
 }
 
+/// What the head of the graph reads.
+enum SourceKind {
+    /// A photo's RGBA texture, through the input transform.
+    Photo {
+        view: wgpu::TextureView,
+        space: SourceSpace,
+    },
+    /// A video frame's planes, through the YUV pass.
+    Video(VideoSource),
+}
+
 struct Source {
-    view: wgpu::TextureView,
+    kind: SourceKind,
+    /// The display size: the photo's, or the frame's after its rotation.
     width: u32,
     height: u32,
-    space: SourceSpace,
+    /// Counts up when the textures are replaced.
     generation: u64,
+    /// Counts up when the content changes but the textures stay.
+    content: u64,
 }
 
 /// Everything that depends on the source and the render size.
@@ -131,6 +154,8 @@ struct Frame {
     width: u32,
     height: u32,
     generation: u64,
+    /// The source content the working and base textures hold.
+    content: u64,
     working: Target,
     ping: Target,
     base: Target,
@@ -153,10 +178,12 @@ pub struct Develop {
     device: wgpu::Device,
     queue: wgpu::Queue,
     input: Pass,
+    video: Pass,
     blur: Pass,
     develop: Pass,
     output: Pass,
     input_uniform: wgpu::Buffer,
+    video_uniform: wgpu::Buffer,
     blur_h_uniform: wgpu::Buffer,
     blur_v_uniform: wgpu::Buffer,
     develop_uniform: wgpu::Buffer,
@@ -180,6 +207,18 @@ impl Develop {
             include_str!("shaders/input_transform.wgsl"),
             WORKING_FORMAT,
             &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
+        );
+        let video = make_pass(
+            device,
+            "video",
+            include_str!("shaders/yuv_to_working.wgsl"),
+            WORKING_FORMAT,
+            &[
+                uniform_entry(0),
+                texture_entry(1),
+                texture_entry(2),
+                sampler_entry(3),
+            ],
         );
         let blur = make_pass(
             device,
@@ -223,10 +262,12 @@ impl Develop {
             device: device.clone(),
             queue: queue.clone(),
             input,
+            video,
             blur,
             develop,
             output,
             input_uniform: uniform("input uniform", size_of::<InputUniform>() as u64),
+            video_uniform: uniform("video uniform", size_of::<VideoUniform>() as u64),
             blur_h_uniform: uniform("blur h uniform", size_of::<BlurUniform>() as u64),
             blur_v_uniform: uniform("blur v uniform", size_of::<BlurUniform>() as u64),
             develop_uniform: uniform("develop uniform", size_of::<DevelopUniform>() as u64),
@@ -282,11 +323,14 @@ impl Develop {
         );
         self.generation += 1;
         self.source = Some(Source {
-            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            kind: SourceKind::Photo {
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                space: photo.source,
+            },
             width: photo.width,
             height: photo.height,
-            space: photo.source,
             generation: self.generation,
+            content: self.generation,
         });
         self.frame = None;
         log::info!(
@@ -295,6 +339,62 @@ impl Develop {
             photo.height,
             photo.source
         );
+    }
+
+    /// Uploads a decoded video frame as the source. The plane textures are
+    /// kept between frames of one size and format; a frame of another
+    /// size, format, colour or rotation replaces them.
+    pub fn set_video_frame(&mut self, frame: &VideoFrame, colour: VideoColour, rotation: u32) {
+        let reuse = matches!(
+            &self.source,
+            Some(Source {
+                kind: SourceKind::Video(planes),
+                ..
+            }) if planes.accepts(frame) && planes.colour == colour && planes.rotation == rotation
+        );
+        if !reuse {
+            let planes = VideoSource::new(
+                &self.device,
+                frame.width,
+                frame.height,
+                frame.format,
+                colour,
+                rotation,
+            );
+            let (width, height) = planes.display_size();
+            self.generation += 1;
+            self.source = Some(Source {
+                kind: SourceKind::Video(planes),
+                width,
+                height,
+                generation: self.generation,
+                content: 0,
+            });
+            self.frame = None;
+            log::info!(
+                "develop video source set: {}x{} {:?} rotation {rotation} {colour:?}",
+                frame.width,
+                frame.height,
+                frame.format
+            );
+        }
+        let source = self.source.as_mut().expect("set above");
+        let SourceKind::Video(planes) = &source.kind else {
+            unreachable!("the source is the video planes");
+        };
+        planes.upload(&self.queue, frame);
+        source.content += 1;
+    }
+
+    /// Whether the source is a video frame.
+    pub fn has_video(&self) -> bool {
+        matches!(
+            &self.source,
+            Some(Source {
+                kind: SourceKind::Video(_),
+                ..
+            })
+        )
     }
 
     /// The size of the source photo, when one is set.
@@ -324,22 +424,45 @@ impl Develop {
         let stale = self.frame.as_ref().is_none_or(|f| {
             (f.width, f.height, f.generation) != (width, height, source.generation)
         });
+        let rerun = stale
+            || self
+                .frame
+                .as_ref()
+                .is_some_and(|f| f.content != source.content);
         if stale {
-            let frame = self.build_frame(source, width, height);
-            let taps = (source.width as f32 / width as f32)
-                .max(source.height as f32 / height as f32)
-                .ceil()
-                .clamp(1.0, MAX_TAPS as f32) as u32;
-            self.queue.write_buffer(
-                &self.input_uniform,
-                0,
-                bytemuck::bytes_of(&InputUniform {
-                    matrix: matrices::input_matrix(source.space).to_wgsl_columns(),
-                    render_size: [width as f32, height as f32],
-                    decode_srgb: 1,
-                    taps,
-                }),
-            );
+            self.frame = Some(self.build_frame(source, width, height));
+            self.frame_generation += 1;
+        }
+        if rerun {
+            let frame = self.frame.as_mut().expect("frame built above");
+            frame.content = source.content;
+            let (head_pipeline, head_label) = match &source.kind {
+                SourceKind::Photo { space, .. } => {
+                    let taps = (source.width as f32 / width as f32)
+                        .max(source.height as f32 / height as f32)
+                        .ceil()
+                        .clamp(1.0, MAX_TAPS as f32) as u32;
+                    self.queue.write_buffer(
+                        &self.input_uniform,
+                        0,
+                        bytemuck::bytes_of(&InputUniform {
+                            matrix: matrices::input_matrix(*space).to_wgsl_columns(),
+                            render_size: [width as f32, height as f32],
+                            decode_srgb: 1,
+                            taps,
+                        }),
+                    );
+                    (&self.input.pipeline, "input transform")
+                }
+                SourceKind::Video(planes) => {
+                    self.queue.write_buffer(
+                        &self.video_uniform,
+                        0,
+                        bytemuck::bytes_of(&planes.uniform()),
+                    );
+                    (&self.video.pipeline, "video")
+                }
+            };
             let sigma = basic::base_sigma(width, height);
             let radius = basic::blur_radius(sigma);
             for (buffer, direction, luma) in [
@@ -360,8 +483,8 @@ impl Develop {
             }
             draw(
                 &mut encoder,
-                "input transform",
-                &self.input.pipeline,
+                head_label,
+                head_pipeline,
                 &frame.input_bind,
                 &frame.working.view,
             );
@@ -379,8 +502,6 @@ impl Develop {
                 &frame.blur_v_bind,
                 &frame.base.view,
             );
-            self.frame_generation += 1;
-            self.frame = Some(frame);
         }
         let frame = self.frame.as_ref().expect("frame built above");
 
@@ -568,18 +689,35 @@ impl Develop {
         let ping = create_target(device, "blur ping", BASE_FORMAT, width, height);
         let base = create_target(device, "base", BASE_FORMAT, width, height);
         let developed = create_target(device, "developed", WORKING_FORMAT, width, height);
-        let input_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("input bind group"),
-            layout: &self.input.layout,
-            entries: &[
-                buffer_binding(0, &self.input_uniform),
-                texture_binding(1, &source.view),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let input_bind = match &source.kind {
+            SourceKind::Photo { view, .. } => {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("input bind group"),
+                    layout: &self.input.layout,
+                    entries: &[
+                        buffer_binding(0, &self.input_uniform),
+                        texture_binding(1, view),
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                })
+            }
+            SourceKind::Video(planes) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("video bind group"),
+                layout: &self.video.layout,
+                entries: &[
+                    buffer_binding(0, &self.video_uniform),
+                    texture_binding(1, &planes.luma_view),
+                    texture_binding(2, &planes.chroma_view),
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            }),
+        };
         let blur_h_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blur h bind group"),
             layout: &self.blur.layout,
@@ -609,6 +747,8 @@ impl Develop {
             width,
             height,
             generation: source.generation,
+            // The head passes have not run into these textures yet.
+            content: source.content.wrapping_sub(1),
             working,
             ping,
             base,
