@@ -20,3 +20,6 @@ slate-color = { path = "../slate-color" }
 slate-core = { path = "../slate-core" }
 slate-gpu = { path = "../slate-gpu" }
 slate-media = { path = "../slate-media" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

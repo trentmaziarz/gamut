@@ -2619,6 +2619,7 @@ dependencies = [
  "image",
  "log",
  "rfd",
+ "serde_json",
  "slate-color",
  "slate-core",
  "slate-gpu",
