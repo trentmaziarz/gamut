@@ -28,6 +28,44 @@ jobs:
         if: steps.libheif.outputs.cache-hit != 'true'
         shell: pwsh
         run: vcpkg install "libheif[core]:x64-windows"
+      - name: Restore ffmpeg
+        id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\ffmpeg
+          key: ffmpeg-win64-lgpl-shared-autobuild-2026-09-15-13-18
+      - name: Download ffmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $tag = "autobuild-2026-09-15-13-18"
+          $zip = "ffmpeg-n9.0.1-30-g9258bacca5-win64-lgpl-shared-9.0.zip"
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/$tag/$zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath unzipped
+          $top = Get-ChildItem unzipped -Directory | Select-Object -First 1
+          Move-Item $top.FullName "$env:GITHUB_WORKSPACE\ffmpeg"
+      - name: Point at ffmpeg
+        shell: pwsh
+        run: |
+          "FFMPEG_DIR=$env:GITHUB_WORKSPACE\ffmpeg" >> $env:GITHUB_ENV
+          "$env:GITHUB_WORKSPACE\ffmpeg\bin" >> $env:GITHUB_PATH
+      - name: Point at libclang
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Program Files\LLVM\bin\libclang.dll") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+            "libclang: the runner's LLVM"
+          } else {
+            python -m pip download libclang --no-deps -d libclang-wheel
+            $wheel = Get-ChildItem libclang-wheel\*.whl | Select-Object -First 1
+            Copy-Item $wheel.FullName libclang-wheel\libclang.zip
+            Expand-Archive libclang-wheel\libclang.zip -DestinationPath libclang-wheel\unpacked
+            New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\libclang" | Out-Null
+            $dll = Get-ChildItem -Recurse libclang-wheel\unpacked -Filter libclang.dll | Select-Object -First 1
+            Copy-Item $dll.FullName "$env:GITHUB_WORKSPACE\libclang\libclang.dll"
+            "LIBCLANG_PATH=$env:GITHUB_WORKSPACE\libclang" >> $env:GITHUB_ENV
+            "libclang: the wheel"
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,6 +76,7 @@ jobs:
         shell: pwsh
         run: |
           gh release download fixtures-m1 -p '*' -D fixtures
+          gh release download fixtures-m2 -p '*' -D fixtures
           "SLATE_FIXTURES=$env:GITHUB_WORKSPACE\fixtures" >> $env:GITHUB_ENV
       - name: Check formatting
         run: cargo fmt --all --check
@@ -47,5 +86,7 @@ jobs:
         run: cargo test --workspace
       - name: Build the release app
         run: cargo build --release -p slate-app
-      - name: Time the develop render
-        run: cargo test -p slate-gpu --release --test develop_timing -- --nocapture
+      - name: Time the develop render and the playback path
+        run: cargo test -p slate-gpu --release --test develop_timing --test playback_timing -- --nocapture
+      - name: Time the Reel export
+        run: cargo test -p slate-app --release --test reel_timing -- --nocapture
