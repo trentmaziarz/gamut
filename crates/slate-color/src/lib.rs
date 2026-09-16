@@ -7,7 +7,8 @@
 //! GPU shader is tested against.
 //!
 //! In M1: [`matrices`], [`transfer`], [`bradford`], [`daylight`], the six
-//! Basic operators in [`basic`], and the ICC classifier in [`icc`].
+//! Basic operators in [`basic`], and the ICC classifier in [`icc`]. M2 adds
+//! [`video`], the twin of the YCbCr pass with the provisional HLG decode.
 
 pub mod basic;
 pub mod bradford;
@@ -15,6 +16,7 @@ pub mod daylight;
 pub mod icc;
 pub mod matrices;
 pub mod transfer;
+pub mod video;
 
 pub use icc::SourceSpace;
 pub use matrices::Mat3;
