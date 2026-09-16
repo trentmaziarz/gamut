@@ -7,7 +7,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use slate_color::video::{self, PlaneFormat, VideoColour};
-use slate_media::VideoFrame;
+use slate_media::FramePlanes;
 
 /// The device feature the 16 bit plane formats need. Asked for when the
 /// adapter has it; without it a 10 bit clip cannot be drawn.
@@ -45,10 +45,13 @@ pub struct VideoUniform {
     pub rotation: u32,
     pub full_range: u32,
     pub _pad: u32,
+    /// The part of the displayed frame the render covers, as x, y, width
+    /// and height in 0 to 1.
+    pub window: [f32; 4],
 }
 
 impl VideoUniform {
-    pub fn new(format: PlaneFormat, colour: VideoColour, rotation: u32) -> Self {
+    pub fn new(format: PlaneFormat, colour: VideoColour, rotation: u32, window: [f32; 4]) -> Self {
         let range = video::range(format, colour.full_range);
         Self {
             yuv: video::yuv_matrix(colour.space).to_wgsl_columns(),
@@ -61,6 +64,7 @@ impl VideoUniform {
             rotation,
             full_range: u32::from(colour.full_range),
             _pad: 0,
+            window,
         }
     }
 }
@@ -128,20 +132,22 @@ impl VideoSource {
     }
 
     /// Whether `frame` fits these textures.
-    pub fn accepts(&self, frame: &VideoFrame) -> bool {
-        frame.width == self.width && frame.height == self.height && frame.format == self.format
+    pub fn accepts(&self, frame: &dyn FramePlanes) -> bool {
+        frame.width() == self.width
+            && frame.height() == self.height
+            && frame.format() == self.format
     }
 
-    /// Writes the frame's planes into the textures. The frame must have the
-    /// size and format the textures were made for.
-    pub fn upload(&self, queue: &wgpu::Queue, frame: &VideoFrame) {
+    /// Writes the frame's planes into the textures, padding and all. The
+    /// frame must have the size and format the textures were made for.
+    pub fn upload(&self, queue: &wgpu::Queue, frame: &dyn FramePlanes) {
         assert!(self.accepts(frame), "the frame matches the plane textures");
         queue.write_texture(
             self.luma.as_image_copy(),
-            &frame.y,
+            frame.y(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(frame.y_stride as u32),
+                bytes_per_row: Some(frame.y_stride() as u32),
                 rows_per_image: Some(self.height),
             },
             wgpu::Extent3d {
@@ -153,10 +159,10 @@ impl VideoSource {
         let chroma_height = self.height.div_ceil(2);
         queue.write_texture(
             self.chroma.as_image_copy(),
-            &frame.uv,
+            frame.uv(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(frame.uv_stride as u32),
+                bytes_per_row: Some(frame.uv_stride() as u32),
                 rows_per_image: Some(chroma_height),
             },
             wgpu::Extent3d {
@@ -176,8 +182,9 @@ impl VideoSource {
         }
     }
 
-    /// The uniform for this source.
-    pub fn uniform(&self) -> VideoUniform {
-        VideoUniform::new(self.format, self.colour, self.rotation)
+    /// The uniform for this source, rendering `window` of the displayed
+    /// frame.
+    pub fn uniform(&self, window: [f32; 4]) -> VideoUniform {
+        VideoUniform::new(self.format, self.colour, self.rotation, window)
     }
 }

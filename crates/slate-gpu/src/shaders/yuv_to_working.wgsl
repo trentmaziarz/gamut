@@ -16,6 +16,9 @@ struct Uniform {
     rotation: u32,
     full_range: u32,
     _pad: u32,
+    // The part of the displayed frame this render covers, as x, y, width,
+    // height in 0 to 1; the whole frame is 0, 0, 1, 1.
+    window: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -75,7 +78,7 @@ fn source_uv(uv: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let at = source_uv(in.uv);
+    let at = source_uv(u.window.xy + in.uv * u.window.zw);
     let y = textureSampleLevel(luma, plane_sampler, at, 0.0).r;
     let c = textureSampleLevel(chroma, plane_sampler, at, 0.0).rg;
     let yp = (y - u.black) / u.luma_range;

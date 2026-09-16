@@ -19,11 +19,13 @@ pub mod fixtures;
 pub mod hwaccel;
 pub mod photo;
 pub mod video;
+pub mod video_export;
 
 pub use ffmpeg_the_third as ffmpeg;
 pub use photo::{Photo, PhotoError, SourceSpace, open_photo};
 pub use video::{
-    Decoder, PlaneFormat, Transfer, VideoColour, VideoError, VideoFrame, VideoSource, YuvSpace,
+    DecodedFrame, Decoder, FramePlanes, PlaneFormat, RawFrame, Transfer, VideoColour, VideoError,
+    VideoFrame, VideoSource, YuvSpace,
 };
 
 /// Initialises ffmpeg once. Every open path calls it; calling it again is

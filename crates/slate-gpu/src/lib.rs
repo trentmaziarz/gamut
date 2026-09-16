@@ -19,7 +19,7 @@ pub mod video;
 
 pub use develop::Develop;
 pub use headless::Headless;
-pub use readback::Readback;
+pub use readback::{PendingReadback, Readback};
 pub use test_image::TestImage;
 
 /// A fullscreen triangle: three vertices, no vertex buffer. Every pass that

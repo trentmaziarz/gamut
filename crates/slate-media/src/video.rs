@@ -29,6 +29,21 @@ pub enum Decoder {
 
 pub use slate_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace};
 
+/// The planes of a decoded frame as the GPU upload reads them: NV12 or
+/// P010, each plane with its own row stride in bytes. [`VideoFrame`] packs
+/// them tightly; [`RawFrame`] keeps ffmpeg's own buffer and its padding.
+pub trait FramePlanes {
+    fn format(&self) -> PlaneFormat;
+    /// The stored width, before the rotation.
+    fn width(&self) -> u32;
+    /// The stored height, before the rotation.
+    fn height(&self) -> u32;
+    fn y(&self) -> &[u8];
+    fn uv(&self) -> &[u8];
+    fn y_stride(&self) -> usize;
+    fn uv_stride(&self) -> usize;
+}
+
 /// One decoded frame in system memory, planes tightly packed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoFrame {
@@ -75,6 +90,12 @@ impl VideoFrame {
         (self.code(cb), self.code(cr))
     }
 
+    /// Whether `other` has the same size and format, so its buffers can be
+    /// reused for this frame.
+    pub fn same_layout(&self, other: &VideoFrame) -> bool {
+        (self.width, self.height, self.format) == (other.width, other.height, other.format)
+    }
+
     fn code(&self, word: u16) -> u32 {
         match self.format {
             PlaneFormat::Nv12 => u32::from(word),
@@ -88,6 +109,100 @@ impl VideoFrame {
         match self.format {
             PlaneFormat::Nv12 => u16::from(plane[at]),
             PlaneFormat::P010 => u16::from_le_bytes([plane[at], plane[at + 1]]),
+        }
+    }
+}
+
+impl FramePlanes for VideoFrame {
+    fn format(&self) -> PlaneFormat {
+        self.format
+    }
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn y(&self) -> &[u8] {
+        &self.y
+    }
+    fn uv(&self) -> &[u8] {
+        &self.uv
+    }
+    fn y_stride(&self) -> usize {
+        self.y_stride
+    }
+    fn uv_stride(&self) -> usize {
+        self.uv_stride
+    }
+}
+
+/// A decoded frame kept in ffmpeg's own system memory buffer, with its
+/// row padding, so no copy sits between the transfer from the decoder and
+/// the upload to the GPU. Only NV12 and P010 frames come this way; a
+/// software decoder's planar frame is packed into a [`VideoFrame`].
+pub struct RawFrame {
+    pub pts_seconds: f64,
+    format: PlaneFormat,
+    frame: frame::Video,
+}
+
+impl RawFrame {
+    /// Gives the buffer back so the next transfer reuses it.
+    pub fn into_buffer(self) -> frame::Video {
+        self.frame
+    }
+
+    /// ffmpeg's pixel format of the buffer, for allocating more like it.
+    pub fn pixel(&self) -> Pixel {
+        self.frame.format()
+    }
+}
+
+impl FramePlanes for RawFrame {
+    fn format(&self) -> PlaneFormat {
+        self.format
+    }
+    fn width(&self) -> u32 {
+        self.frame.width()
+    }
+    fn height(&self) -> u32 {
+        self.frame.height()
+    }
+    fn y(&self) -> &[u8] {
+        self.frame.data(0)
+    }
+    fn uv(&self) -> &[u8] {
+        self.frame.data(1)
+    }
+    fn y_stride(&self) -> usize {
+        self.frame.stride(0)
+    }
+    fn uv_stride(&self) -> usize {
+        self.frame.stride(1)
+    }
+}
+
+/// A frame from [`VideoSource::next_frame_raw`]: ffmpeg's buffer when the
+/// decoder gave NV12 or P010, a packed frame otherwise.
+pub enum DecodedFrame {
+    Raw(RawFrame),
+    Packed(VideoFrame),
+}
+
+impl DecodedFrame {
+    pub fn pts_seconds(&self) -> f64 {
+        match self {
+            DecodedFrame::Raw(frame) => frame.pts_seconds,
+            DecodedFrame::Packed(frame) => frame.pts_seconds,
+        }
+    }
+
+    /// The planes, whichever way they are held.
+    pub fn planes(&self) -> &dyn FramePlanes {
+        match self {
+            DecodedFrame::Raw(frame) => frame,
+            DecodedFrame::Packed(frame) => frame,
         }
     }
 }
@@ -130,6 +245,12 @@ pub enum VideoError {
     UnsupportedFormat { path: PathBuf, format: Pixel },
     #[error("{path} is not a video format slate opens (mp4, mov, m4v)")]
     Unsupported { path: PathBuf },
+    #[error("could not write {path}: {source}")]
+    Encode {
+        path: PathBuf,
+        #[source]
+        source: Error,
+    },
 }
 
 /// The extensions the open path accepts.
@@ -326,12 +447,66 @@ impl VideoSource {
     /// are decoded and dropped, so the first frame returned is the one at
     /// or just after it.
     pub fn next_frame(&mut self) -> Result<Option<VideoFrame>, VideoError> {
+        let Some(pts) = self.advance()? else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let frame = self.pack(pts, None)?;
+        self.last_timing.copy_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(Some(frame))
+    }
+
+    /// As [`next_frame`](Self::next_frame), but a hardware frame comes back
+    /// in ffmpeg's own buffer with no packing copy, and `reuse` (a frame
+    /// handed back through [`RawFrame::into_buffer`]) receives the
+    /// transfer instead of a fresh allocation.
+    pub fn next_frame_raw(
+        &mut self,
+        reuse: Option<frame::Video>,
+    ) -> Result<Option<DecodedFrame>, VideoError> {
+        let Some(pts) = self.advance()? else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let decoded = if hwaccel::is_hardware_frame(&self.hardware) {
+            let mut system = reuse.unwrap_or_else(frame::Video::empty);
+            hwaccel::transfer(&self.hardware, &mut system).map_err(|source| {
+                VideoError::Decode {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+            let format = match system.format() {
+                Pixel::NV12 => PlaneFormat::Nv12,
+                Pixel::P010LE => PlaneFormat::P010,
+                other => {
+                    return Err(VideoError::UnsupportedFormat {
+                        path: self.path.clone(),
+                        format: other,
+                    });
+                }
+            };
+            DecodedFrame::Raw(RawFrame {
+                pts_seconds: pts,
+                format,
+                frame: system,
+            })
+        } else {
+            DecodedFrame::Packed(self.pack(pts, None)?)
+        };
+        self.last_timing.copy_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(Some(decoded))
+    }
+
+    /// Receives the next frame past any seek target into `self.hardware`
+    /// and returns its time, or `None` at the end.
+    fn advance(&mut self) -> Result<Option<f64>, VideoError> {
         loop {
             let started = Instant::now();
             if !self.receive()? {
                 return Ok(None);
             }
-            let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+            self.last_timing.decode_ms = started.elapsed().as_secs_f64() * 1000.0;
             let pts = self.pts_seconds(&self.hardware);
             if let Some(target) = self.skip_until
                 && pts + self.frame_seconds() * 0.5 < target
@@ -339,13 +514,7 @@ impl VideoSource {
                 continue;
             }
             self.skip_until = None;
-            let started = Instant::now();
-            let frame = self.pack(pts)?;
-            self.last_timing = DecodeTiming {
-                decode_ms,
-                copy_ms: started.elapsed().as_secs_f64() * 1000.0,
-            };
-            return Ok(Some(frame));
+            return Ok(Some(pts));
         }
     }
 
@@ -440,8 +609,10 @@ impl VideoSource {
     }
 
     /// Moves the received frame into system memory when it is a CUDA frame
-    /// and packs its planes.
-    fn pack(&mut self, pts: f64) -> Result<VideoFrame, VideoError> {
+    /// and packs its planes, into the buffers of `reuse` when it has the
+    /// same layout.
+    fn pack(&mut self, pts: f64, reuse: Option<VideoFrame>) -> Result<VideoFrame, VideoError> {
+        let _ = reuse;
         let source: &frame::Video = if hwaccel::is_hardware_frame(&self.hardware) {
             hwaccel::transfer(&self.hardware, &mut self.system).map_err(|source| {
                 VideoError::Decode {

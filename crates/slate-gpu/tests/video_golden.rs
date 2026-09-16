@@ -268,6 +268,53 @@ fn a_p010_hlg_frame_matches_the_twin() {
     check("p010 hlg", PlaneFormat::P010, HLG, 0);
 }
 
+/// The crop rendered through the window path against the same crop cut
+/// out of the full render: the two must agree, since the window holds the
+/// blur's whole reach.
+#[test]
+fn a_windowed_render_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let frame = synthetic_frame(PlaneFormat::Nv12);
+    let crop = CropRect {
+        x: 0.25,
+        y: 0.0,
+        width: 0.5,
+        height: 1.0,
+    };
+    let output = (32, 64);
+    let edit = PhotoEdit {
+        highlights: -60.0,
+        shadows: 40.0,
+        ..PhotoEdit::default()
+    };
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_video_frame(&frame, SDR, 0);
+    let full = develop
+        .render(&edit, crop, (SIZE, SIZE), output)
+        .expect("a source is set");
+    let full = readback.read(&gpu.device, &gpu.queue, full, output.0, output.1);
+    let windowed = develop
+        .render_crop(&edit, crop, output)
+        .expect("a source is set");
+    let windowed = readback.read(&gpu.device, &gpu.queue, windowed, output.0, output.1);
+    let max = full
+        .iter()
+        .zip(&windowed)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap_or(0);
+    println!("windowed render against the full render: max difference {max}");
+    assert!(max <= 1, "max difference {max}");
+}
+
 #[test]
 fn a_turned_frame_matches_the_turned_twin() {
     check("nv12 rotated 90", PlaneFormat::Nv12, SDR, 90);

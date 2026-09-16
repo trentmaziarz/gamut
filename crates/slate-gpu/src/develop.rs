@@ -32,7 +32,7 @@ use slate_color::basic;
 use slate_color::matrices;
 use slate_color::video::VideoColour;
 use slate_core::{CropRect, ExportPreset, PhotoEdit};
-use slate_media::{Photo, VideoFrame};
+use slate_media::{FramePlanes, Photo};
 
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
@@ -56,6 +56,7 @@ struct InputUniform {
     render_size: [f32; 2],
     decode_srgb: u32,
     taps: u32,
+    window: [f32; 4],
 }
 
 #[repr(C)]
@@ -157,6 +158,10 @@ struct Frame {
     generation: u64,
     /// The source content the working and base textures hold.
     content: u64,
+    /// The part of the source this render covers.
+    window: CropRect,
+    /// The size the blur sigma was taken from.
+    sigma_size: (u32, u32),
     working: Target,
     ping: Target,
     base: Target,
@@ -226,7 +231,7 @@ impl Develop {
             "blur",
             include_str!("shaders/blur.wgsl"),
             BASE_FORMAT,
-            &[uniform_entry(0), texture_entry(1)],
+            &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
         );
         let develop = make_pass(
             device,
@@ -345,7 +350,7 @@ impl Develop {
     /// Uploads a decoded video frame as the source. The plane textures are
     /// kept between frames of one size and format; a frame of another
     /// size, format, colour or rotation replaces them.
-    pub fn set_video_frame(&mut self, frame: &VideoFrame, colour: VideoColour, rotation: u32) {
+    pub fn set_video_frame(&mut self, frame: &dyn FramePlanes, colour: VideoColour, rotation: u32) {
         let reuse = matches!(
             &self.source,
             Some(Source {
@@ -356,9 +361,9 @@ impl Develop {
         if !reuse {
             let planes = VideoSource::new(
                 &self.device,
-                frame.width,
-                frame.height,
-                frame.format,
+                frame.width(),
+                frame.height(),
+                frame.format(),
                 colour,
                 rotation,
             );
@@ -374,9 +379,9 @@ impl Develop {
             self.frame = None;
             log::info!(
                 "develop video source set: {}x{} {:?} rotation {rotation} {colour:?}",
-                frame.width,
-                frame.height,
-                frame.format
+                frame.width(),
+                frame.height(),
+                frame.format()
             );
         }
         let source = self.source.as_mut().expect("set above");
@@ -414,6 +419,62 @@ impl Develop {
         render_size: (u32, u32),
         output_size: (u32, u32),
     ) -> Option<&wgpu::TextureView> {
+        self.render_window(
+            edit,
+            crop,
+            render_size,
+            output_size,
+            CropRect::FULL,
+            render_size,
+        )
+    }
+
+    /// Renders only what `crop` needs at the scale where it lands on
+    /// `output_size` one to one: the crop plus the reach of the base blur
+    /// on every side, so the picture inside the crop is the one
+    /// [`render`](Self::render) would give at the full size. The rest of
+    /// the frame is never drawn, which is what makes a Reel frame cheap.
+    pub fn render_crop(
+        &mut self,
+        edit: &PhotoEdit,
+        crop: CropRect,
+        output_size: (u32, u32),
+    ) -> Option<&wgpu::TextureView> {
+        let full = render_size_for_crop(crop, output_size);
+        let (full_w, full_h) = (full.0 as f32, full.1 as f32);
+        let reach = basic::blur_radius(basic::base_sigma(full.0, full.1)) as f32;
+        let x0 = (crop.x * full_w - reach).floor().max(0.0);
+        let y0 = (crop.y * full_h - reach).floor().max(0.0);
+        let x1 = ((crop.x + crop.width) * full_w + reach).ceil().min(full_w);
+        let y1 = ((crop.y + crop.height) * full_h + reach).ceil().min(full_h);
+        let window = CropRect {
+            x: x0 / full_w,
+            y: y0 / full_h,
+            width: (x1 - x0) / full_w,
+            height: (y1 - y0) / full_h,
+        };
+        let inner = CropRect {
+            x: (crop.x - window.x) / window.width,
+            y: (crop.y - window.y) / window.height,
+            width: crop.width / window.width,
+            height: crop.height / window.height,
+        };
+        let window_size = ((x1 - x0).round() as u32, (y1 - y0).round() as u32);
+        self.render_window(edit, inner, window_size, output_size, window, full)
+    }
+
+    /// The shared body: renders `window` of the source at `render_size`
+    /// with the blur sigma of `sigma_size`, then crops `crop` of that
+    /// render into the output.
+    fn render_window(
+        &mut self,
+        edit: &PhotoEdit,
+        crop: CropRect,
+        render_size: (u32, u32),
+        output_size: (u32, u32),
+        window: CropRect,
+        sigma_size: (u32, u32),
+    ) -> Option<&wgpu::TextureView> {
         let source = self.source.as_ref()?;
         let (width, height) = (render_size.0.max(1), render_size.1.max(1));
         let mut encoder = self
@@ -424,6 +485,8 @@ impl Develop {
 
         let stale = self.frame.as_ref().is_none_or(|f| {
             (f.width, f.height, f.generation) != (width, height, source.generation)
+                || f.window != window
+                || f.sigma_size != sigma_size
         });
         let rerun = stale
             || self
@@ -431,16 +494,17 @@ impl Develop {
                 .as_ref()
                 .is_some_and(|f| f.content != source.content);
         if stale {
-            self.frame = Some(self.build_frame(source, width, height));
+            self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
             self.frame_generation += 1;
         }
         if rerun {
             let frame = self.frame.as_mut().expect("frame built above");
             frame.content = source.content;
+            let window_uniform = [window.x, window.y, window.width, window.height];
             let (head_pipeline, head_label) = match &source.kind {
                 SourceKind::Photo { space, .. } => {
-                    let taps = (source.width as f32 / width as f32)
-                        .max(source.height as f32 / height as f32)
+                    let taps = (source.width as f32 * window.width / width as f32)
+                        .max(source.height as f32 * window.height / height as f32)
                         .ceil()
                         .clamp(1.0, MAX_TAPS as f32) as u32;
                     self.queue.write_buffer(
@@ -451,6 +515,7 @@ impl Develop {
                             render_size: [width as f32, height as f32],
                             decode_srgb: 1,
                             taps,
+                            window: window_uniform,
                         }),
                     );
                     (&self.input.pipeline, "input transform")
@@ -459,12 +524,12 @@ impl Develop {
                     self.queue.write_buffer(
                         &self.video_uniform,
                         0,
-                        bytemuck::bytes_of(&planes.uniform()),
+                        bytemuck::bytes_of(&planes.uniform(window_uniform)),
                     );
                     (&self.video.pipeline, "video")
                 }
             };
-            let sigma = basic::base_sigma(width, height);
+            let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
             let radius = basic::blur_radius(sigma);
             for (buffer, direction, luma) in [
                 (&self.blur_h_uniform, [1, 0], 1),
@@ -488,13 +553,20 @@ impl Develop {
                 head_pipeline,
                 &frame.input_bind,
                 &frame.working.view,
+                None,
             );
+            // Only the columns under the crop are read by the vertical
+            // pass, and only the crop by the develop pass, so the blur and
+            // develop passes are scissored to the crop plus a margin.
+            let columns = scissor_for(crop, (width, height), true);
+            let region = scissor_for(crop, (width, height), false);
             draw(
                 &mut encoder,
                 "blur h",
                 &self.blur.pipeline,
                 &frame.blur_h_bind,
                 &frame.ping.view,
+                Some(columns),
             );
             draw(
                 &mut encoder,
@@ -502,9 +574,11 @@ impl Develop {
                 &self.blur.pipeline,
                 &frame.blur_v_bind,
                 &frame.base.view,
+                Some(region),
             );
         }
         let frame = self.frame.as_ref().expect("frame built above");
+        let region = scissor_for(crop, (width, height), false);
 
         self.queue.write_buffer(
             &self.develop_uniform,
@@ -517,6 +591,7 @@ impl Develop {
             &self.develop.pipeline,
             &frame.develop_bind,
             &frame.developed.view,
+            Some(region),
         );
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
@@ -566,6 +641,7 @@ impl Develop {
             &self.output.pipeline,
             &out.bind,
             &out.target.view,
+            None,
         );
         self.queue.submit(Some(encoder.finish()));
         Some(&out.target.view)
@@ -680,11 +756,19 @@ impl Develop {
             &self.output.pipeline,
             &bind,
             &target.view,
+            None,
         );
         (target, uniform, bind)
     }
 
-    fn build_frame(&self, source: &Source, width: u32, height: u32) -> Frame {
+    fn build_frame(
+        &self,
+        source: &Source,
+        width: u32,
+        height: u32,
+        window: CropRect,
+        sigma_size: (u32, u32),
+    ) -> Frame {
         let device = &self.device;
         let working = create_target(device, "working", WORKING_FORMAT, width, height);
         let ping = create_target(device, "blur ping", BASE_FORMAT, width, height);
@@ -725,6 +809,10 @@ impl Develop {
             entries: &[
                 buffer_binding(0, &self.blur_h_uniform),
                 texture_binding(1, &working.view),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
             ],
         });
         let blur_v_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -733,6 +821,10 @@ impl Develop {
             entries: &[
                 buffer_binding(0, &self.blur_v_uniform),
                 texture_binding(1, &ping.view),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
             ],
         });
         let develop_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -750,6 +842,8 @@ impl Develop {
             generation: source.generation,
             // The head passes have not run into these textures yet.
             content: source.content.wrapping_sub(1),
+            window,
+            sigma_size,
             working,
             ping,
             base,
@@ -760,6 +854,31 @@ impl Develop {
             develop_bind,
         }
     }
+}
+
+/// The pixels the blur must reach: the crop with a margin of two pixels
+/// for the output pass's sampling, over the whole height when
+/// `full_height` (the horizontal pass feeds every row the vertical pass
+/// reads). As x, y, width, height of a render of `size`.
+fn scissor_for(crop: CropRect, size: (u32, u32), full_height: bool) -> (u32, u32, u32, u32) {
+    const MARGIN: f32 = 2.0;
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let x0 = (crop.x * w - MARGIN).floor().clamp(0.0, w - 1.0);
+    let x1 = ((crop.x + crop.width) * w + MARGIN)
+        .ceil()
+        .clamp(x0 + 1.0, w);
+    let (y0, y1) = if full_height {
+        (0.0, h)
+    } else {
+        let y0 = (crop.y * h - MARGIN).floor().clamp(0.0, h - 1.0);
+        (
+            y0,
+            ((crop.y + crop.height) * h + MARGIN)
+                .ceil()
+                .clamp(y0 + 1.0, h),
+        )
+    };
+    (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
 }
 
 /// The size to render the whole photo at so that `crop` lands on an output
@@ -902,6 +1021,7 @@ fn draw(
     pipeline: &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
     target: &wgpu::TextureView,
+    scissor: Option<(u32, u32, u32, u32)>,
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
@@ -921,5 +1041,35 @@ fn draw(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
+    if let Some((x, y, w, h)) = scissor {
+        pass.set_scissor_rect(x, y, w, h);
+    }
     pass.draw(0..FULLSCREEN_VERTICES, 0..1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scissor_for;
+    use slate_core::CropRect;
+
+    #[test]
+    fn the_scissor_covers_the_crop_and_a_margin_inside_the_render() {
+        let crop = CropRect {
+            x: 0.25,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        assert_eq!(scissor_for(crop, (400, 200), true), (98, 0, 204, 200));
+        assert_eq!(scissor_for(crop, (400, 200), false), (98, 0, 204, 200));
+        assert_eq!(scissor_for(CropRect::FULL, (64, 64), false), (0, 0, 64, 64));
+        let tiny = CropRect {
+            x: 0.5,
+            y: 0.5,
+            width: 0.01,
+            height: 0.01,
+        };
+        let (x, y, w, h) = scissor_for(tiny, (100, 100), false);
+        assert!(x <= 50 && y <= 50 && w >= 1 && h >= 1 && x + w <= 100 && y + h <= 100);
+    }
 }

@@ -83,6 +83,21 @@ impl Readback {
         width: u32,
         height: u32,
     ) -> Vec<u8> {
+        self.start(device, queue, source, width, height)
+            .wait(device)
+    }
+
+    /// Submits the copy of `source` and starts mapping the buffer, then
+    /// returns at once. The caller keeps the [`PendingReadback`] and asks
+    /// for its bytes later, so the GPU can run the next frame meanwhile.
+    pub fn start(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> PendingReadback {
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("readback target"),
             size: wgpu::Extent3d {
@@ -157,32 +172,60 @@ impl Readback {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(Some(encoder.finish()));
+        let submission = queue.submit(Some(encoder.finish()));
 
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
-            // The receiver only goes away if this function has already
-            // returned, and it waits for the message below.
+            // The receiver only goes away if the pending readback was
+            // dropped, in which case nobody needs the message.
             let _ = sender.send(result);
         });
+        PendingReadback {
+            buffer,
+            receiver,
+            submission,
+            padded_bytes_per_row,
+            unpadded_bytes_per_row,
+            height,
+        }
+    }
+}
+
+/// A readback whose copy is submitted and whose buffer is being mapped.
+pub struct PendingReadback {
+    buffer: wgpu::Buffer,
+    receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    submission: wgpu::SubmissionIndex,
+    padded_bytes_per_row: u32,
+    unpadded_bytes_per_row: u32,
+    height: u32,
+}
+
+impl PendingReadback {
+    /// Waits for this copy alone, not for work submitted after it, and
+    /// returns the bytes, unpadded.
+    pub fn wait(self, device: &wgpu::Device) -> Vec<u8> {
         device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(self.submission),
+                timeout: None,
+            })
             .expect("wait for the readback copy");
-        receiver
+        self.receiver
             .recv()
             .expect("map callback ran")
             .expect("map the readback buffer");
-
-        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        let mut pixels = Vec::with_capacity((self.unpadded_bytes_per_row * self.height) as usize);
         {
-            let mapped = buffer
+            let mapped = self
+                .buffer
                 .get_mapped_range(..)
                 .expect("mapped range of the readback buffer");
-            for row in mapped.chunks_exact(padded_bytes_per_row as usize) {
-                pixels.extend_from_slice(&row[..unpadded_bytes_per_row as usize]);
+            for row in mapped.chunks_exact(self.padded_bytes_per_row as usize) {
+                pixels.extend_from_slice(&row[..self.unpadded_bytes_per_row as usize]);
             }
         }
-        buffer.unmap();
+        self.buffer.unmap();
         pixels
     }
 }

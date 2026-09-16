@@ -9,6 +9,9 @@ struct Uniform {
     render_size: vec2<f32>,
     decode_srgb: u32,
     taps: u32,
+    // The part of the source this render covers, as x, y, width, height
+    // in 0 to 1; the whole source is 0, 0, 1, 1.
+    window: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -38,13 +41,14 @@ fn srgb_eotf(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let footprint = 1.0 / u.render_size;
+    let footprint = u.window.zw / u.render_size;
+    let uv = u.window.xy + in.uv * u.window.zw;
     let n = f32(u.taps);
     var sum = vec3<f32>(0.0);
     for (var j = 0u; j < u.taps; j = j + 1u) {
         for (var i = 0u; i < u.taps; i = i + 1u) {
             let offset = (vec2<f32>(f32(i), f32(j)) + 0.5) / n - 0.5;
-            var c = textureSampleLevel(source, source_sampler, in.uv + offset * footprint, 0.0).rgb;
+            var c = textureSampleLevel(source, source_sampler, uv + offset * footprint, 0.0).rgb;
             if (u.decode_srgb == 1u) {
                 c = srgb_eotf(c);
             }
