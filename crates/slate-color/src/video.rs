@@ -172,7 +172,7 @@ pub fn yuv_to_rgb(
 
 const HLG_A: f32 = 0.178_832_77;
 const HLG_B: f32 = 0.284_668_92;
-const HLG_C: f32 = 0.559_910_73;
+const HLG_C: f32 = 0.559_910_7;
 
 /// The inverse OETF of BT.2100 hybrid log gamma: a signal in 0 to 1 to
 /// scene light normalised so that 1.0 in gives 1.0 out (0.5 gives 1/12).
