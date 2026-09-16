@@ -134,8 +134,9 @@ enum SourceKind {
         view: wgpu::TextureView,
         space: SourceSpace,
     },
-    /// A video frame's planes, through the YUV pass.
-    Video(VideoSource),
+    /// A video frame's planes, through the YUV pass. Boxed because the
+    /// planes are far larger than the photo variant.
+    Video(Box<VideoSource>),
 }
 
 struct Source {
@@ -364,7 +365,7 @@ impl Develop {
             let (width, height) = planes.display_size();
             self.generation += 1;
             self.source = Some(Source {
-                kind: SourceKind::Video(planes),
+                kind: SourceKind::Video(Box::new(planes)),
                 width,
                 height,
                 generation: self.generation,
