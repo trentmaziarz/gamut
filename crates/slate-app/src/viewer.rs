@@ -1,6 +1,8 @@
-//! The Viewer tab: the developed photo from the shared device, with the
-//! crop rectangle, the phone frame and its guides drawn over it. With no
-//! photo open it shows the M0 test image.
+//! The Viewer tab: the developed photo, or the frame under the playhead of
+//! the open project, from the shared device, with the crop rectangle, the
+//! phone frame and its guides drawn over it. With nothing open it shows
+//! the M0 test image. A video frame goes through the same develop graph
+//! as a photo, so the Basic sliders and the crop apply to it.
 
 use egui::load::SizedTexture;
 use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind};
@@ -37,6 +39,8 @@ pub struct Viewer {
     develop: Develop,
     texture_id: egui::TextureId,
     shown: Shown,
+    /// The player frame the develop graph holds.
+    frame_serial: u64,
 }
 
 impl Viewer {
@@ -56,12 +60,19 @@ impl Viewer {
             develop,
             texture_id,
             shown: Shown::Placeholder((width, height)),
+            frame_serial: 0,
         }
     }
 
     /// Uploads a photo to the develop graph.
     pub fn set_photo(&mut self, photo: &Photo) {
         self.develop.set_source(photo);
+        self.frame_serial = 0;
+    }
+
+    /// A project was opened: the next player frame is new.
+    pub fn clear_video(&mut self) {
+        self.frame_serial = 0;
     }
 
     /// Renders the crop for a preset at full resolution and returns the
@@ -79,8 +90,8 @@ impl Viewer {
     /// tab, then the crop and the frame over it. The develop graph runs
     /// only when the session is dirty or the pixel size changed.
     pub fn ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
-        let aspect = match &session.photo {
-            Some(photo) => [photo.width as f32, photo.height as f32],
+        let aspect = match session.source_size() {
+            Some((width, height)) => [width as f32, height as f32],
             None => VIEWER_ASPECT,
         };
         let points = fit_aspect(ui.available_size(), aspect);
@@ -89,8 +100,15 @@ impl Viewer {
             (points.x * scale).round().max(1.0) as u32,
             (points.y * scale).round().max(1.0) as u32,
         );
+        let mut has_picture = false;
         if session.photo.is_some() {
             self.show_photo(wanted, session);
+            has_picture = true;
+        } else if session.project.is_some() {
+            has_picture = self.show_video(wanted, session);
+            if !has_picture {
+                self.show_placeholder(wanted);
+            }
         } else {
             self.show_placeholder(wanted);
         }
@@ -98,9 +116,34 @@ impl Viewer {
         let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
         let image = Rect::from_center_size(area.center(), points);
         egui::Image::from_texture(SizedTexture::new(self.texture_id, points)).paint_at(ui, image);
-        if session.photo.is_some() {
+        if has_picture {
             draw_crop(ui, image, session);
         }
+    }
+
+    /// Uploads the player's current frame when it changed and draws it.
+    /// `false` when no frame has arrived yet.
+    fn show_video(&mut self, wanted: (u32, u32), session: &mut Session) -> bool {
+        let Some(project) = session.project.as_mut() else {
+            return false;
+        };
+        let playing = project.player.is_playing();
+        if let Some((serial, frame)) = project.player.current_frame()
+            && serial != self.frame_serial
+        {
+            self.develop
+                .set_video_frame(&frame.frame, frame.colour, frame.rotation);
+            self.frame_serial = serial;
+            session.develop_dirty = true;
+        }
+        if playing {
+            session.repaint_wanted = true;
+        }
+        if !self.develop.has_video() {
+            return false;
+        }
+        self.show_photo(wanted, session);
+        true
     }
 
     fn show_photo(&mut self, wanted: (u32, u32), session: &mut Session) {

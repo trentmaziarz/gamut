@@ -8,7 +8,7 @@ use std::path::Path;
 use slate_core::{Crop, CropRect, Sidecar};
 use slate_gpu::Headless;
 use slate_media::export::ExportError;
-use slate_media::{Photo, PhotoError, open_photo};
+use slate_media::{Photo, PhotoError, VideoError, open_photo};
 
 use crate::sidecar;
 
@@ -23,8 +23,10 @@ pub enum HeadlessError {
     Jpeg(ExportError),
     /// The photo could not be opened.
     Photo(PhotoError),
-    /// The edit file could not be read.
+    /// The edit file could not be read, or a project is not usable.
     Edit(String),
+    /// The video could not be opened or decoded.
+    Video(VideoError),
 }
 
 impl fmt::Display for HeadlessError {
@@ -35,6 +37,7 @@ impl fmt::Display for HeadlessError {
             HeadlessError::Jpeg(error) => write!(f, "{error}"),
             HeadlessError::Photo(error) => write!(f, "{error}"),
             HeadlessError::Edit(error) => write!(f, "{error}"),
+            HeadlessError::Video(error) => write!(f, "{error}"),
         }
     }
 }
@@ -45,6 +48,7 @@ impl Error for HeadlessError {
             HeadlessError::Image(error) => Some(error),
             HeadlessError::Jpeg(error) => Some(error),
             HeadlessError::Photo(error) => Some(error),
+            HeadlessError::Video(error) => Some(error),
             HeadlessError::NoAdapter | HeadlessError::Edit(_) => None,
         }
     }

@@ -1,24 +1,30 @@
 //! The window: a menu bar and an egui_dock layout of three tabs over the
-//! one wgpu device that eframe created. The Viewer tab draws the developed
-//! photo, the Adjust tab holds the Basic sliders and the crop, File > Export
-//! opens the export dialog, and the edit is saved as a sidecar next to the
-//! photo half a second after the last change and on close.
+//! one wgpu device that eframe created. A session holds either a photo or
+//! a project. The Viewer tab draws the developed photo, or the frame under
+//! the playhead, the Adjust tab holds the Basic sliders and the crop, the
+//! Timeline tab holds the one track, File > Export opens the export
+//! dialog, and the edit is saved half a second after the last change and
+//! on close: as a sidecar next to a photo, as the .slate file of a project.
 
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::CreationContext;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
-use slate_core::{Crop, ExportPreset, PhotoEdit, Sidecar};
+use slate_core::{Crop, CropAspect, ExportPreset, PhotoEdit, Project, Sidecar, Track};
 use slate_media::export::write_jpeg;
 use slate_media::open_photo;
+use slate_media::video::is_video_path;
 
 use crate::export::{crop_for_preset, proposed_name};
 use crate::headless::crop_for;
+use crate::player::{MediaInfo, Player};
+use crate::project::{self as project_file, LoadedProject};
 use crate::viewer::Viewer;
-use crate::{adjust, sidecar};
+use crate::{adjust, sidecar, timeline_tab};
 
 /// The window title.
 pub const WINDOW_TITLE: &str = "slate";
@@ -26,19 +32,34 @@ pub const WINDOW_TITLE: &str = "slate";
 /// The window size at first launch, in points.
 pub const WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 
-/// The extensions the open dialog offers.
+/// The extensions the open dialog offers for photos.
 pub const PHOTO_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "heic", "heif"];
 
-/// How long after the last change the sidecar is written.
+/// The extensions the open dialog offers for videos.
+pub const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "mov", "m4v"];
+
+/// How long after the last change the sidecar or project is written.
 pub const SIDECAR_DELAY: Duration = Duration::from_millis(500);
 
-/// The eframe options: the wgpu renderer, the title and the launch size.
+/// The eframe options: the wgpu renderer, the title, the launch size and
+/// the device features the video planes need.
 pub fn native_options() -> eframe::NativeOptions {
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    let base = setup.device_descriptor.clone();
+    setup.device_descriptor = Arc::new(move |adapter| {
+        let mut descriptor = base(adapter);
+        descriptor.required_features |= slate_gpu::video::wanted_features(adapter);
+        descriptor
+    });
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
             .with_inner_size(WINDOW_SIZE),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -56,7 +77,7 @@ impl fmt::Display for NoRenderState {
 
 impl Error for NoRenderState {}
 
-/// The three tabs of M0.
+/// The three tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Viewer,
@@ -82,43 +103,163 @@ pub struct OpenPhoto {
     pub height: u32,
 }
 
-/// The editing state the tabs share: the open photo, its edit and crop,
-/// and what needs doing about them.
-#[derive(Debug, Default)]
+/// The project that is open: its file, its media, the track being edited
+/// and the player that plays it.
+pub struct OpenProject {
+    /// The .slate file.
+    pub path: PathBuf,
+    /// The folder the media paths are relative to.
+    pub dir: PathBuf,
+    pub media: Vec<MediaInfo>,
+    /// The media list as saved, so the file keeps its paths.
+    pub project: Project,
+    pub track: Track,
+    pub player: Player,
+    pub selected: Option<usize>,
+    /// The track changed and the session has not been told yet.
+    pub track_dirty: bool,
+}
+
+impl OpenProject {
+    /// The frame rate of the first media, for timecodes.
+    pub fn frame_rate(&self) -> f64 {
+        self.media.first().map(|m| m.frame_rate).unwrap_or(30.0)
+    }
+
+    /// The display size of the first media.
+    pub fn size(&self) -> (u32, u32) {
+        self.media
+            .first()
+            .map(|m| (m.width, m.height))
+            .unwrap_or((1080, 1920))
+    }
+
+    fn track_changed(&mut self) {
+        self.player.set_track(self.track.clone());
+        self.track_dirty = true;
+    }
+
+    /// Splits the clip under the playhead and selects the second half.
+    pub fn split_at_playhead(&mut self) {
+        let at = self.player.position();
+        if let Some(index) = self.track.split_at(at) {
+            self.selected = Some(index);
+            self.track_changed();
+        }
+    }
+
+    /// Ripple-deletes the selected clip.
+    pub fn delete_selected(&mut self) {
+        let Some(index) = self.selected.take() else {
+            return;
+        };
+        if self.track.ripple_delete(index).is_some() {
+            self.track_changed();
+        }
+    }
+
+    /// Moves a clip's in point (`is_in`) or out point by `seconds`.
+    pub fn trim(&mut self, index: usize, is_in: bool, seconds: f64) {
+        let Some(clip) = self.track.clips.get(index).copied() else {
+            return;
+        };
+        let media_duration = self
+            .media
+            .get(clip.media)
+            .map(|m| m.duration)
+            .unwrap_or(clip.source_out);
+        if is_in {
+            self.track.trim_in(index, clip.source_in + seconds);
+        } else {
+            self.track
+                .trim_out(index, clip.source_out + seconds, media_duration);
+        }
+        if self.track.clips[index] != clip {
+            self.selected = Some(index);
+            self.track_changed();
+        }
+    }
+
+    /// The project as it should be saved, with the live edit and crop.
+    pub fn snapshot(&self, edit: PhotoEdit, crop: Crop) -> Project {
+        Project {
+            track: self.track.clone(),
+            crop,
+            edit,
+            ..self.project.clone()
+        }
+    }
+}
+
+/// The editing state the tabs share: the open photo or project, its edit
+/// and crop, and what needs doing about them.
+#[derive(Default)]
 pub struct Session {
     pub photo: Option<OpenPhoto>,
+    pub project: Option<OpenProject>,
     pub edit: PhotoEdit,
     pub crop: Crop,
     pub grid_guide: bool,
     /// The Viewer must run the develop graph again.
     pub develop_dirty: bool,
-    /// When the edit or crop last changed and the sidecar has not been
+    /// When the edit, crop or track last changed and the file has not been
     /// written since.
     pub changed_at: Option<Instant>,
     /// One line about the last thing that happened, shown in Adjust.
     pub status: Option<String>,
+    /// Playback is running, so the window must draw again at once.
+    pub repaint_wanted: bool,
 }
 
 impl Session {
-    /// A slider or the crop moved: the picture and the sidecar are stale.
+    /// A slider, the crop or the track moved: the picture and the file are
+    /// stale.
     pub fn mark_edited(&mut self) {
         self.develop_dirty = true;
         self.changed_at = Some(Instant::now());
     }
 
-    /// Writes the sidecar next to the photo when a change is pending.
-    fn save_sidecar(&mut self) {
-        let Some(photo) = &self.photo else {
-            self.changed_at = None;
-            return;
+    /// The size of what is open, for the crop buttons.
+    pub fn source_size(&self) -> Option<(u32, u32)> {
+        match (&self.photo, &self.project) {
+            (Some(photo), _) => Some((photo.width, photo.height)),
+            (None, Some(project)) => Some(project.size()),
+            (None, None) => None,
+        }
+    }
+
+    /// One line naming what is open.
+    pub fn open_name(&self) -> Option<String> {
+        let path = match (&self.photo, &self.project) {
+            (Some(photo), _) => &photo.path,
+            (None, Some(project)) => &project.path,
+            (None, None) => return None,
         };
+        path.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
+    /// Writes the sidecar or the project file when a change is pending.
+    fn save(&mut self) {
         if self.changed_at.take().is_none() {
             return;
         }
-        if let Err(error) = sidecar::save(&photo.path, &Sidecar::new(self.edit, self.crop)) {
-            log::error!("could not save the sidecar: {error}");
-            self.status = Some(format!("Could not save the sidecar: {error}"));
+        let result = if let Some(photo) = &self.photo {
+            sidecar::save(&photo.path, &Sidecar::new(self.edit, self.crop)).map(|_| ())
+        } else if let Some(project) = &self.project {
+            project_file::save(&project.path, &project.snapshot(self.edit, self.crop))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            log::error!("could not save: {error}");
+            self.status = Some(format!("Could not save: {error}"));
         }
+    }
+
+    /// Saves now regardless of the timer.
+    pub fn save_now(&mut self) {
+        self.changed_at = Some(Instant::now());
+        self.save();
     }
 }
 
@@ -132,9 +273,9 @@ pub struct SlateApp {
 }
 
 impl SlateApp {
-    /// Builds the app on the device eframe created, and opens `photo` when
+    /// Builds the app on the device eframe created, and opens `path` when
     /// one was named. Never creates a second device.
-    pub fn new(cc: &CreationContext<'_>, photo: Option<PathBuf>) -> Result<Self, NoRenderState> {
+    pub fn new(cc: &CreationContext<'_>, path: Option<PathBuf>) -> Result<Self, NoRenderState> {
         let render_state = cc.wgpu_render_state.clone().ok_or(NoRenderState)?;
         let info = render_state.adapter.get_info();
         log::info!("adapter: {} ({:?})", info.name, info.backend);
@@ -144,57 +285,111 @@ impl SlateApp {
             session: Session::default(),
             export_dialog: None,
         };
-        if let Some(path) = photo {
+        if let Some(path) = path {
             app.open(path);
         }
         Ok(app)
     }
 
-    /// Opens a photo into the viewer, with its sidecar when one is next to
-    /// it. A failure is reported in the status line and the previous photo
-    /// stays.
+    /// Opens a file by its extension: a photo, a video into a fresh
+    /// project, or a project. A failure is reported in the status line and
+    /// what was open stays.
     pub fn open(&mut self, path: PathBuf) {
-        self.session.save_sidecar();
-        match open_photo(&path) {
-            Ok(photo) => {
-                self.viewer.set_photo(&photo);
-                let saved = sidecar::load(&path);
-                let (edit, crop) = match saved {
-                    Some(sidecar) => (sidecar.edit, crop_for(&sidecar, photo.width, photo.height)),
-                    None => (
-                        PhotoEdit::default(),
-                        Crop::fitted(self.session.crop.aspect, photo.width, photo.height),
-                    ),
-                };
-                self.session.edit = edit;
-                self.session.crop = crop;
-                self.session.photo = Some(OpenPhoto {
-                    path,
-                    width: photo.width,
-                    height: photo.height,
-                });
-                self.session.status = None;
-                self.session.develop_dirty = true;
-                self.session.changed_at = None;
-            }
-            Err(error) => {
-                log::error!("{error}");
-                self.session.status = Some(error.to_string());
-            }
+        self.session.save();
+        let result = if Project::is_project_path(&path) {
+            project_file::load(&path).and_then(|loaded| self.open_project(loaded))
+        } else if is_video_path(&path) {
+            MediaInfo::probe(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|info| self.open_project(project_file::for_video(&path, &info)))
+        } else {
+            self.open_photo(path)
+        };
+        if let Err(error) = result {
+            log::error!("{error}");
+            self.session.status = Some(error);
         }
+    }
+
+    fn open_photo(&mut self, path: PathBuf) -> Result<(), String> {
+        let photo = open_photo(&path).map_err(|error| error.to_string())?;
+        self.viewer.set_photo(&photo);
+        let saved = sidecar::load(&path);
+        let (edit, crop) = match saved {
+            Some(sidecar) => (sidecar.edit, crop_for(&sidecar, photo.width, photo.height)),
+            None => (
+                PhotoEdit::default(),
+                Crop::fitted(self.session.crop.aspect, photo.width, photo.height),
+            ),
+        };
+        self.session.project = None;
+        self.session.edit = edit;
+        self.session.crop = crop;
+        self.session.photo = Some(OpenPhoto {
+            path,
+            width: photo.width,
+            height: photo.height,
+        });
+        self.session.status = None;
+        self.session.develop_dirty = true;
+        self.session.changed_at = None;
+        Ok(())
+    }
+
+    fn open_project(&mut self, loaded: LoadedProject) -> Result<(), String> {
+        let media = project_file::probe_media(&loaded)?;
+        if media.is_empty() {
+            return Err(format!("{} names no media", loaded.path.display()));
+        }
+        let track = loaded.project.track.clone();
+        let player = Player::new(media.clone(), track.clone());
+        let (width, height) = (media[0].width, media[0].height);
+        let crop = if loaded.project.crop.rect == slate_core::CropRect::FULL {
+            Crop::fitted(CropAspect::Story9x16, width, height)
+        } else {
+            loaded.project.crop
+        };
+        self.session.photo = None;
+        self.session.edit = loaded.project.edit;
+        self.session.crop = crop;
+        self.session.project = Some(OpenProject {
+            path: loaded.path,
+            dir: loaded.dir,
+            media,
+            project: loaded.project,
+            track,
+            player,
+            selected: None,
+            track_dirty: false,
+        });
+        self.viewer.clear_video();
+        self.session.status = None;
+        self.session.develop_dirty = true;
+        self.session.changed_at = None;
+        if let Some(project) = &mut self.session.project {
+            project.player.seek(0.0);
+        }
+        Ok(())
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open...").clicked()
-                    && let Some(path) = pick_photo()
+                    && let Some(path) = pick_file()
                 {
                     self.open(path);
                 }
-                let has_photo = self.session.photo.is_some();
+                let has_project = self.session.project.is_some();
                 if ui
-                    .add_enabled(has_photo, egui::Button::new("Export..."))
+                    .add_enabled(has_project, egui::Button::new("Save As..."))
+                    .clicked()
+                {
+                    self.save_as();
+                }
+                let has_source = self.session.photo.is_some() || has_project;
+                if ui
+                    .add_enabled(has_source, egui::Button::new("Export..."))
                     .clicked()
                 {
                     self.export_dialog = Some(ExportPreset::for_aspect(self.session.crop.aspect));
@@ -203,11 +398,45 @@ impl SlateApp {
         });
     }
 
-    /// The export dialog: four presets and a Save button.
+    /// Asks for a new .slate path and moves the project there.
+    fn save_as(&mut self) {
+        let Some(project) = self.session.project.as_mut() else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("slate project", &[slate_core::project::EXTENSION])
+            .set_file_name(
+                project
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        if let Some(dir) = project.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(out) = dialog.save_file() else {
+            return;
+        };
+        let new_dir = project_file::dir_of(&out);
+        project_file::rebase(&mut project.project, &project.dir, &new_dir);
+        project.path = out;
+        project.dir = new_dir;
+        self.session.save_now();
+        if self.session.status.is_none()
+            && let Some(project) = &self.session.project
+        {
+            self.session.status = Some(format!("Saved {}", project.path.display()));
+        }
+    }
+
+    /// The export dialog: the four photo presets, or the one Reel preset
+    /// for a project, and a Save button.
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut preset) = self.export_dialog else {
             return;
         };
+        let is_project = self.session.project.is_some();
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
@@ -216,8 +445,13 @@ impl SlateApp {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                for candidate in ExportPreset::ALL {
-                    ui.radio_value(&mut preset, candidate, candidate.label());
+                if is_project {
+                    preset = ExportPreset::Story9x16;
+                    ui.label("Reel 9:16, 1080 by 1920, H.264 with AAC");
+                } else {
+                    for candidate in ExportPreset::ALL {
+                        ui.radio_value(&mut preset, candidate, candidate.label());
+                    }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -231,7 +465,11 @@ impl SlateApp {
             });
         self.export_dialog = (open && !cancel).then_some(preset);
         if save {
-            self.export(preset);
+            if is_project {
+                self.export_reel();
+            } else {
+                self.export(preset);
+            }
         }
     }
 
@@ -266,13 +504,61 @@ impl SlateApp {
         self.session.develop_dirty = true;
         self.export_dialog = None;
     }
+
+    /// Asks where to save and writes the Reel from the project as it is.
+    fn export_reel(&mut self) {
+        let Some(project) = self.session.project.as_mut() else {
+            return;
+        };
+        project.player.pause();
+        let stem = project
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "reel".to_string());
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("MP4", &["mp4"])
+            .set_file_name(format!("{stem}_reel.mp4"));
+        if let Some(dir) = project.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(out) = dialog.save_file() else {
+            return;
+        };
+        let snapshot = project.snapshot(self.session.edit, self.session.crop);
+        let dir = project.dir.clone();
+        let result = crate::reel::export(&snapshot, &dir, &out).map_err(|error| error.to_string());
+        self.session.status = Some(match result {
+            Ok(seconds) => format!("Exported {} in {seconds:.1} s", out.display()),
+            Err(error) => error,
+        });
+        self.session.develop_dirty = true;
+        self.export_dialog = None;
+    }
 }
 
-/// The open dialog, filtered to the photo formats slate reads.
-fn pick_photo() -> Option<PathBuf> {
+/// The open dialog, filtered to the photo, video and project formats slate
+/// reads.
+fn pick_file() -> Option<PathBuf> {
+    let mut all: Vec<&str> = PHOTO_EXTENSIONS.to_vec();
+    all.extend(VIDEO_EXTENSIONS);
+    all.push(slate_core::project::EXTENSION);
     rfd::FileDialog::new()
+        .add_filter("Photos, videos and projects", &all)
         .add_filter("Photos", &PHOTO_EXTENSIONS)
+        .add_filter("Videos", &VIDEO_EXTENSIONS)
+        .add_filter("slate projects", &[slate_core::project::EXTENSION])
         .pick_file()
+}
+
+/// Whether a path is something the window opens.
+pub fn opens(path: &Path) -> bool {
+    Project::is_project_path(path)
+        || is_video_path(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| PHOTO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Viewer in the centre, Adjust on the right, Timeline along the bottom.
@@ -306,10 +592,19 @@ impl eframe::App for SlateApp {
             .show_inside(ui, &mut tabs);
         self.export_dialog(ui.ctx());
 
+        if std::mem::take(&mut self.session.repaint_wanted) {
+            ui.ctx().request_repaint();
+        }
+        if let Some(project) = &self.session.project
+            && let Some(error) = project.player.take_error()
+        {
+            log::error!("{error}");
+            self.session.status = Some(error);
+        }
         if let Some(changed_at) = self.session.changed_at {
             let waited = changed_at.elapsed();
             if waited >= SIDECAR_DELAY {
-                self.session.save_sidecar();
+                self.session.save();
             } else {
                 ui.ctx().request_repaint_after(SIDECAR_DELAY - waited);
             }
@@ -317,7 +612,7 @@ impl eframe::App for SlateApp {
     }
 
     fn on_exit(&mut self) {
-        self.session.save_sidecar();
+        self.session.save();
     }
 }
 
@@ -341,9 +636,7 @@ impl TabViewer for Tabs<'_> {
         match tab {
             Tab::Viewer => self.viewer.ui(ui, self.session),
             Tab::Adjust => adjust::ui(ui, self.session),
-            Tab::Timeline => {
-                ui.label("Timeline arrives in M2");
-            }
+            Tab::Timeline => timeline_tab::ui(ui, self.session),
         }
     }
 

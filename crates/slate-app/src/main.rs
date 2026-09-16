@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use slate_app::{SlateApp, WINDOW_TITLE, export, native_options, screenshot};
+use slate_app::{SlateApp, WINDOW_TITLE, export, native_options, reel, screenshot};
 use slate_core::ExportPreset;
 
-const USAGE: &str = "usage: slate-app [<photo>]
+const USAGE: &str = "usage: slate-app [<photo, video or project.slate>]
        slate-app [--open <photo>] --screenshot <out.png> [--edit <sidecar.json>]
-       slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [--edit <sidecar.json>]";
+       slate-app --open <video or project.slate> --screenshot <out.png> --at <seconds>
+       slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [--edit <sidecar.json>]
+       slate-app --export-reel <video or project.slate> <out.mp4>";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -16,6 +18,11 @@ enum Command {
     Screenshot {
         photo: Option<PathBuf>,
         edit: Option<PathBuf>,
+        out: PathBuf,
+        at: Option<f64>,
+    },
+    ExportReel {
+        input: PathBuf,
         out: PathBuf,
     },
     Export {
@@ -32,6 +39,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     let mut edit = None;
     let mut screenshot = None;
     let mut export = None;
+    let mut at = None;
+    let mut reel = None;
     while let Some(arg) = args.next() {
         let mut value = |slot: &mut Option<PathBuf>| match args.next() {
             Some(path) if slot.is_none() => {
@@ -44,6 +53,19 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             "--open" => value(&mut photo)?,
             "--screenshot" => value(&mut screenshot)?,
             "--edit" => value(&mut edit)?,
+            "--at" => {
+                let seconds = args.next().and_then(|s| s.parse::<f64>().ok());
+                match (seconds, &at) {
+                    (Some(seconds), None) if seconds >= 0.0 => at = Some(seconds),
+                    _ => return Err(USAGE),
+                }
+            }
+            "--export-reel" => match (args.next(), args.next(), &reel) {
+                (Some(input), Some(out), None) => {
+                    reel = Some((PathBuf::from(input), PathBuf::from(out)));
+                }
+                _ => return Err(USAGE),
+            },
             "--export" => {
                 let preset = args.next().and_then(|p| ExportPreset::parse(&p));
                 match (preset, args.next(), &export) {
@@ -58,9 +80,25 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             _ => return Err(USAGE),
         }
     }
+    if let Some((input, out)) = reel {
+        return match (photo, screenshot, export, edit, at) {
+            (None, None, None, None, None) => Ok(Command::ExportReel { input, out }),
+            _ => Err(USAGE),
+        };
+    }
     match (screenshot, export, edit) {
-        (Some(out), None, edit) => Ok(Command::Screenshot { photo, edit, out }),
-        (None, Some((preset, out)), edit) => match photo {
+        (Some(out), None, edit) => {
+            if at.is_some() && (photo.is_none() || edit.is_some()) {
+                return Err(USAGE);
+            }
+            Ok(Command::Screenshot {
+                photo,
+                edit,
+                out,
+                at,
+            })
+        }
+        (None, Some((preset, out)), edit) if at.is_none() => match photo {
             Some(photo) => Ok(Command::Export {
                 photo,
                 edit,
@@ -69,7 +107,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             }),
             None => Err(USAGE),
         },
-        (None, None, None) => Ok(Command::Window { photo }),
+        (None, None, None) if at.is_none() => Ok(Command::Window { photo }),
         _ => Err(USAGE),
     }
 }
@@ -85,14 +123,24 @@ fn main() -> ExitCode {
     };
     let result = match command {
         Command::Screenshot {
+            photo: Some(input),
+            out,
+            at: Some(at),
+            ..
+        } => screenshot::write_video_frame(&input, at, &out).map_err(|error| error.to_string()),
+        Command::Screenshot {
             photo: Some(photo),
             edit,
             out,
+            at: None,
         } => screenshot::write_developed(&photo, edit.as_deref(), &out)
             .map_err(|error| error.to_string()),
         Command::Screenshot {
             photo: None, out, ..
         } => screenshot::write(&out).map_err(|error| error.to_string()),
+        Command::ExportReel { input, out } => reel::export_file(&input, &out)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
         Command::Export {
             photo,
             edit,
@@ -157,6 +205,7 @@ mod tests {
                 photo: Some(PathBuf::from("a.jpg")),
                 edit: Some(PathBuf::from("e.json")),
                 out: PathBuf::from("o.png"),
+                at: None,
             })
         );
         assert_eq!(
@@ -165,8 +214,38 @@ mod tests {
                 photo: None,
                 edit: None,
                 out: PathBuf::from("o.png"),
+                at: None,
             })
         );
+    }
+
+    #[test]
+    fn a_video_screenshot_takes_a_time() {
+        assert_eq!(
+            parsed(&["--open", "a.mp4", "--screenshot", "o.png", "--at", "3.0"]),
+            Ok(Command::Screenshot {
+                photo: Some(PathBuf::from("a.mp4")),
+                edit: None,
+                out: PathBuf::from("o.png"),
+                at: Some(3.0),
+            })
+        );
+        assert!(parsed(&["--screenshot", "o.png", "--at", "3.0"]).is_err());
+        assert!(parsed(&["--open", "a.mp4", "--screenshot", "o.png", "--at", "x"]).is_err());
+        assert!(parsed(&["--open", "a.mp4", "--at", "1"]).is_err());
+    }
+
+    #[test]
+    fn a_reel_export_takes_an_input_and_an_output() {
+        assert_eq!(
+            parsed(&["--export-reel", "p.slate", "o.mp4"]),
+            Ok(Command::ExportReel {
+                input: PathBuf::from("p.slate"),
+                out: PathBuf::from("o.mp4"),
+            })
+        );
+        assert!(parsed(&["--export-reel", "p.slate"]).is_err());
+        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--screenshot", "s.png"]).is_err());
     }
 
     #[test]

@@ -20,8 +20,10 @@ pub mod export;
 pub mod headless;
 pub mod player;
 pub mod project;
+pub mod reel;
 pub mod screenshot;
 pub mod sidecar;
+pub mod timeline_tab;
 pub mod viewer;
 
 pub use app::{SlateApp, WINDOW_TITLE, native_options};

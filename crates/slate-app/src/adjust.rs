@@ -44,8 +44,8 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
         for aspect in CropAspect::ALL {
             let selected = session.crop.aspect == aspect;
             if ui.selectable_label(selected, aspect.label()).clicked() && !selected {
-                session.crop = match &session.photo {
-                    Some(photo) => Crop::fitted(aspect, photo.width, photo.height),
+                session.crop = match session.source_size() {
+                    Some((width, height)) => Crop::fitted(aspect, width, height),
                     None => Crop {
                         aspect,
                         ..session.crop
@@ -60,17 +60,14 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
     }
 
     ui.separator();
-    match &session.photo {
-        Some(photo) => {
-            let name = photo
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            ui.label(format!("{name}, {}x{}", photo.width, photo.height));
+    match (session.open_name(), session.source_size()) {
+        (Some(name), Some((width, height))) => {
+            ui.label(format!("{name}, {width}x{height}"));
         }
-        None => {
-            ui.weak("Open a photo: File > Open, drop a file on the window, or slate-app <path>.");
+        _ => {
+            ui.weak(
+                "Open a photo or a video: File > Open, drop a file on the window, or slate-app <path>.",
+            );
         }
     }
     if let Some(status) = &session.status {
