@@ -19,8 +19,11 @@ pub const LUMINANCE_STOPS: f32 = 1.0;
 pub const CHROMA_FLOOR: f32 = 0.01;
 
 /// The mixer reaches full strength at this chroma. The ramp from
-/// [`CHROMA_FLOOR`] keeps a hard edge out of near-grey gradients.
-pub const CHROMA_FULL: f32 = 0.05;
+/// [`CHROMA_FLOOR`] is kept thin: an overcast photo has most of its pixels
+/// under a chroma of 0.02, and a wide ramp leaves the mixer nothing to move
+/// there. It exists so the floor is not a step the CPU and the GPU could
+/// land on opposite sides of.
+pub const CHROMA_FULL: f32 = 0.012;
 
 /// The mixer as the shader takes it: per range the hue turn in radians, the
 /// chroma scale, the luminance offset in ACEScct units, and a spare.

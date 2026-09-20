@@ -105,7 +105,7 @@ const HUE_CENTRES: array<f32, 8> = array<f32, 8>(0.40264693, 0.726648, 1.0599453
 
 // hsl.rs
 const CHROMA_FLOOR: f32 = 0.01;
-const CHROMA_FULL: f32 = 0.05;
+const CHROMA_FULL: f32 = 0.012;
 
 fn luma(px: vec3<f32>) -> f32 {
     return dot(px, LUMA);
