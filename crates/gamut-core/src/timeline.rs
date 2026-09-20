@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The smallest span a clip can be trimmed to, in seconds: one frame at
-/// the highest rate slate plays.
+/// the highest rate Gamut plays.
 pub const MIN_CLIP_SECONDS: f64 = 1.0 / 60.0;
 
 /// A span of one media file on the track.

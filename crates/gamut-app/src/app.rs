@@ -29,7 +29,7 @@ use crate::viewer::Viewer;
 use crate::{adjust, sidecar, timeline_tab};
 
 /// The window title.
-pub const WINDOW_TITLE: &str = "slate";
+pub const WINDOW_TITLE: &str = "Gamut";
 
 /// The window size at first launch, in points.
 pub const WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
@@ -541,7 +541,7 @@ impl GamutApp {
             return;
         };
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("slate project", &[gamut_core::project::EXTENSION])
+            .add_filter("Gamut project", &[gamut_core::project::EXTENSION])
             .set_file_name(
                 project
                     .path
@@ -674,7 +674,7 @@ impl GamutApp {
     }
 }
 
-/// The open dialog, filtered to the photo, video and project formats slate
+/// The open dialog, filtered to the photo, video and project formats Gamut
 /// reads.
 fn pick_file() -> Option<PathBuf> {
     let mut all: Vec<&str> = PHOTO_EXTENSIONS.to_vec();
@@ -684,7 +684,7 @@ fn pick_file() -> Option<PathBuf> {
         .add_filter("Photos, videos and projects", &all)
         .add_filter("Photos", &PHOTO_EXTENSIONS)
         .add_filter("Videos", &VIDEO_EXTENSIONS)
-        .add_filter("slate projects", &[gamut_core::project::EXTENSION])
+        .add_filter("Gamut projects", &[gamut_core::project::EXTENSION])
         .pick_file()
 }
 

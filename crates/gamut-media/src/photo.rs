@@ -67,9 +67,9 @@ pub enum PhotoError {
         #[source]
         source: libheif_rs::HeifError,
     },
-    #[error("{path} decoded to {bits} bit planes, not the 8 bit interleaved RGB slate asked for")]
+    #[error("{path} decoded to {bits} bit planes, not the 8 bit interleaved RGB Gamut asked for")]
     UnexpectedPlanes { path: PathBuf, bits: u8 },
-    #[error("{path} is not a photo format slate opens (jpg, jpeg, png, heic, heif)")]
+    #[error("{path} is not a photo format Gamut opens (jpg, jpeg, png, heic, heif)")]
     Unsupported { path: PathBuf },
 }
 

@@ -5,7 +5,7 @@
 //! The atmospheric light is a property of the source and is estimated once
 //! on the CPU from a small downsample. The transmission map is the dark
 //! channel of I over A under a square minimum filter, t = 1 - 0.95 times
-//! that. The paper refines the map with a guided filter; slate smooths it
+//! that. The paper refines the map with a guided filter; Gamut smooths it
 //! with one gaussian at the patch size instead, which is cheap on the GPU
 //! and hides the patch edges well enough for a slider.
 

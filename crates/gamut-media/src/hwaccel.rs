@@ -1,4 +1,4 @@
-//! The hardware decode device: the one unsafe module of slate. ffmpeg's safe
+//! The hardware decode device: the one unsafe module of Gamut. ffmpeg's safe
 //! wrappers expose no hwaccel, so this module creates the CUDA device
 //! context with `av_hwdevice_ctx_create`, attaches it to a decoder before
 //! the decoder opens, installs the `get_format` callback that picks the

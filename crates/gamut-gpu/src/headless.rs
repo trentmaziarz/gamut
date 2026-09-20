@@ -25,7 +25,7 @@ impl Headless {
         let adapter = request_adapter(&instance, fallback_first)
             .or_else(|| request_adapter(&instance, !fallback_first))?;
         let descriptor = wgpu::DeviceDescriptor {
-            label: Some("slate headless device"),
+            label: Some("Gamut headless device"),
             required_features: crate::video::wanted_features(&adapter),
             ..Default::default()
         };

@@ -40,8 +40,8 @@ pub fn require(name: &str) -> PathBuf {
     assert!(
         path.is_file(),
         "fixture {name} is missing at {}; download the fixtures with: \
-         gh release download {RELEASE} --repo trentmaziarz/slate -p '*' -D {dir} \
-         and gh release download {RELEASE_M2} --repo trentmaziarz/slate -p '*' -D {dir}",
+         gh release download {RELEASE} --repo trentmaziarz/gamut -p '*' -D {dir} \
+         and gh release download {RELEASE_M2} --repo trentmaziarz/gamut -p '*' -D {dir}",
         path.display(),
         dir = dir().display()
     );

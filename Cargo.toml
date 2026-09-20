@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/trentmaziarz/slate"
+repository = "https://github.com/trentmaziarz/gamut"
 
 [workspace.dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "wgpu"] }

@@ -2,7 +2,7 @@
 //! wheels run in. The constants are those of the Academy specification
 //! S-2016-001.
 //!
-//! The published encoding is defined on AP1 primaries. slate applies the
+//! The published encoding is defined on AP1 primaries. Gamut applies the
 //! curve to linear Rec.2020 channels directly: the controls need the log
 //! shape, and a gamut hop per pixel buys nothing visible.
 

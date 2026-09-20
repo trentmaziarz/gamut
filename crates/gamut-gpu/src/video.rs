@@ -13,7 +13,7 @@ use gamut_media::FramePlanes;
 /// adapter has it; without it a 10 bit clip cannot be drawn.
 pub const P010_FEATURE: wgpu::Features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
 
-/// The features slate asks a device for: [`P010_FEATURE`] when the
+/// The features Gamut asks a device for: [`P010_FEATURE`] when the
 /// adapter offers it.
 pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     adapter.features() & P010_FEATURE

@@ -1,4 +1,4 @@
-//! The export presets: the four Instagram sizes a photo leaves slate at.
+//! The export presets: the four Instagram sizes a photo leaves Gamut at.
 
 use serde::{Deserialize, Serialize};
 

@@ -241,9 +241,9 @@ pub enum VideoError {
         #[source]
         source: Error,
     },
-    #[error("{path} decodes to {format:?}, which slate does not draw")]
+    #[error("{path} decodes to {format:?}, which Gamut does not draw")]
     UnsupportedFormat { path: PathBuf, format: Pixel },
-    #[error("{path} is not a video format slate opens (mp4, mov, m4v)")]
+    #[error("{path} is not a video format Gamut opens (mp4, mov, m4v)")]
     Unsupported { path: PathBuf },
     #[error("could not write {path}: {source}")]
     Encode {
