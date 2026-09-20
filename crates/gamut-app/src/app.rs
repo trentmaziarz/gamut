@@ -5,6 +5,8 @@
 //! Timeline tab holds the one track, File > Export opens the export
 //! dialog, and the edit is saved half a second after the last change and
 //! on close: as a sidecar next to a photo, as the .gamut file of a project.
+//! Edit > Undo and Redo walk the history of the open file, which starts
+//! empty when the file opens and is never written anywhere.
 
 use std::error::Error;
 use std::fmt;
@@ -15,7 +17,7 @@ use std::time::{Duration, Instant};
 use eframe::CreationContext;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use gamut_core::{
-    Crop, CropAspect, ExportPreset, PhotoEdit, Project, Sidecar, Track, VersionError,
+    Crop, CropAspect, ExportPreset, History, PhotoEdit, Project, Sidecar, Track, VersionError,
 };
 use gamut_media::export::write_jpeg;
 use gamut_media::open_photo;
@@ -25,6 +27,7 @@ use crate::export::{crop_for_preset, proposed_name};
 use crate::headless::crop_for;
 use crate::player::{MediaInfo, Player};
 use crate::project::{self as project_file, LoadedProject};
+use crate::undo::{self, HistoryKey, HistoryKeys, Settle, Snapshot};
 use crate::viewer::Viewer;
 use crate::{adjust, sidecar, timeline_tab};
 
@@ -252,6 +255,12 @@ pub struct Session {
     pub status: Option<String>,
     /// Playback is running, so the window must draw again at once.
     pub repaint_wanted: bool,
+    /// The undo history of what is open; `None` until the first frame after
+    /// an open, never saved.
+    pub history: Option<History<Snapshot>>,
+    /// When the arrow keys last changed the file, while that change waits
+    /// to settle into a step.
+    pub key_change_at: Option<Instant>,
 }
 
 impl Session {
@@ -371,6 +380,139 @@ impl Session {
         Ok(())
     }
 
+    /// The state of the open file as the history holds it: everything the
+    /// file saves and nothing else.
+    pub fn snapshot(&self) -> Snapshot {
+        match &self.project {
+            Some(project) => Snapshot::Project {
+                edit: Box::new(self.edit.clone()),
+                crop: self.crop,
+                track: project.track.clone(),
+            },
+            None => Snapshot::Photo(Box::new(self.sidecar())),
+        }
+    }
+
+    /// Starts an empty history at the state the file has now: when it opens.
+    pub fn begin_history(&mut self) {
+        self.history = Some(History::new(self.snapshot()));
+        self.key_change_at = None;
+    }
+
+    fn history_mut(&mut self) -> &mut History<Snapshot> {
+        if self.history.is_none() {
+            self.begin_history();
+        }
+        self.history.as_mut().expect("begun above")
+    }
+
+    /// Shows the history the state of this frame, once the tabs are drawn.
+    /// Returns how long until a change from the arrow keys settles, for the
+    /// window to draw again by then.
+    pub fn observe_history(&mut self, input: Settle, now: Instant) -> Option<Duration> {
+        let snapshot = self.snapshot();
+        if self.history_mut().changed(&snapshot) && input.arrow_key && !input.pointer_busy {
+            self.key_change_at = Some(now);
+        }
+        let waited = self
+            .key_change_at
+            .map(|at| now.saturating_duration_since(at));
+        let is_settled = undo::settled(input, waited);
+        self.history_mut().observe(&snapshot, is_settled);
+        if is_settled {
+            self.key_change_at = None;
+            return None;
+        }
+        waited.map(|waited| undo::KEY_SETTLE.saturating_sub(waited))
+    }
+
+    /// Whether Undo and Redo have anything to take. A change that has not
+    /// settled yet counts: an undo takes it back.
+    pub fn can_undo(&self) -> bool {
+        self.adjust.pending_switch.is_none()
+            && self.history.as_ref().is_some_and(|history| {
+                history.undo_steps() > 0 || *history.present() != self.snapshot()
+            })
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.adjust.pending_switch.is_none()
+            && self
+                .history
+                .as_ref()
+                .is_some_and(|history| history.redo_steps() > 0)
+    }
+
+    /// One step back. `false` when there is none, or while the Save,
+    /// Discard, Cancel prompt is up.
+    pub fn undo(&mut self) -> bool {
+        self.step_history(HistoryKey::Undo)
+    }
+
+    /// One step forward again.
+    pub fn redo(&mut self) -> bool {
+        self.step_history(HistoryKey::Redo)
+    }
+
+    fn step_history(&mut self, key: HistoryKey) -> bool {
+        if self.adjust.pending_switch.is_some() {
+            return false;
+        }
+        let current = self.snapshot();
+        let history = self.history_mut();
+        let taken = match key {
+            HistoryKey::Undo => history.undo(&current),
+            HistoryKey::Redo => history.redo(&current),
+        };
+        let Some(snapshot) = taken else {
+            return false;
+        };
+        let (back, forward) = (history.undo_steps(), history.redo_steps());
+        self.restore(snapshot);
+        self.key_change_at = None;
+        self.status = Some(match key {
+            HistoryKey::Undo => format!("Undo: {back} more to undo, {forward} to redo."),
+            HistoryKey::Redo => format!("Redo: {forward} more to redo, {back} to undo."),
+        });
+        true
+    }
+
+    /// Takes a state of the history back into the session. The picture and
+    /// the file are stale, so the file on disk follows what is shown; the
+    /// player is seated on a track that changed; and what belonged to the
+    /// state that is gone (a selection past the list, an armed pick, a
+    /// rename in progress, a switch waiting for its answer) is let go.
+    fn restore(&mut self, snapshot: Snapshot) {
+        match snapshot {
+            Snapshot::Photo(sidecar) => self.take_sidecar(*sidecar),
+            Snapshot::Project { edit, crop, track } => {
+                self.edit = *edit;
+                self.crop = crop;
+                if let Some(project) = self.project.as_mut()
+                    && project.track != track
+                {
+                    project.track = track;
+                    let clips = project.track.clips.len();
+                    project.selected = project.selected.filter(|index| *index < clips);
+                    project.track_changed();
+                }
+            }
+        }
+        if self
+            .adjust
+            .selected_mask
+            .is_some_and(|index| index >= self.edit.masks.len())
+        {
+            self.adjust.select_mask(None);
+        }
+        self.adjust.picking = None;
+        self.adjust.mask_renaming = None;
+        self.adjust.renaming = None;
+        self.adjust.pending_switch = None;
+        self.adjust.curve_editor = Default::default();
+        self.mark_edited();
+    }
+
     /// Writes the sidecar or the project file when a change is pending.
     fn save(&mut self) {
         if self.changed_at.take().is_none() {
@@ -476,6 +618,7 @@ impl GamutApp {
         self.session.status = None;
         self.session.develop_dirty = true;
         self.session.changed_at = None;
+        self.session.begin_history();
         Ok(())
     }
 
@@ -517,6 +660,7 @@ impl GamutApp {
         if let Some(project) = &mut self.session.project {
             project.player.seek(0.0);
         }
+        self.session.begin_history();
         Ok(())
     }
 
@@ -543,7 +687,81 @@ impl GamutApp {
                     self.export_dialog = Some(ExportPreset::for_aspect(self.session.crop.aspect));
                 }
             });
+            ui.menu_button("Edit", |ui| {
+                let shortcut = |modifiers, key| {
+                    ui.ctx()
+                        .format_shortcut(&egui::KeyboardShortcut::new(modifiers, key))
+                };
+                let undo = shortcut(egui::Modifiers::COMMAND, egui::Key::Z);
+                let redo = shortcut(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                );
+                if ui
+                    .add_enabled(
+                        self.session.can_undo(),
+                        egui::Button::new("Undo").shortcut_text(undo),
+                    )
+                    .clicked()
+                {
+                    self.session.undo();
+                }
+                if ui
+                    .add_enabled(
+                        self.session.can_redo(),
+                        egui::Button::new("Redo").shortcut_text(redo),
+                    )
+                    .clicked()
+                {
+                    self.session.redo();
+                }
+            });
         });
+    }
+
+    /// The history's part of a frame, after the tabs are drawn: the undo and
+    /// redo keys, then the state of this frame shown to the history.
+    fn history_frame(&mut self, ctx: &egui::Context) {
+        // A slider keeps the focus after a click, so focus alone is not
+        // typing; a text field's own undo owns the keys while it has them.
+        let typing = ctx.text_edit_focused();
+        let (keys, arrow_key, pointer_down) = ctx.input(|i| {
+            let keys = HistoryKeys {
+                command: i.modifiers.command,
+                shift: i.modifiers.shift,
+                z: i.key_pressed(egui::Key::Z),
+                y: i.key_pressed(egui::Key::Y),
+                typing,
+                prompt: self.session.adjust.pending_switch.is_some(),
+            };
+            let arrows = [
+                egui::Key::ArrowLeft,
+                egui::Key::ArrowRight,
+                egui::Key::ArrowUp,
+                egui::Key::ArrowDown,
+            ];
+            (
+                keys,
+                arrows.iter().any(|key| i.key_down(*key)),
+                i.pointer.any_down(),
+            )
+        });
+        let stepped = match undo::history_key(keys) {
+            Some(HistoryKey::Undo) => self.session.undo(),
+            Some(HistoryKey::Redo) => self.session.redo(),
+            None => false,
+        };
+        if stepped {
+            ctx.request_repaint();
+        }
+        let input = Settle {
+            pointer_busy: pointer_down || ctx.egui_is_using_pointer(),
+            typing,
+            arrow_key,
+        };
+        if let Some(wait) = self.session.observe_history(input, Instant::now()) {
+            ctx.request_repaint_after(wait);
+        }
     }
 
     /// Asks for a new .gamut path and moves the project there.
@@ -739,6 +957,7 @@ impl eframe::App for GamutApp {
             .show_leaf_collapse_buttons(false)
             .show_inside(ui, &mut tabs);
         self.export_dialog(ui.ctx());
+        self.history_frame(ui.ctx());
 
         if std::mem::take(&mut self.session.repaint_wanted) {
             ui.ctx().request_repaint();
