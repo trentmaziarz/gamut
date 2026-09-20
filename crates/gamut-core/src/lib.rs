@@ -11,6 +11,7 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
+pub mod brush;
 pub mod crop;
 pub mod export;
 pub mod history;
@@ -21,6 +22,7 @@ pub mod project;
 pub mod sidecar;
 pub mod timeline;
 
+pub use brush::{Brush, SharedStroke, Stroke};
 pub use crop::{Crop, CropAspect, CropRect};
 pub use export::ExportPreset;
 pub use history::History;

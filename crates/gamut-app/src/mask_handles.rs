@@ -259,14 +259,14 @@ impl PickImage {
 /// chroma floor until the pixel is fully inside. A gradient is left as it is.
 pub fn picked(source: &MaskSource, px: [f32; 3]) -> MaskSource {
     let v = acescct::encode_pixel(px);
-    match *source {
+    match source {
         MaskSource::Luminance(range) => {
             let n = wheels::tone(v);
             let half = (range.high - range.low).max(PICK_LUMINANCE_WIDTH) / 2.0;
             MaskSource::Luminance(LuminanceRange {
                 low: (n - half).clamp(0.0, 1.0),
                 high: (n + half).clamp(0.0, 1.0),
-                ..range
+                ..*range
             })
         }
         MaskSource::Colour(range) => {
@@ -276,10 +276,10 @@ pub fn picked(source: &MaskSource, px: [f32; 3]) -> MaskSource {
                 chroma_low: range
                     .chroma_low
                     .min((hue::chroma(plane) - CHROMA_RAMP).max(0.0)),
-                ..range
+                ..*range
             })
         }
-        other => other,
+        other => other.clone(),
     }
 }
 
@@ -476,7 +476,7 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
                         changed = true;
                     }
                 }
-                MaskSource::Luminance(_) | MaskSource::Colour(_) => {}
+                MaskSource::Luminance(_) | MaskSource::Colour(_) | MaskSource::Brush(_) => {}
             }
         }
     }

@@ -241,7 +241,7 @@ impl MaskUniform {
     fn new(mask: &Mask, geometry: &Geometry) -> Self {
         let mut components = [MaskComponentUniform::zeroed(); MAX_COMPONENTS];
         for (slot, component) in components.iter_mut().zip(&mask.components) {
-            let (kind, a, b) = match component.source {
+            let (kind, a, b) = match &component.source {
                 MaskSource::Linear(g) => {
                     (0, [g.start[0], g.start[1], g.end[0], g.end[1]], [0.0; 4])
                 }
@@ -274,6 +274,7 @@ impl MaskUniform {
                     ],
                     [0.0; 4],
                 ),
+                MaskSource::Brush(_) => (4, [0.0; 4], [0.0; 4]),
             };
             let op = match component.op {
                 MaskOp::Add => 0,

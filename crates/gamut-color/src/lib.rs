@@ -16,6 +16,7 @@
 pub mod acescct;
 pub mod basic;
 pub mod bradford;
+pub mod brush;
 pub mod curve;
 pub mod daylight;
 pub mod dehaze;

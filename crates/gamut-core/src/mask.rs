@@ -8,6 +8,8 @@
 //! of a radial gradient) are fractions of the longer side of the photo, so a
 //! radial gradient with equal radii is a circle on any photo.
 //!
+//! A painted source is a [`Brush`]: strokes, stored as points (brush.rs).
+//!
 //! [`MaskSource`] is a tagged enum: a file names the type of each source, and
 //! a build that does not know a type refuses the file by that name instead of
 //! dropping the mask.
@@ -15,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Adjustments;
+use crate::brush::Brush;
 
 /// The most masks one edit holds.
 pub const MAX_MASKS: usize = 8;
@@ -136,13 +139,14 @@ impl Default for ColourRange {
 }
 
 /// Where a component's alpha comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum MaskSource {
     Linear(LinearGradient),
     Radial(RadialGradient),
     Luminance(LuminanceRange),
     Colour(ColourRange),
+    Brush(Brush),
 }
 
 impl Default for MaskSource {
@@ -159,6 +163,7 @@ impl MaskSource {
             MaskSource::Radial(_) => "Radial gradient",
             MaskSource::Luminance(_) => "Luminance range",
             MaskSource::Colour(_) => "Colour range",
+            MaskSource::Brush(_) => "Brush",
         }
     }
 
@@ -169,7 +174,7 @@ impl MaskSource {
 
     /// The source with every number finite and inside its range.
     pub fn sanitised(&self) -> MaskSource {
-        match *self {
+        match self {
             MaskSource::Linear(linear) => {
                 let default = LinearGradient::default();
                 MaskSource::Linear(LinearGradient {
@@ -206,6 +211,7 @@ impl MaskSource {
                     falloff: finite_or(range.falloff, default.falloff).clamp(0.0, 180.0),
                 })
             }
+            MaskSource::Brush(brush) => MaskSource::Brush(brush.sanitised()),
         }
     }
 }
@@ -244,7 +250,7 @@ fn wrap_half_turn(degrees: f32) -> f32 {
 /// One part of a mask: a source, whether it is inverted, and how it joins
 /// the alpha built by the components before it. The alpha starts at 0, so a
 /// first component that adds gives its own alpha.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Component {
     pub op: MaskOp,
@@ -333,8 +339,9 @@ impl Mask {
                 .iter()
                 .take(MAX_COMPONENTS)
                 .map(|component| Component {
+                    op: component.op,
                     source: component.source.sanitised(),
-                    ..*component
+                    invert: component.invert,
                 })
                 .collect(),
             adjust: self.adjust.clone(),
@@ -405,12 +412,12 @@ mod tests {
     #[test]
     fn a_mask_round_trips_through_json_with_each_source() {
         for source in one_of_each() {
-            let mut mask = Mask::new("Sky", source);
+            let mut mask = Mask::new("Sky", source.clone());
             mask.invert = true;
             mask.opacity = 60.0;
             mask.components.push(Component {
                 op: MaskOp::Subtract,
-                source,
+                source: source.clone(),
                 invert: true,
             });
             mask.adjust.exposure = -0.7;
@@ -433,11 +440,12 @@ mod tests {
 
     #[test]
     fn an_unknown_source_type_is_an_error_that_names_it() {
-        let text = r#"{"name": "Hair", "components": [{"op": "Add", "source": {"type": "Brush", "strokes": []}}]}"#;
+        let text = r#"{"name": "Hair", "components": [{"op": "Add", "source": {"type": "Depth", "near": 0.2}}]}"#;
         let error = serde_json::from_str::<Mask>(text).expect_err("a later format");
         let message = error.to_string();
-        assert!(message.contains("Brush"), "{message}");
+        assert!(message.contains("Depth"), "{message}");
         assert!(message.contains("Linear"), "{message}");
+        assert!(message.contains("Brush"), "{message}");
     }
 
     #[test]
@@ -549,6 +557,39 @@ mod tests {
         mask.invert = false;
         mask.components[0].invert = true;
         assert_ne!(mask.shape(), shape);
+    }
+
+    #[test]
+    fn the_shape_of_a_brush_mask_changes_with_a_stroke_and_shares_the_rest() {
+        use crate::brush::{SharedStroke, Stroke};
+        let dab = |x: f32| {
+            SharedStroke::new(&Stroke {
+                points: vec![[x, 0.5]],
+                ..Stroke::default()
+            })
+        };
+        let mut mask = Mask::new(
+            "Hair",
+            MaskSource::Brush(Brush {
+                strokes: vec![dab(0.2)],
+            }),
+        );
+        let shape = mask.shape();
+        mask.adjust.exposure = 1.0;
+        mask.opacity = 40.0;
+        assert_eq!(mask.shape(), shape, "an adjustment is not the shape");
+        let MaskSource::Brush(brush) = &mut mask.components[0].source else {
+            panic!("a brush");
+        };
+        brush.strokes.push(dab(0.6));
+        let grown = mask.shape();
+        assert_ne!(grown, shape);
+        let (MaskSource::Brush(before), MaskSource::Brush(after)) =
+            (&shape.components[0].source, &grown.components[0].source)
+        else {
+            panic!("brushes");
+        };
+        assert!(after.strokes[0].shares_with(&before.strokes[0]));
     }
 
     #[test]

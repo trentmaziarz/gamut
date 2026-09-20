@@ -19,6 +19,7 @@ use gamut_core::mask::{
 use gamut_core::{Adjustments, CropRect, EXPOSURE_LIMIT, PhotoEdit, SLIDER_LIMIT, Wheel};
 
 use crate::basic::{self, Neighbourhood, Prepared};
+use crate::brush::{self, Dab};
 use crate::{acescct, hue, wheels};
 
 /// The chroma above `chroma_low` at which a colour range is fully on.
@@ -143,6 +144,7 @@ pub fn source_alpha(source: &MaskSource, at: [f32; 2], aspect: [f32; 2], px: [f3
         MaskSource::Radial(gradient) => radial(gradient, at, aspect),
         MaskSource::Luminance(range) => luminance(range, px),
         MaskSource::Colour(range) => colour(range, px),
+        MaskSource::Brush(painted) => brush::brush_alpha(painted, at, aspect),
     }
 }
 
@@ -159,14 +161,48 @@ pub fn combine(a: f32, b: f32, op: MaskOp) -> f32 {
 /// pixel: its components combined in order from 0, then the mask's invert.
 /// The opacity is not part of it.
 pub fn alpha(mask: &Mask, at: [f32; 2], aspect: [f32; 2], px: [f32; 3]) -> f32 {
-    let combined = mask.components.iter().fold(0.0, |a, component| {
-        let b = source_alpha(&component.source, at, aspect, px);
-        combine(a, if component.invert { 1.0 - b } else { b }, component.op)
-    });
-    if mask.invert {
-        1.0 - combined
-    } else {
-        combined
+    StampedMask::new(mask, aspect).alpha(at, px, &|layer| layer)
+}
+
+/// A sanitised mask with the dabs of its brushes stamped once, for the alpha
+/// of many positions.
+pub struct StampedMask<'a> {
+    mask: &'a Mask,
+    aspect: [f32; 2],
+    /// The dabs of each component that is a brush.
+    dabs: Vec<Option<Vec<Dab>>>,
+}
+
+impl<'a> StampedMask<'a> {
+    pub fn new(mask: &'a Mask, aspect: [f32; 2]) -> Self {
+        let dabs = mask
+            .components
+            .iter()
+            .map(|component| match &component.source {
+                MaskSource::Brush(painted) => Some(brush::dabs(painted, aspect)),
+                _ => None,
+            })
+            .collect();
+        StampedMask { mask, aspect, dabs }
+    }
+
+    /// The alpha at a normalised position over a source pixel. `layer_store`
+    /// is the rounding of the layer a brush is stamped into, applied after
+    /// every dab.
+    pub fn alpha(&self, at: [f32; 2], px: [f32; 3], layer_store: &dyn Fn(f32) -> f32) -> f32 {
+        let components = self.mask.components.iter().zip(&self.dabs);
+        let combined = components.fold(0.0, |a, (component, dabs)| {
+            let b = match dabs {
+                Some(dabs) => brush::dabs_alpha(dabs, at, self.aspect, layer_store),
+                None => source_alpha(&component.source, at, self.aspect, px),
+            };
+            combine(a, if component.invert { 1.0 - b } else { b }, component.op)
+        });
+        if self.mask.invert {
+            1.0 - combined
+        } else {
+            combined
+        }
     }
 }
 
@@ -177,15 +213,25 @@ pub fn stored_alpha(alpha: f32) -> f32 {
 
 /// The alpha of a mask over every pixel of a render, as the GPU stores it.
 pub fn alpha_image(mask: &Mask, pixels: &[[f32; 3]], geometry: &Geometry) -> Vec<f32> {
+    alpha_image_with(mask, pixels, geometry, &|layer| layer)
+}
+
+/// [`alpha_image`] with the rounding of the layer a brush is stamped into.
+pub fn alpha_image_with(
+    mask: &Mask,
+    pixels: &[[f32; 3]],
+    geometry: &Geometry,
+    layer_store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
     let mask = mask.sanitised();
-    let aspect = geometry.aspect();
+    let stamped = StampedMask::new(&mask, geometry.aspect());
     let width = geometry.size.0;
     pixels
         .iter()
         .enumerate()
         .map(|(i, px)| {
             let at = geometry.position(i as u32 % width, i as u32 / width);
-            stored_alpha(alpha(&mask, at, aspect, *px))
+            stored_alpha(stamped.alpha(at, *px, layer_store))
         })
         .collect()
 }
@@ -870,5 +916,59 @@ mod tests {
         };
         develop_image(&image, &edit, [1.0; 3], &counting);
         assert_eq!(count.get(), 3 * 3, "three channels, three stores");
+    }
+
+    #[test]
+    fn a_brush_combines_with_a_gradient_by_each_op() {
+        use gamut_core::brush::{Brush, SharedStroke, Stroke};
+        let painted = MaskSource::Brush(Brush {
+            strokes: vec![SharedStroke::new(&Stroke {
+                points: vec![[0.3, 0.5], [0.7, 0.5]],
+                size: 0.1,
+                feather: 100.0,
+                flow: 30.0,
+                erase: false,
+            })],
+        });
+        let gradient = MaskSource::Linear(LinearGradient {
+            start: [0.2, 0.5],
+            end: [0.8, 0.5],
+        });
+        let at = [0.6, 0.53];
+        let b = source_alpha(&painted, at, SQUARE, GREY);
+        let g = source_alpha(&gradient, at, SQUARE, GREY);
+        assert!(b > 0.1 && b < 0.95 && g > 0.1 && g < 0.95, "{b} {g}");
+        for (op, expected) in [
+            (MaskOp::Add, g + b - g * b),
+            (MaskOp::Subtract, g * (1.0 - b)),
+            (MaskOp::Intersect, g * b),
+        ] {
+            let mut mask = Mask::new("Both", gradient.clone());
+            mask.components.push(Component {
+                op,
+                source: painted.clone(),
+                invert: false,
+            });
+            assert!(close(alpha(&mask, at, SQUARE, GREY), expected), "{op:?}");
+            // The other way round the brush is what the gradient joins.
+            let mut mask = Mask::new("Both", painted.clone());
+            mask.components.push(Component {
+                op,
+                source: gradient.clone(),
+                invert: false,
+            });
+            let expected = combine(b, g, op);
+            assert!(close(alpha(&mask, at, SQUARE, GREY), expected), "{op:?}");
+        }
+        // A whole image stamps the brush once and agrees with the one pixel.
+        let geometry = Geometry::full((8, 8), (800, 800));
+        let mask = Mask::new("Painted", painted);
+        let image = alpha_image(&mask, &[GREY; 64], &geometry);
+        let pixel = geometry.position(5, 4);
+        assert_eq!(
+            image[4 * 8 + 5],
+            stored_alpha(alpha(&mask, pixel, SQUARE, GREY))
+        );
+        assert!(image[4 * 8 + 5] > 0.0);
     }
 }

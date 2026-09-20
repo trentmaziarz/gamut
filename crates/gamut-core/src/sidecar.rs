@@ -556,6 +556,24 @@ mod tests {
         );
     }
 
+    /// A sidecar exactly as version 3 wrote it before the brush: two masks
+    /// of two components, one of each source, and a version holding them.
+    const VERSION_3: &str = include_str!("testdata/sidecar_version_3.json");
+
+    #[test]
+    fn a_version_3_sidecar_from_before_the_brush_saves_back_unchanged() {
+        let back = Sidecar::from_json(VERSION_3).expect("parse");
+        assert_eq!(back.version, 3);
+        assert_eq!(back.edit.masks.len(), 2);
+        assert_eq!(back.edit.masks[1].opacity, 60.0);
+        assert_eq!(back.versions[0].edit.masks[1].opacity, 80.0);
+        assert!(back.is_dirty());
+        assert_eq!(
+            back.to_json().trim(),
+            VERSION_3.replace("\r\n", "\n").trim()
+        );
+    }
+
     #[test]
     fn masks_round_trip_in_the_working_edit_and_in_a_version() {
         let mut sidecar = Sidecar::default();
@@ -573,11 +591,11 @@ mod tests {
     #[test]
     fn a_sidecar_with_an_unknown_mask_source_is_refused_by_name() {
         let text = r#"{"version": 4, "edit": {"masks": [{"name": "Hair",
-            "components": [{"source": {"type": "Brush"}}]}]}}"#;
+            "components": [{"source": {"type": "Depth"}}]}]}}"#;
         let message = Sidecar::from_json(text)
             .expect_err("a later format")
             .to_string();
-        assert!(message.contains("Brush"), "{message}");
+        assert!(message.contains("Depth"), "{message}");
     }
 
     #[test]

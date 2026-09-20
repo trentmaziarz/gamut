@@ -220,6 +220,9 @@ fn source_fields(ui: &mut egui::Ui, source: &mut MaskSource) -> bool {
                 )
                 .changed();
         }
+        MaskSource::Brush(brush) => {
+            ui.label(format!("{} strokes", brush.strokes.len()));
+        }
     }
     changed
 }
@@ -458,12 +461,12 @@ mod tests {
     fn a_new_mask_takes_a_free_name_and_the_list_holds_eight() {
         let mut masks = Vec::new();
         let [(word, source), ..] = new_sources();
-        assert_eq!(add_mask(&mut masks, word, source), Some(0));
-        assert_eq!(add_mask(&mut masks, word, source), Some(1));
+        assert_eq!(add_mask(&mut masks, word, source.clone()), Some(0));
+        assert_eq!(add_mask(&mut masks, word, source.clone()), Some(1));
         assert_eq!(names(&masks), ["Linear", "Linear 2"]);
         assert!(masks[0].enabled && masks[0].components.len() == 1);
         while masks.len() < MAX_MASKS {
-            add_mask(&mut masks, "Radial", source).expect("room");
+            add_mask(&mut masks, "Radial", source.clone()).expect("room");
         }
         assert_eq!(add_mask(&mut masks, "Radial", source), None);
         assert_eq!(masks.len(), MAX_MASKS);
