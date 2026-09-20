@@ -34,6 +34,9 @@ pub const HUE_FALLOFF_FLOOR: f32 = 0.01;
 /// radius, so a feather of 0 is still a ramp and not a division by zero.
 pub const RADIAL_INNER_CEILING: f32 = 0.999;
 
+/// How much red the overlay of the selected mask mixes in at a full alpha.
+pub const OVERLAY_STRENGTH: f32 = 0.5;
+
 /// The shortest squared length a linear gradient is measured along.
 pub const LINEAR_LENGTH_FLOOR: f32 = 1e-12;
 
@@ -244,6 +247,17 @@ pub fn active_masks(edit: &PhotoEdit) -> Vec<(usize, Mask)> {
         .enumerate()
         .filter(|(_, mask)| mask.is_active())
         .collect()
+}
+
+/// The overlay of the selected mask on an output pixel in linear sRGB, after
+/// the clip: red mixed in by the stored alpha at [`OVERLAY_STRENGTH`].
+pub fn overlay(srgb: [f32; 3], alpha: f32) -> [f32; 3] {
+    let a = alpha * OVERLAY_STRENGTH;
+    [
+        srgb[0] * (1.0 - a) + a,
+        srgb[1] * (1.0 - a),
+        srgb[2] * (1.0 - a),
+    ]
 }
 
 /// One step of the ordered blend: `developed` over `result` by the stored
@@ -609,6 +623,14 @@ mod tests {
         assert_eq!(at(&empty, both), 0.0);
         empty.invert = true;
         assert_eq!(at(&empty, both), 1.0);
+    }
+
+    #[test]
+    fn the_overlay_mixes_red_in_by_half_the_alpha() {
+        assert_eq!(overlay([0.2, 0.4, 0.6], 0.0), [0.2, 0.4, 0.6]);
+        assert_eq!(overlay([0.2, 0.4, 0.6], 1.0), [0.6, 0.2, 0.3]);
+        assert_eq!(overlay([0.0, 0.0, 0.0], 0.5), [0.25, 0.0, 0.0]);
+        assert_eq!(overlay([1.0, 1.0, 1.0], 1.0), [1.0, 0.5, 0.5]);
     }
 
     #[test]

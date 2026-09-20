@@ -9,12 +9,12 @@ use half::f16;
 use slate_color::SourceSpace;
 use slate_color::basic;
 use slate_color::mask::{self as mask_twin, Geometry, Image};
-use slate_color::{dehaze, local};
+use slate_color::{dehaze, local, matrices, transfer};
 use slate_core::look::{Curve, HslRange, Wheel};
 use slate_core::mask::{
     ColourRange, Component, LinearGradient, LuminanceRange, MaskOp, MaskSource, RadialGradient,
 };
-use slate_core::{Adjustments, CropRect, Mask, PhotoEdit};
+use slate_core::{Adjustments, CropRect, ExportPreset, Mask, PhotoEdit};
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::Photo;
 
@@ -1081,4 +1081,131 @@ fn a_mask_slider_does_not_rebuild_its_alpha_and_a_component_does() {
         7,
         "a new source draws both again"
     );
+}
+
+/// The red overlay of the selected mask: the output pass mixes red in by the
+/// alpha of the mask, on a mask that adjusts nothing as much as on one that
+/// does, and an export never shows it.
+#[test]
+fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let idle = Mask::new("Idle", radial_source());
+    let mut edit = PhotoEdit::from(Adjustments {
+        exposure: 0.3,
+        ..Adjustments::default()
+    });
+    edit.masks = vec![exposure_mask("Linear", linear_source()), idle.clone()];
+
+    // The reference: the developed picture through the output transform
+    // with the overlay of the second mask between the clip and the curve.
+    let linear: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    let reference = |rounding: Rounding| -> Vec<[u8; 3]> {
+        let stored: Vec<[f32; 3]> = linear
+            .iter()
+            .map(|px| px.map(|c| half(c, rounding)))
+            .collect();
+        let alphas = mask_twin::alpha_image(&idle, &stored, &geometry);
+        let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
+        let store = |v: f32| half(v, rounding);
+        let base = basic::gaussian_stored(&luma, SIZE, SIZE, basic::base_sigma(SIZE, SIZE), &store);
+        let clear = vec![1.0; stored.len()];
+        let image = Image {
+            pixels: &stored,
+            base: &base,
+            texture: &luma,
+            transmission: &clear,
+            geometry,
+        };
+        mask_twin::develop_image(&image, &edit, [1.0; 3], &store)
+            .into_iter()
+            .zip(alphas)
+            .map(|(px, alpha)| {
+                let srgb = matrices::rec2020_to_srgb()
+                    .apply(px)
+                    .map(|c| c.clamp(0.0, 1.0));
+                mask_twin::overlay(srgb, alpha).map(transfer::linear_to_srgb8)
+            })
+            .collect()
+    };
+    let references = [
+        reference(Rounding::Nearest),
+        reference(Rounding::TowardZero),
+    ];
+
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let mut render = |develop: &mut Develop| -> Vec<[u8; 3]> {
+        let view = develop
+            .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        readback
+            .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
+    };
+    let plain = render(&mut develop);
+    develop.set_overlay(Some(1));
+    let overlaid = render(&mut develop);
+    let mut max = 0;
+    let mut sum = 0u64;
+    for (i, g) in overlaid.iter().enumerate() {
+        for k in 0..3 {
+            let d = references
+                .iter()
+                .map(|r| (i32::from(r[i][k]) - i32::from(g[k])).abs())
+                .min()
+                .expect("two references");
+            max = max.max(d);
+            sum += d as u64;
+        }
+    }
+    let mean = sum as f64 / (overlaid.len() * 3) as f64;
+    println!("overlay: max {max}, mean {mean:.3}");
+    assert!(max <= MAX_DIFFERENCE, "overlay: max difference {max}");
+    assert!(mean <= MEAN_DIFFERENCE, "overlay: mean difference {mean}");
+
+    // Red where the mask is, the plain picture where it is not.
+    let centre = (SIZE * (SIZE * 45 / 100) + SIZE * 55 / 100) as usize;
+    assert!(
+        overlaid[centre][0] > plain[centre][0],
+        "red inside the mask"
+    );
+    assert!(overlaid[centre][1] < plain[centre][1], "less green inside");
+    assert_eq!(overlaid[0], plain[0], "nothing outside the mask");
+
+    // Off again, the first picture comes back; an out of range mask shows
+    // nothing; an export ignores the overlay.
+    develop.set_overlay(None);
+    assert_eq!(render(&mut develop), plain);
+    develop.set_overlay(Some(5));
+    assert_eq!(render(&mut develop), plain);
+    develop.set_overlay(Some(1));
+    let shown = develop
+        .render_export(&edit, CropRect::FULL, ExportPreset::ALL[0])
+        .expect("a source is set");
+    assert_eq!(develop.overlay(), Some(1), "the export leaves the choice");
+    develop.set_overlay(None);
+    let hidden = develop
+        .render_export(&edit, CropRect::FULL, ExportPreset::ALL[0])
+        .expect("a source is set");
+    assert_eq!(shown, hidden);
 }

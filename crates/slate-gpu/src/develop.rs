@@ -304,6 +304,7 @@ impl MaskUniform {
 struct OutputUniform {
     matrix: [[f32; 4]; 3],
     crop: [f32; 4],
+    overlay: [f32; 4],
 }
 
 /// A pipeline and the layout of its one bind group.
@@ -401,6 +402,8 @@ struct Output {
     target: Target,
     bind: wgpu::BindGroup,
     frame_generation: u64,
+    /// The mask whose alpha the bind group holds for the overlay.
+    overlay: Option<usize>,
 }
 
 /// The develop graph on one device. Build it once, set a source, render as
@@ -443,6 +446,10 @@ pub struct Develop {
     /// How many mask alphas have been drawn, for the cache test.
     alpha_builds: u64,
     output_uniform: wgpu::Buffer,
+    /// The mask of the list shown as a red overlay, when one is.
+    overlay: Option<usize>,
+    /// One zero texel: the overlay alpha of an output that shows none.
+    no_overlay: Target,
     sampler: wgpu::Sampler,
     readback: Readback,
     source: Option<Source>,
@@ -547,7 +554,12 @@ impl Develop {
             "output",
             include_str!("shaders/output.wgsl"),
             OUTPUT_FORMAT,
-            &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
+            &[
+                uniform_entry(0),
+                texture_entry(1),
+                sampler_entry(2),
+                texture_entry(3),
+            ],
         );
         let uniform = |label: &str, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -600,6 +612,8 @@ impl Develop {
             mask_curves_uploaded: Default::default(),
             alpha_builds: 0,
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
+            overlay: None,
+            no_overlay: zero_texel(device, queue),
             sampler,
             readback: Readback::new(device),
             source: None,
@@ -732,6 +746,19 @@ impl Develop {
                 ..
             })
         )
+    }
+
+    /// Shows the mask at this index of the edit's list as a red overlay on
+    /// every render from now on, or none. The overlay is for the window and
+    /// for a screenshot that asks for it: [`render_export`](Self::render_export)
+    /// never draws it.
+    pub fn set_overlay(&mut self, mask: Option<usize>) {
+        self.overlay = mask;
+    }
+
+    /// The mask shown as an overlay, when one is.
+    pub fn overlay(&self) -> Option<usize> {
+        self.overlay
     }
 
     /// How many mask alphas this graph has drawn since it was built. A test
@@ -918,6 +945,13 @@ impl Develop {
         // mask that alone turns on texture or dehaze asks for the product
         // the same way the global slider does.
         let masks = mask_twin::active_masks(edit);
+        // The overlay shows a mask whether or not it adjusts anything yet,
+        // so its alpha is drawn even when the mask itself is not.
+        let shown = self.overlay.filter(|index| *index < MAX_MASKS);
+        let overlaid: Option<(usize, Mask)> = shown.and_then(|index| {
+            let mask = edit.masks.get(index)?.sanitised();
+            Some((index, mask))
+        });
         let effective: Vec<Adjustments> = masks
             .iter()
             .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
@@ -1016,8 +1050,14 @@ impl Develop {
             size: (width, height),
             photo: (source.width, source.height),
         };
-        for (index, mask) in &masks {
-            let index = *index;
+        let only_shown = overlaid
+            .iter()
+            .filter(|(index, _)| masks.iter().all(|(active, _)| active != index));
+        for (index, mask, develops) in masks
+            .iter()
+            .map(|(index, mask)| (*index, mask, true))
+            .chain(only_shown.map(|(index, mask)| (*index, mask, false)))
+        {
             let slot = frame.masks[index].get_or_insert_with(|| {
                 let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
                 let raster_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1065,6 +1105,9 @@ impl Develop {
                 );
                 slot.shape = Some(shape);
                 self.alpha_builds += 1;
+            }
+            if !develops {
+                continue;
             }
             let (ours, theirs) = (&edit.look.curves, &mask.adjust.look.curves);
             let composed = (!ours.is_identity() || !theirs.is_identity())
@@ -1114,9 +1157,11 @@ impl Develop {
         }
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
+        let overlay = overlaid.as_ref().map(|(index, _)| *index);
         let out_stale = self.out.as_ref().is_none_or(|o| {
             (o.target.width, o.target.height) != (out_width, out_height)
                 || o.frame_generation != self.frame_generation
+                || o.overlay != overlay
         });
         if out_stale {
             let target = create_target(
@@ -1126,6 +1171,9 @@ impl Develop {
                 out_width,
                 out_height,
             );
+            let overlay_alpha = overlay
+                .and_then(|index| frame.masks[index].as_ref())
+                .map_or(&self.no_overlay.view, |slot| &slot.alpha.view);
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("output bind group"),
                 layout: &self.output.layout,
@@ -1136,12 +1184,14 @@ impl Develop {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    texture_binding(3, overlay_alpha),
                 ],
             });
             self.out = Some(Output {
                 target,
                 bind,
                 frame_generation: self.frame_generation,
+                overlay,
             });
             self.out_generation += 1;
         }
@@ -1152,6 +1202,12 @@ impl Develop {
             bytemuck::bytes_of(&OutputUniform {
                 matrix: matrices::rec2020_to_srgb().to_wgsl_columns(),
                 crop: [crop.x, crop.y, crop.width, crop.height],
+                overlay: [
+                    overlay.map_or(0.0, |_| mask_twin::OVERLAY_STRENGTH),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
             }),
         );
         draw(
@@ -1195,7 +1251,15 @@ impl Develop {
     ) -> Option<Vec<u8>> {
         let (source_width, source_height) = self.source_size()?;
         let crop_size = crop.pixel_size(source_width, source_height);
-        self.render(edit, crop, (source_width, source_height), crop_size)?;
+        // An export is the picture, never the view of a mask.
+        let overlay = self.overlay.take();
+        let rendered = self
+            .render(edit, crop, (source_width, source_height), crop_size)
+            .is_some();
+        self.overlay = overlay;
+        if !rendered {
+            return None;
+        }
         let target = preset.size();
         let mut encoder = self
             .device
@@ -1248,6 +1312,7 @@ impl Develop {
             bytemuck::bytes_of(&OutputUniform {
                 matrix: matrices::Mat3::IDENTITY.to_wgsl_columns(),
                 crop: [0.0, 0.0, 1.0, 1.0],
+                overlay: [0.0; 4],
             }),
         );
         let target = create_target(
@@ -1267,6 +1332,7 @@ impl Develop {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                texture_binding(3, &self.no_overlay.view),
             ],
         });
         draw(
@@ -1429,6 +1495,43 @@ impl Develop {
             develop_bind,
             masks: Default::default(),
         }
+    }
+}
+
+/// A 1 by 1 alpha texture holding 0.
+fn zero_texel(device: &wgpu::Device, queue: &wgpu::Queue) -> Target {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("no overlay"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: ALPHA_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        texture.as_image_copy(),
+        &[0],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(1),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    Target {
+        view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        width: 1,
+        height: 1,
     }
 }
 
@@ -1736,7 +1839,7 @@ fn draw_loading(
 mod tests {
     use super::{
         DevelopUniform, FLAG_CURVES, Geometry, MaskComponentUniform, MaskUniform, MinimumUniform,
-        scissor_for,
+        OutputUniform, scissor_for,
     };
     use slate_core::mask::{Component, LinearGradient, MaskOp, MaskSource, RadialGradient};
     use slate_core::{Adjustments, CropRect, Mask};
@@ -1803,6 +1906,22 @@ mod tests {
         assert_eq!(offset("hsl"), offset_of!(DevelopUniform, hsl));
         assert_eq!(offsets.len(), 22, "a member was added without a check here");
         assert_eq!(size, 304, "the two new members took the old padding");
+    }
+
+    #[test]
+    fn the_output_uniform_matches_the_wgsl_struct() {
+        let (size, offsets) = wgsl_uniform(include_str!("shaders/output.wgsl"));
+        assert_eq!(size as usize, size_of::<OutputUniform>());
+        let expected = [
+            ("matrix", offset_of!(OutputUniform, matrix)),
+            ("crop", offset_of!(OutputUniform, crop)),
+            ("overlay", offset_of!(OutputUniform, overlay)),
+        ];
+        assert_eq!(offsets.len(), expected.len());
+        for ((name, offset), (wanted_name, wanted)) in offsets.iter().zip(expected) {
+            assert_eq!(name, wanted_name);
+            assert_eq!(*offset as usize, wanted, "{name}");
+        }
     }
 
     #[test]
