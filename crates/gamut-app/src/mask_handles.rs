@@ -24,7 +24,7 @@ use gamut_core::mask::{
 use gamut_media::Photo;
 
 use crate::app::Session;
-use crate::view::Placement;
+use crate::view::{Gesture, Over, PanInput, Placement};
 
 /// The radius of a handle in points, and of the area that grabs it.
 const HANDLE_RADIUS: f32 = 6.0;
@@ -322,6 +322,7 @@ fn paint_line(painter: &egui::Painter, points: [Pos2; 2]) {
 fn linear_handles(
     ui: &egui::Ui,
     map: &PictureMap,
+    pan: &mut PanInput,
     id: egui::Id,
     gradient: &LinearGradient,
 ) -> Option<LinearGradient> {
@@ -333,7 +334,8 @@ fn linear_handles(
             continue;
         };
         hot[k] = response.hovered() || response.dragged();
-        if response.dragged()
+        // A middle drag, or a drag with Space held, pans from here instead.
+        if pan.take(&response, Over::Handle) == Gesture::HandleDrag
             && let Some(pointer) = response.interact_pointer_pos()
         {
             *point = map.to_picture(pointer);
@@ -359,6 +361,7 @@ fn linear_handles(
 fn radial_gradient_handles(
     ui: &egui::Ui,
     map: &PictureMap,
+    pan: &mut PanInput,
     id: egui::Id,
     gradient: &RadialGradient,
 ) -> Option<RadialGradient> {
@@ -372,10 +375,8 @@ fn radial_gradient_handles(
             continue;
         };
         hot[k] = response.hovered() || response.dragged();
-        let Some(pointer) = response
-            .interact_pointer_pos()
-            .filter(|_| response.dragged())
-        else {
+        let held = pan.take(&response, Over::Handle) == Gesture::HandleDrag;
+        let Some(pointer) = response.interact_pointer_pos().filter(|_| held) else {
             continue;
         };
         match k {
@@ -409,8 +410,9 @@ fn radial_gradient_handles(
 
 /// Draws the handles of the selected mask over the picture and takes the
 /// pick click while a range is armed. Every change goes through
-/// `Session::mark_edited`.
-pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
+/// `Session::mark_edited`. A drag that pans is added to `pan` and moves no
+/// handle.
+pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mut PanInput) {
     let Some(selected) = session.adjust.selected_mask else {
         return;
     };
@@ -438,7 +440,9 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
         let response = ui
             .interact(area, base.with("pick"), Sense::click())
             .on_hover_cursor(CursorIcon::Crosshair);
+        // With Space held the pointer pans: the pick stays armed.
         if response.clicked()
+            && !pan.space
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let px = session
@@ -461,13 +465,13 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
             let id = base.with(index);
             match &mut component.source {
                 MaskSource::Linear(gradient) => {
-                    if let Some(moved) = linear_handles(ui, map, id, gradient) {
+                    if let Some(moved) = linear_handles(ui, map, pan, id, gradient) {
                         *gradient = moved;
                         changed = true;
                     }
                 }
                 MaskSource::Radial(gradient) => {
-                    if let Some(moved) = radial_gradient_handles(ui, map, id, gradient) {
+                    if let Some(moved) = radial_gradient_handles(ui, map, pan, id, gradient) {
                         *gradient = moved;
                         changed = true;
                     }

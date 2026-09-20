@@ -21,6 +21,7 @@ use crate::app::{Session, SwitchAnswer};
 use crate::curve_editor::{self, CurveEditorState};
 use crate::mask_panel;
 use crate::presets;
+use crate::view::ViewKey;
 use crate::wheel;
 
 /// The range of the exposure slider in stops.
@@ -133,7 +134,40 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
         .show(ui, |ui| sections(ui, session));
 }
 
+/// The zoom of the Viewer as a percentage, with the buttons a person
+/// without a wheel zooms with. The viewer carries the request out, because
+/// only it knows the tab.
+fn view_row(ui: &mut egui::Ui, session: &mut Session) {
+    let Some((scale, fitted)) = session.view_link.shown else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        let percent = format!("{:.0}%", scale * 100.0);
+        if fitted {
+            ui.label(format!("Zoom: Fit ({percent})"));
+        } else {
+            ui.label(format!("Zoom: {percent}"));
+        }
+        let mut ask = |ui: &mut egui::Ui, label: &str, hint: &str, key: ViewKey| {
+            if ui.small_button(label).on_hover_text(hint).clicked() {
+                session.view_link.request = Some(key);
+            }
+        };
+        ask(ui, "Fit", "The whole picture (Ctrl+0 or F)", ViewKey::Fit);
+        ask(
+            ui,
+            "100%",
+            "One screen pixel per pixel (Ctrl+1)",
+            ViewKey::Actual,
+        );
+        ask(ui, "-", "Zoom out (Ctrl+-, or the wheel)", ViewKey::Out);
+        ask(ui, "+", "Zoom in (Ctrl+=, or the wheel)", ViewKey::In);
+    });
+    ui.separator();
+}
+
 fn sections(ui: &mut egui::Ui, session: &mut Session) {
+    view_row(ui, session);
     let mut changed = false;
     // A version switch, a preset or a reset can shorten the list under the
     // selection.

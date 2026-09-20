@@ -240,6 +240,8 @@ pub struct Session {
     /// How far the Viewer is zoomed into what is open and where. It belongs
     /// to the window: no file holds it.
     pub view: crate::view::View,
+    /// What the Viewer and the other tabs tell each other about the view.
+    pub view_link: crate::view::ViewLink,
     pub grid_guide: bool,
     /// The Viewer must run the develop graph again.
     pub develop_dirty: bool,
@@ -410,6 +412,10 @@ impl GamutApp {
         let render_state = cc.wgpu_render_state.clone().ok_or(NoRenderState)?;
         let info = render_state.adapter.get_info();
         log::info!("adapter: {} ({:?})", info.name, info.backend);
+        // Ctrl with 0, = and - zoom the picture here; egui would take them
+        // to scale the whole interface.
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_with_keyboard = false);
         let mut app = Self {
             dock: layout(),
             viewer: Viewer::new(render_state),

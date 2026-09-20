@@ -235,6 +235,174 @@ impl View {
     }
 }
 
+/// What a drag on the picture is over when it starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    /// A handle of the selected mask.
+    Handle,
+    /// The crop rectangle.
+    Crop,
+    /// The picture, or the tab around it.
+    Picture,
+}
+
+/// What a drag on the picture does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    Pan,
+    HandleDrag,
+    CropDrag,
+    Nothing,
+}
+
+/// What a pointer and key state means. The middle button pans wherever it
+/// starts, and so does the primary button while Space is held. A plain drag
+/// does what it did before the viewer could zoom: it moves the handle or the
+/// crop it starts on, and nothing on the bare picture.
+pub fn gesture(over: Over, primary: bool, middle: bool, space: bool) -> Gesture {
+    if middle || (primary && space) {
+        Gesture::Pan
+    } else if primary {
+        match over {
+            Over::Handle => Gesture::HandleDrag,
+            Over::Crop => Gesture::CropDrag,
+            Over::Picture => Gesture::Nothing,
+        }
+    } else {
+        Gesture::Nothing
+    }
+}
+
+/// The pan the widgets on the picture collect during a frame: every one of
+/// them can be the start of a pan, so each reports its drag here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PanInput {
+    /// Space is held and no text field has the keyboard.
+    pub space: bool,
+    /// How far the pans of this frame moved, in points.
+    pub delta: Vec2,
+    /// A pan is under way, moving or not.
+    pub panning: bool,
+}
+
+impl PanInput {
+    /// What the drag on `response` means, with a pan added to the total.
+    pub fn take(&mut self, response: &egui::Response, over: Over) -> Gesture {
+        let found = gesture(
+            over,
+            response.dragged_by(egui::PointerButton::Primary),
+            response.dragged_by(egui::PointerButton::Middle),
+            self.space,
+        );
+        if found == Gesture::Pan {
+            self.delta += response.drag_delta();
+            self.panning = true;
+        }
+        found
+    }
+}
+
+/// A change of view a key or a button of the Adjust tab asks for. The
+/// viewer carries it out, because only it knows the tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewKey {
+    /// Ctrl+0 and F: the whole picture.
+    Fit,
+    /// Ctrl+1: 100 percent about the middle of the tab.
+    Actual,
+    /// Ctrl+= and Ctrl+-: one step about the middle of the tab.
+    In,
+    Out,
+}
+
+/// The keys of the view as they are this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewKeys {
+    /// Ctrl, or Cmd on a Mac, with nothing else but Shift (which `+` needs
+    /// on some layouts).
+    pub command: bool,
+    /// No modifier at all.
+    pub bare: bool,
+    pub zero: bool,
+    pub one: bool,
+    pub plus: bool,
+    pub minus: bool,
+    pub f: bool,
+    /// A text field or a drag value has the keyboard.
+    pub typing: bool,
+}
+
+/// The change of view the keys ask for, none while someone types.
+pub fn view_key(keys: ViewKeys) -> Option<ViewKey> {
+    if keys.typing {
+        return None;
+    }
+    if keys.command {
+        if keys.zero {
+            return Some(ViewKey::Fit);
+        }
+        if keys.one {
+            return Some(ViewKey::Actual);
+        }
+        if keys.plus {
+            return Some(ViewKey::In);
+        }
+        if keys.minus {
+            return Some(ViewKey::Out);
+        }
+    }
+    (keys.bare && keys.f).then_some(ViewKey::Fit)
+}
+
+/// Points of touchpad scroll that count as one notch of a wheel.
+const POINTS_PER_NOTCH: f32 = 40.0;
+
+/// The zoom steps of one wheel event: a notch of a wheel is one step, a
+/// touchpad scrolls [`POINTS_PER_NOTCH`] points for one.
+pub fn wheel_steps(unit: egui::MouseWheelUnit, delta: Vec2) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Point => delta.y / POINTS_PER_NOTCH,
+        egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => delta.y,
+    }
+}
+
+/// Whether the release of Space plays or pauses: only a Space that panned
+/// nothing while it was held, and never one typed into a text field.
+pub fn space_release_toggles(panned: bool, typing: bool) -> bool {
+    !panned && !typing
+}
+
+/// What the Viewer and the other tabs tell each other about the view.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ViewLink {
+    /// A change of view the Adjust tab asks the viewer for.
+    pub request: Option<ViewKey>,
+    /// The scale the viewer last showed and whether that was Fit; `None`
+    /// until a picture has been shown.
+    pub shown: Option<(f32, bool)>,
+    /// The Space that is held has panned, so its release toggles nothing.
+    pub space_panned: bool,
+}
+
+impl View {
+    /// The view after a key or a button, about the middle of the tab.
+    pub fn after_key(
+        &self,
+        key: ViewKey,
+        tab: Rect,
+        source: (u32, u32),
+        pixels_per_point: f32,
+    ) -> View {
+        let middle = tab.center();
+        match key {
+            ViewKey::Fit => View::default(),
+            ViewKey::Actual => self.zoomed_about(tab, source, pixels_per_point, middle, 1.0),
+            ViewKey::In => self.stepped(tab, source, pixels_per_point, middle, 1.0),
+            ViewKey::Out => self.stepped(tab, source, pixels_per_point, middle, -1.0),
+        }
+    }
+}
+
 /// A rectangle of pixels: x, y, width, height.
 pub type PixelRect = (u32, u32, u32, u32);
 
@@ -694,5 +862,140 @@ mod tests {
         // Coming back out sees more than a window made at 400 percent holds.
         let small = Some((deep.full, deep.window(None)));
         assert_ne!(actual.window(small), deep.window(None));
+    }
+
+    #[test]
+    fn a_plain_drag_moves_what_it_starts_on_and_nothing_on_the_bare_picture() {
+        assert_eq!(
+            gesture(Over::Handle, true, false, false),
+            Gesture::HandleDrag
+        );
+        assert_eq!(gesture(Over::Crop, true, false, false), Gesture::CropDrag);
+        assert_eq!(gesture(Over::Picture, true, false, false), Gesture::Nothing);
+        for over in [Over::Handle, Over::Crop, Over::Picture] {
+            assert_eq!(gesture(over, false, false, false), Gesture::Nothing);
+            assert_eq!(
+                gesture(over, false, false, true),
+                Gesture::Nothing,
+                "Space alone"
+            );
+        }
+    }
+
+    #[test]
+    fn space_with_a_drag_and_a_middle_drag_pan_wherever_they_start() {
+        for over in [Over::Handle, Over::Crop, Over::Picture] {
+            assert_eq!(gesture(over, true, false, true), Gesture::Pan);
+            assert_eq!(gesture(over, false, true, false), Gesture::Pan);
+            assert_eq!(gesture(over, false, true, true), Gesture::Pan);
+        }
+    }
+
+    #[test]
+    fn the_view_keys_are_ctrl_0_ctrl_1_ctrl_plus_ctrl_minus_and_f() {
+        let ctrl = ViewKeys {
+            command: true,
+            ..ViewKeys::default()
+        };
+        assert_eq!(
+            view_key(ViewKeys { zero: true, ..ctrl }),
+            Some(ViewKey::Fit)
+        );
+        assert_eq!(
+            view_key(ViewKeys { one: true, ..ctrl }),
+            Some(ViewKey::Actual)
+        );
+        assert_eq!(view_key(ViewKeys { plus: true, ..ctrl }), Some(ViewKey::In));
+        assert_eq!(
+            view_key(ViewKeys {
+                minus: true,
+                ..ctrl
+            }),
+            Some(ViewKey::Out)
+        );
+        let bare = ViewKeys {
+            bare: true,
+            ..ViewKeys::default()
+        };
+        assert_eq!(view_key(ViewKeys { f: true, ..bare }), Some(ViewKey::Fit));
+        // A bare digit is not a view key, and Ctrl+F is not Fit.
+        assert_eq!(view_key(ViewKeys { zero: true, ..bare }), None);
+        assert_eq!(view_key(ViewKeys { one: true, ..bare }), None);
+        assert_eq!(view_key(ViewKeys { f: true, ..ctrl }), None);
+        assert_eq!(view_key(ctrl), None);
+    }
+
+    #[test]
+    fn the_view_keys_are_ignored_while_a_text_field_has_the_keyboard() {
+        for keys in [
+            ViewKeys {
+                command: true,
+                zero: true,
+                ..ViewKeys::default()
+            },
+            ViewKeys {
+                command: true,
+                minus: true,
+                ..ViewKeys::default()
+            },
+            ViewKeys {
+                bare: true,
+                f: true,
+                ..ViewKeys::default()
+            },
+        ] {
+            assert!(view_key(keys).is_some());
+            assert_eq!(
+                view_key(ViewKeys {
+                    typing: true,
+                    ..keys
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_notch_of_the_wheel_is_one_step_of_a_quarter() {
+        use egui::MouseWheelUnit::{Line, Point};
+        assert_eq!(wheel_steps(Line, Vec2::new(0.0, 1.0)), 1.0);
+        assert_eq!(wheel_steps(Line, Vec2::new(0.0, -2.0)), -2.0);
+        assert_eq!(wheel_steps(Point, Vec2::new(0.0, 20.0)), 0.5);
+        let pointer = Pos2::new(500.0, 400.0);
+        let view = at(1.0, [0.5, 0.5]);
+        let steps = wheel_steps(Line, Vec2::new(0.0, 1.0));
+        let closer = view.stepped(tab(), SOURCE, 1.0, pointer, steps);
+        assert_eq!(closer.zoom, Zoom::Scale(1.25));
+        let back = closer.stepped(tab(), SOURCE, 1.0, pointer, -steps);
+        assert!(matches!(back.zoom, Zoom::Scale(s) if (s - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn space_released_after_a_pan_toggles_nothing_and_after_no_pan_toggles_playback() {
+        assert!(space_release_toggles(false, false));
+        assert!(!space_release_toggles(true, false), "it panned");
+        assert!(!space_release_toggles(false, true), "it was typed");
+        assert!(!space_release_toggles(true, true));
+    }
+
+    #[test]
+    fn the_keys_and_the_buttons_change_the_view_about_the_middle_of_the_tab() {
+        let view = at(2.0, [0.3, 0.7]);
+        assert_eq!(
+            view.after_key(ViewKey::Fit, tab(), SOURCE, 1.0),
+            View::default()
+        );
+        let actual = view.after_key(ViewKey::Actual, tab(), SOURCE, 1.0);
+        assert_eq!(actual.zoom, Zoom::Scale(1.0));
+        // The point in the middle of the tab stays there.
+        assert!(close(actual.centre, [0.3, 0.7]));
+        let closer = view.after_key(ViewKey::In, tab(), SOURCE, 1.0);
+        assert_eq!(closer.zoom, Zoom::Scale(2.5));
+        assert!(close(closer.centre, [0.3, 0.7]));
+        let further = view.after_key(ViewKey::Out, tab(), SOURCE, 1.0);
+        assert!(matches!(further.zoom, Zoom::Scale(s) if (s - 1.6).abs() < 1e-5));
+        // From Fit, 100 percent lands on the middle of the picture.
+        let from_fit = View::default().after_key(ViewKey::Actual, tab(), SOURCE, 1.0);
+        assert_eq!(from_fit, at(1.0, [0.5, 0.5]));
     }
 }

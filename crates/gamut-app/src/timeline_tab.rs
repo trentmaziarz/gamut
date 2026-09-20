@@ -2,12 +2,14 @@
 //! rectangle per clip, the playhead, the trim handles, the selection and
 //! the shortcuts. Space plays and pauses, S splits at the playhead, Delete
 //! ripple-deletes the selected clip, Home and End move the playhead, Left
-//! and Right step one frame.
+//! and Right step one frame. Space also pans the Viewer while it is held,
+//! so it plays and pauses on its release, and only when it panned nothing.
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind};
 use gamut_core::Track;
 
 use crate::app::{OpenProject, Session};
+use crate::view::space_release_toggles;
 
 /// The height of the ruler in points.
 const RULER_HEIGHT: f32 = 22.0;
@@ -43,7 +45,13 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
         ui.weak("Open a video: File > Open, drop a file on the window, or gamut-app <path>.");
         return;
     };
-    shortcuts(ui, project);
+    let typing = ui.ctx().egui_wants_keyboard_input();
+    let space = ui.input(|i| i.key_released(egui::Key::Space))
+        && space_release_toggles(session.view_link.space_panned, typing);
+    if ui.input(|i| i.key_released(egui::Key::Space)) {
+        session.view_link.space_panned = false;
+    }
+    shortcuts(ui, project, space);
     transport(ui, project);
     track_area(ui, project);
     if project.player.is_playing() {
@@ -55,10 +63,9 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
     }
 }
 
-fn shortcuts(ui: &egui::Ui, project: &mut OpenProject) {
-    let (space, split, delete, home, end, left, right) = ui.input(|i| {
+fn shortcuts(ui: &egui::Ui, project: &mut OpenProject, space: bool) {
+    let (split, delete, home, end, left, right) = ui.input(|i| {
         (
-            i.key_pressed(egui::Key::Space),
             i.key_pressed(egui::Key::S),
             i.key_pressed(egui::Key::Delete),
             i.key_pressed(egui::Key::Home),

@@ -14,7 +14,7 @@ use gamut_media::Photo;
 
 use crate::app::Session;
 use crate::mask_handles::{self, PictureMap};
-use crate::view::RenderPlan;
+use crate::view::{self, Gesture, Over, PanInput, RenderPlan, ViewKeys, Zoom};
 
 /// The viewer keeps the 4:5 feed-post shape when no photo is open.
 pub const VIEWER_ASPECT: [f32; 2] = [4.0, 5.0];
@@ -118,6 +118,12 @@ impl Viewer {
     pub fn ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
         let scale = ui.pixels_per_point();
         let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        // The wheel, the keys and a pan on the bare picture move the view
+        // before anything is placed, so the picture follows in this frame.
+        let mut pan = PanInput::default();
+        if let Some(source) = session.source_size() {
+            view_input(ui, area, source, session, &mut pan);
+        }
         // With nothing open the test image is fitted and never zooms.
         let placed = match session.source_size() {
             Some(source) => {
@@ -182,11 +188,23 @@ impl Viewer {
         if let Some(placed) = placed.filter(|_| has_picture) {
             // The one place that knows where the photo is on the screen.
             let map = PictureMap::new(&placed, area);
-            draw_crop(ui, &map, session);
+            draw_crop(ui, &map, session, &mut pan);
             // The handles of the selected mask go over the crop and take the
             // pointer first.
-            mask_handles::show(ui, &map, session);
+            mask_handles::show(ui, &map, session, &mut pan);
         }
+        // A pan that began on the crop or on a handle is known only now.
+        if let Some(source) = session.source_size() {
+            apply_pan(ui, area, source, session, &mut pan);
+            if pan.panning {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if pan.space && ui.rect_contains_pointer(area) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+        session.view_link.shown = placed
+            .filter(|_| has_picture)
+            .map(|placed| (placed.scale, placed.view.zoom == Zoom::Fit));
     }
 
     /// Uploads the player's current frame when it changed and draws it.
@@ -287,8 +305,117 @@ pub fn dragged_crop(map: &PictureMap, crop: CropRect, delta: Vec2) -> CropRect {
     crop.moved(dx, dy)
 }
 
+/// Moves the view by what the pans of this frame collected, and notes a
+/// Space that panned so its release does not play or pause.
+fn apply_pan(
+    ui: &egui::Ui,
+    area: Rect,
+    source: (u32, u32),
+    session: &mut Session,
+    pan: &mut PanInput,
+) {
+    let delta = std::mem::take(&mut pan.delta);
+    if delta == Vec2::ZERO {
+        return;
+    }
+    log::trace!("pan by {delta:?}, space {}", pan.space);
+    if pan.space {
+        session.view_link.space_panned = true;
+    }
+    let moved = session
+        .view
+        .panned(area, source, ui.pixels_per_point(), delta);
+    if moved != session.view {
+        session.view = moved;
+        ui.ctx().request_repaint();
+    }
+}
+
+/// The input that changes the view: the wheel and a pinch over the picture
+/// zoom about the pointer, the view keys and the buttons of the Adjust tab
+/// act about the middle of the tab, and a middle drag or a drag with Space
+/// held on the bare picture pans. None of it runs while the Save, Discard,
+/// Cancel prompt is up.
+fn view_input(
+    ui: &mut egui::Ui,
+    area: Rect,
+    source: (u32, u32),
+    session: &mut Session,
+    pan: &mut PanInput,
+) {
+    let scale = ui.pixels_per_point();
+    let typing = ui.ctx().egui_wants_keyboard_input();
+    let prompt = session.adjust.pending_switch.is_some();
+    let (keys, space, space_released, steps, pinch, pointer) = ui.input(|i| {
+        let mut steps = 0.0;
+        let mut pinch = 1.0;
+        for event in &i.events {
+            match event {
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    steps += view::wheel_steps(*unit, *delta);
+                }
+                egui::Event::Zoom(factor) => pinch *= *factor,
+                _ => {}
+            }
+        }
+        let modifiers = i.modifiers;
+        let keys = ViewKeys {
+            command: modifiers.command && !modifiers.alt,
+            bare: modifiers.is_none(),
+            zero: i.key_pressed(egui::Key::Num0),
+            one: i.key_pressed(egui::Key::Num1),
+            plus: i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+            minus: i.key_pressed(egui::Key::Minus),
+            f: i.key_pressed(egui::Key::F),
+            typing,
+        };
+        (
+            keys,
+            i.key_down(egui::Key::Space),
+            i.key_released(egui::Key::Space),
+            steps,
+            pinch,
+            i.pointer.hover_pos(),
+        )
+    });
+    pan.space = space && !typing && !prompt;
+    // The release belongs to the timeline, which reads the note this frame;
+    // a Space that is simply up has nothing left to say.
+    if !space && !space_released {
+        session.view_link.space_panned = false;
+    }
+    // The bare picture, under the crop and the handles: it pans and does
+    // nothing else.
+    let bare = ui.interact(area, ui.id().with("view pan"), Sense::drag());
+    if pan.take(&bare, Over::Picture) == Gesture::Pan {
+        apply_pan(ui, area, source, session, pan);
+    }
+    if prompt {
+        session.view_link.request = None;
+        return;
+    }
+    let mut view = session.view;
+    if let Some(key) = session.view_link.request.take().or(view::view_key(keys)) {
+        view = view.after_key(key, area, source, scale);
+    }
+    if let Some(pointer) = pointer.filter(|_| ui.rect_contains_pointer(area)) {
+        if steps != 0.0 {
+            log::trace!("wheel {steps} at {pointer:?}");
+            view = view.stepped(area, source, scale, pointer, steps);
+        }
+        if pinch != 1.0 {
+            let shown = view.place_exact(area, source, scale).scale;
+            view = view.zoomed_about(area, source, scale, pointer, shown * pinch);
+        }
+    }
+    if view != session.view {
+        session.view = view;
+        ui.ctx().request_repaint();
+    }
+}
+
 /// The crop rectangle, draggable, under the phone frame and its guides.
-fn draw_crop(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
+fn draw_crop(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mut PanInput) {
     let id = ui.id().with("crop drag");
     // Only the part of the crop inside the tab takes the pointer; a drag
     // under way keeps going when the pointer leaves it.
@@ -297,7 +424,8 @@ fn draw_crop(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
         .or_else(|| ui.ctx().is_being_dragged(id).then_some(map.visible));
     if let Some(grab) = grab {
         let response = ui.interact(grab, id, Sense::drag());
-        if response.dragged() {
+        // A plain drag moves the crop, as it always did; the pans go by.
+        if pan.take(&response, Over::Crop) == Gesture::CropDrag {
             session.crop.rect = dragged_crop(map, session.crop.rect, response.drag_delta());
             session.mark_edited();
         }
