@@ -7,10 +7,14 @@ use std::sync::Mutex;
 
 use half::f16;
 use slate_color::SourceSpace;
-use slate_color::basic::{self, Neighbourhood, Prepared};
+use slate_color::basic;
+use slate_color::mask::{self as mask_twin, Geometry, Image};
 use slate_color::{dehaze, local};
 use slate_core::look::{Curve, HslRange, Wheel};
-use slate_core::{Adjustments, CropRect, PhotoEdit};
+use slate_core::mask::{
+    ColourRange, Component, LinearGradient, LuminanceRange, MaskOp, MaskSource, RadialGradient,
+};
+use slate_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::Photo;
 
@@ -156,11 +160,11 @@ fn half_steps(value: f32, steps: i32) -> f32 {
 /// with dehaze on the GPU has to match the reference at the modelled map or
 /// at the map one step either way.
 fn transmission_steps(edit: &PhotoEdit) -> &'static [i32] {
-    if edit.dehaze != 0.0 {
-        &[0, -1, 1]
-    } else {
-        &[0]
-    }
+    let dehazes = edit.dehaze != 0.0
+        || mask_twin::active_masks(edit).iter().any(|(_, mask)| {
+            mask_twin::effective_adjustments(&edit.adjust, &mask.adjust).dehaze != 0.0
+        });
+    if dehazes { &[0, -1, 1] } else { &[0] }
 }
 
 fn cpu_reference(
@@ -199,19 +203,24 @@ fn cpu_reference(
     // The atmospheric light is read from the photo's bytes on the CPU, before
     // any half float store, exactly as Develop::set_source reads it.
     let atmosphere = dehaze::atmosphere_rgba8(&photo.rgba8, width, height, photo.source);
-    let transmission = dehaze::transmission_stored(&linear, width, height, atmosphere, &store);
-    let prepared = Prepared::new(edit, atmosphere);
-    (0..linear.len())
-        .map(|i| {
-            let around = Neighbourhood {
-                base_luma: base[i],
-                texture_luma: texture[i],
-                transmission: half_steps(transmission[i], transmission_step),
-            };
-            let developed = basic::develop_pixel_with(linear[i], &around, edit, &prepared)
-                .map(|c| half(c, rounding));
-            basic::output_srgb8(developed)
-        })
+    let transmission: Vec<f32> =
+        dehaze::transmission_stored(&linear, width, height, atmosphere, &store)
+            .into_iter()
+            .map(|t| half_steps(t, transmission_step))
+            .collect();
+    // The global develop and the ordered blend of the masks live in
+    // slate-color; the developed texture is a half float store after the
+    // global pass and after every blend.
+    let image = Image {
+        pixels: &linear,
+        base: &base,
+        texture: &texture,
+        transmission: &transmission,
+        geometry: Geometry::full((width, height), (width, height)),
+    };
+    mask_twin::develop_image(&image, edit, atmosphere, &store)
+        .into_iter()
+        .map(basic::output_srgb8)
         .collect()
 }
 
@@ -667,4 +676,409 @@ fn a_product_switched_on_later_matches_a_fresh_render() {
         .collect();
     assert_eq!(later, fresh);
     assert_eq!(render(&PhotoEdit::default()), first);
+}
+
+fn linear_source() -> MaskSource {
+    MaskSource::Linear(LinearGradient {
+        start: [0.2, 0.8],
+        end: [0.7, 0.3],
+    })
+}
+
+fn radial_source() -> MaskSource {
+    MaskSource::Radial(RadialGradient {
+        centre: [0.55, 0.45],
+        radius: [0.35, 0.2],
+        rotation: 30.0,
+        feather: 40.0,
+    })
+}
+
+fn luminance_source() -> MaskSource {
+    MaskSource::Luminance(LuminanceRange {
+        low: 0.45,
+        high: 0.8,
+        falloff: 0.1,
+    })
+}
+
+fn colour_source() -> MaskSource {
+    MaskSource::Colour(ColourRange {
+        hue: 250.0,
+        hue_width: 80.0,
+        chroma_low: 0.03,
+        falloff: 20.0,
+    })
+}
+
+/// A mask of one source that lifts the exposure.
+fn exposure_mask(name: &str, source: MaskSource) -> Mask {
+    let mut mask = Mask::new(name, source);
+    mask.adjust.exposure = 1.2;
+    mask
+}
+
+fn masked(masks: Vec<Mask>) -> PhotoEdit {
+    PhotoEdit {
+        masks,
+        ..PhotoEdit::default()
+    }
+}
+
+/// A mask has to move the picture for its golden test to mean anything.
+fn assert_the_masks_show(photo: &Photo, edit: &PhotoEdit) {
+    let with = cpu_reference(photo, edit, Rounding::Nearest, 0);
+    let without = cpu_reference(
+        photo,
+        &PhotoEdit::from(edit.adjust.clone()),
+        Rounding::Nearest,
+        0,
+    );
+    let moved = with.iter().zip(&without).filter(|(a, b)| a != b).count();
+    assert!(
+        moved * 20 > with.len(),
+        "the masks move only {moved} of {} pixels",
+        with.len()
+    );
+    assert!(moved < with.len(), "the masks move every pixel");
+}
+
+fn check_masks(name: &str, edit: &PhotoEdit) {
+    assert_the_masks_show(&synthetic_photo(), edit);
+    check(name, edit);
+}
+
+#[test]
+fn a_linear_gradient_mask_matches() {
+    check_masks(
+        "linear gradient mask",
+        &masked(vec![exposure_mask("Linear", linear_source())]),
+    );
+}
+
+#[test]
+fn a_radial_gradient_mask_matches() {
+    check_masks(
+        "radial gradient mask",
+        &masked(vec![exposure_mask("Radial", radial_source())]),
+    );
+}
+
+#[test]
+fn a_luminance_range_mask_matches() {
+    check_masks(
+        "luminance range mask",
+        &masked(vec![exposure_mask("Luminance", luminance_source())]),
+    );
+}
+
+#[test]
+fn a_colour_range_mask_matches() {
+    check_masks(
+        "colour range mask",
+        &masked(vec![exposure_mask("Colour", colour_source())]),
+    );
+}
+
+#[test]
+fn an_inverted_mask_matches() {
+    let mut mask = exposure_mask("Outside", radial_source());
+    mask.invert = true;
+    let inverted = masked(vec![mask]);
+    check_masks("inverted mask", &inverted);
+    let photo = synthetic_photo();
+    let plain = masked(vec![exposure_mask("Inside", radial_source())]);
+    assert_ne!(
+        cpu_reference(&photo, &inverted, Rounding::Nearest, 0),
+        cpu_reference(&photo, &plain, Rounding::Nearest, 0)
+    );
+}
+
+#[test]
+fn a_mask_at_half_opacity_matches() {
+    let mut mask = exposure_mask("Half", radial_source());
+    mask.opacity = 50.0;
+    check_masks("mask at opacity 50", &masked(vec![mask]));
+}
+
+fn linear_and_radial(op: MaskOp) -> PhotoEdit {
+    let mut mask = exposure_mask("Both", linear_source());
+    mask.components.push(Component {
+        op,
+        source: radial_source(),
+        invert: false,
+    });
+    masked(vec![mask])
+}
+
+#[test]
+fn a_linear_gradient_with_a_radial_added_matches() {
+    check_masks("linear add radial", &linear_and_radial(MaskOp::Add));
+}
+
+#[test]
+fn a_linear_gradient_with_a_radial_subtracted_matches() {
+    check_masks(
+        "linear subtract radial",
+        &linear_and_radial(MaskOp::Subtract),
+    );
+}
+
+#[test]
+fn a_linear_gradient_intersected_with_a_radial_matches() {
+    check_masks(
+        "linear intersect radial",
+        &linear_and_radial(MaskOp::Intersect),
+    );
+}
+
+#[test]
+fn two_overlapping_masks_blend_in_list_order() {
+    let mut warm = Mask::new("Warm", radial_source());
+    warm.adjust.white_balance_temperature = 60.0;
+    warm.adjust.exposure = 0.8;
+    let mut dark = Mask::new("Dark", linear_source());
+    dark.adjust.exposure = -1.0;
+    dark.adjust.saturation = -50.0;
+    dark.opacity = 70.0;
+    let one_way = masked(vec![warm.clone(), dark.clone()]);
+    let other_way = masked(vec![dark, warm]);
+    check_masks("two masks in order", &one_way);
+    check_masks("the same two masks swapped", &other_way);
+
+    // The order is part of the picture, on the CPU and on the GPU.
+    let photo = synthetic_photo();
+    assert_ne!(
+        cpu_reference(&photo, &one_way, Rounding::Nearest, 0),
+        cpu_reference(&photo, &other_way, Rounding::Nearest, 0)
+    );
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    assert_ne!(
+        gpu_render(&gpu, &photo, &one_way),
+        gpu_render(&gpu, &photo, &other_way)
+    );
+}
+
+/// The edit of `every_operator_together_matches_develop_pixel`.
+fn everything_global() -> PhotoEdit {
+    let mut edit = PhotoEdit::from(Adjustments {
+        white_balance_temperature: -20.0,
+        white_balance_tint: 10.0,
+        exposure: 0.4,
+        contrast: 25.0,
+        highlights: -40.0,
+        shadows: 30.0,
+        whites: 15.0,
+        blacks: -10.0,
+        vibrance: 20.0,
+        saturation: 8.0,
+        texture: 40.0,
+        clarity: 35.0,
+        dehaze: 30.0,
+        ..Adjustments::default()
+    });
+    edit.look.curves.master = s_curve();
+    edit.look.curves.blue = curve(&[[0.0, 0.03], [0.5, 0.46], [1.0, 1.0]]);
+    edit.look.hsl[1].saturation = -40.0;
+    edit.look.hsl[4].hue = 50.0;
+    edit.look.hsl[5].luminance = -30.0;
+    edit.look.wheels.shadows = Wheel {
+        x: -0.4,
+        y: -0.3,
+        luminance: 0.0,
+    };
+    edit.look.wheels.midtones = Wheel {
+        x: 0.1,
+        y: 0.2,
+        luminance: 10.0,
+    };
+    edit.look.wheels.highlights = Wheel {
+        x: 0.4,
+        y: 0.15,
+        luminance: 0.0,
+    };
+    edit
+}
+
+/// Adjustments that set every group: Basic, Presence, curves, mixer, wheels.
+fn everything_in_a_mask() -> Adjustments {
+    let mut adjust = Adjustments {
+        white_balance_temperature: 35.0,
+        white_balance_tint: -15.0,
+        exposure: -0.6,
+        contrast: -20.0,
+        highlights: 30.0,
+        shadows: -25.0,
+        whites: -10.0,
+        blacks: 12.0,
+        vibrance: -30.0,
+        saturation: 25.0,
+        texture: -30.0,
+        clarity: 20.0,
+        dehaze: 25.0,
+        ..Adjustments::default()
+    };
+    adjust.look.curves.master = curve(&[[0.0, 0.05], [0.4, 0.5], [1.0, 0.95]]);
+    adjust.look.curves.red = curve(&[[0.0, 0.0], [0.5, 0.58], [1.0, 1.0]]);
+    adjust.look.hsl[1].saturation = 60.0;
+    adjust.look.hsl[5].hue = -40.0;
+    adjust.look.hsl[7].luminance = 35.0;
+    adjust.look.wheels.shadows = Wheel {
+        x: 0.5,
+        y: 0.2,
+        luminance: 15.0,
+    };
+    adjust.look.wheels.highlights = Wheel {
+        x: -0.3,
+        y: -0.4,
+        luminance: -20.0,
+    };
+    adjust
+}
+
+#[test]
+fn a_mask_carrying_everything_over_a_global_edit_with_everything_matches() {
+    let mut edit = everything_global();
+    let mut mask = Mask::new("Everything", radial_source());
+    mask.adjust = everything_in_a_mask();
+    mask.opacity = 85.0;
+    edit.masks.push(mask);
+    check_masks("a mask carrying everything", &edit);
+}
+
+#[test]
+fn a_mask_that_alone_turns_on_dehaze_and_texture_matches() {
+    let mut mask = Mask::new("Haze", linear_source());
+    mask.adjust.dehaze = 60.0;
+    mask.adjust.texture = 50.0;
+    check_masks("a mask alone with dehaze and texture", &masked(vec![mask]));
+}
+
+/// A render of only the crop window has to show the masks where the full
+/// render shows them: the alpha is laid out on the photo, not on the render.
+#[test]
+fn masks_under_a_crop_window_match_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let crop = CropRect {
+        x: 0.25,
+        y: 0.25,
+        width: 0.5,
+        height: 0.5,
+    };
+    let output = (32, 32);
+    let mut colour = exposure_mask("Colour", colour_source());
+    colour.adjust.saturation = -60.0;
+    let edit = masked(vec![
+        exposure_mask("Linear", linear_source()),
+        exposure_mask("Radial", radial_source()),
+        colour,
+    ]);
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let read =
+        |view: &wgpu::TextureView| readback.read(&gpu.device, &gpu.queue, view, output.0, output.1);
+    let full = develop
+        .render(&edit, crop, (SIZE, SIZE), output)
+        .expect("a source is set");
+    let full = read(full);
+    let windowed = develop
+        .render_crop(&edit, crop, output)
+        .expect("a source is set");
+    let windowed = read(windowed);
+    let plain = develop
+        .render_crop(&PhotoEdit::default(), crop, output)
+        .expect("a source is set");
+    let plain = read(plain);
+    let max = full
+        .iter()
+        .zip(&windowed)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap_or(0);
+    println!("masked windowed render against the full render: max difference {max}");
+    assert!(max <= 1, "max difference {max}");
+    assert_ne!(windowed, plain, "the masks show inside the window");
+}
+
+/// The alpha of a mask is a head-pass product: a slider of the mask, its
+/// opacity or the global edit never draws it again; its shape does, and so
+/// does a new source.
+#[test]
+fn a_mask_slider_does_not_rebuild_its_alpha_and_a_component_does() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let mut builds_after = |edit: &PhotoEdit| -> u64 {
+        develop
+            .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        develop.mask_alpha_builds()
+    };
+    let mut edit = masked(vec![
+        exposure_mask("Radial", radial_source()),
+        exposure_mask("Luminance", luminance_source()),
+    ]);
+    assert_eq!(builds_after(&PhotoEdit::default()), 0, "no mask, no alpha");
+    assert_eq!(builds_after(&edit), 2, "one alpha per mask");
+    assert_eq!(builds_after(&edit), 2, "the same edit again");
+
+    edit.masks[0].adjust.exposure = -0.5;
+    edit.masks[0].adjust.look.curves.master = s_curve();
+    edit.masks[1].adjust.look.wheels.shadows.x = 0.3;
+    assert_eq!(builds_after(&edit), 2, "sliders of the masks");
+    edit.masks[0].opacity = 35.0;
+    edit.masks[0].name = "Renamed".to_string();
+    edit.exposure = 0.7;
+    assert_eq!(
+        builds_after(&edit),
+        2,
+        "the opacity, the name, a global slider"
+    );
+
+    edit.masks[0].components[0].invert = true;
+    assert_eq!(builds_after(&edit), 3, "a component of the first mask");
+    edit.masks[1].invert = true;
+    assert_eq!(builds_after(&edit), 4, "the invert of the second mask");
+    edit.masks[1]
+        .components
+        .push(Component::new(linear_source()));
+    assert_eq!(builds_after(&edit), 5, "a new component");
+
+    edit.masks[1].enabled = false;
+    assert_eq!(builds_after(&edit), 5, "a disabled mask costs nothing");
+    edit.masks[1].enabled = true;
+    assert_eq!(builds_after(&edit), 5, "and comes back with its alpha kept");
+
+    develop.set_source(&hazy_photo());
+    develop
+        .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+        .expect("a source is set");
+    assert_eq!(
+        develop.mask_alpha_builds(),
+        7,
+        "a new source draws both again"
+    );
 }
