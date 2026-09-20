@@ -6,6 +6,13 @@
 // line (basic.rs, local.rs, dehaze.rs, acescct.rs, curve.rs, hue.rs, hsl.rs,
 // wheels.rs); the golden tests hold the two together. Every operator is
 // skipped at its neutral value. Nothing here clips.
+//
+// Two pipelines run this shader. The global pass draws fs_main over the
+// developed texture. A mask pass draws fs_masked with the mask's effective
+// adjustments in the uniform and alpha blending on: it returns the develop
+// of the source pixel with the mask's alpha times its opacity as the alpha,
+// so the blender mixes it over what the passes before it left (mask.rs in
+// slate-color is the twin of that blend).
 
 struct Uniform {
     white_balance: mat3x3<f32>,
@@ -24,6 +31,11 @@ struct Uniform {
     dehaze: f32,
     // Bit 0: the tone curves run. Bit 1: the mixer runs. Bit 2: the wheels run.
     flags: u32,
+    // The row of the curve table this pass reads: 0 for the global edit, 1
+    // to 8 for the masks, each row the global curves with the mask's after.
+    table_row: u32,
+    // The opacity of the mask in 0 to 1; the global pass does not read it.
+    opacity: f32,
     // The atmospheric light after the white balance and the exposure.
     atmosphere: vec4<f32>,
     cdl_slope: vec4<f32>,
@@ -41,8 +53,12 @@ struct Uniform {
 @group(0) @binding(3) var texture_base: texture_2d<f32>;
 // The transmission map of dehaze.
 @group(0) @binding(4) var transmission_map: texture_2d<f32>;
-// The baked tone curves: 1024 by 1, red, green and blue tables.
+// The baked tone curves: 1024 by 9, red, green and blue tables, one row for
+// the global edit and one per mask.
 @group(0) @binding(5) var curve_table: texture_2d<f32>;
+// The alpha of the mask, from mask.wgsl. Only fs_masked reads it, so only
+// the masked pipeline binds it.
+@group(0) @binding(6) var mask_alpha: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -179,17 +195,18 @@ fn acescct_decode(v: vec3<f32>) -> vec3<f32> {
 }
 
 fn curve_lookup(x: f32, channel: i32) -> f32 {
+    let row = i32(u.table_row);
     if (x < 0.0) {
-        return textureLoad(curve_table, vec2<i32>(0, 0), 0)[channel] + x;
+        return textureLoad(curve_table, vec2<i32>(0, row), 0)[channel] + x;
     }
     if (x > 1.0) {
-        return textureLoad(curve_table, vec2<i32>(TABLE_SIZE - 1, 0), 0)[channel] + (x - 1.0);
+        return textureLoad(curve_table, vec2<i32>(TABLE_SIZE - 1, row), 0)[channel] + (x - 1.0);
     }
     let position = x * f32(TABLE_SIZE - 1);
     let i = min(i32(floor(position)), TABLE_SIZE - 2);
     let f = position - f32(i);
-    let a = textureLoad(curve_table, vec2<i32>(i, 0), 0)[channel];
-    let b = textureLoad(curve_table, vec2<i32>(i + 1, 0), 0)[channel];
+    let a = textureLoad(curve_table, vec2<i32>(i, row), 0)[channel];
+    let b = textureLoad(curve_table, vec2<i32>(i + 1, row), 0)[channel];
     return a * (1.0 - f) + b * f;
 }
 
@@ -263,9 +280,8 @@ fn vibrance_saturation(px: vec3<f32>, vibrance: f32, saturation: f32) -> vec3<f3
     return vec3<f32>(l) + chroma * gain;
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let at = vec2<i32>(in.position.xy);
+// The develop chain of the source pixel at `at` under the uniform.
+fn develop(at: vec2<i32>) -> vec3<f32> {
     var px = textureLoad(working, at, 0).rgb;
     let base_luma = textureLoad(base, at, 0).r;
     let input_luma = luma(px);
@@ -299,6 +315,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         px = acescct_decode(v);
     }
-    px = vibrance_saturation(px, u.vibrance, u.saturation);
-    return vec4<f32>(px, 1.0);
+    return vibrance_saturation(px, u.vibrance, u.saturation);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(develop(vec2<i32>(in.position.xy)), 1.0);
+}
+
+@fragment
+fn fs_masked(in: VertexOutput) -> @location(0) vec4<f32> {
+    let at = vec2<i32>(in.position.xy);
+    let alpha = textureLoad(mask_alpha, at, 0).r * u.opacity;
+    return vec4<f32>(develop(at), alpha);
 }

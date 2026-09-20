@@ -50,11 +50,13 @@ use slate_color::curve::{self, TABLE_SIZE};
 use slate_color::dehaze;
 use slate_color::hsl::HslParams;
 use slate_color::local;
+use slate_color::mask::{self as mask_twin, Geometry};
 use slate_color::matrices;
 use slate_color::video::VideoColour;
 use slate_color::wheels::Cdl;
 use slate_core::look::ToneCurves;
-use slate_core::{CropRect, ExportPreset, PhotoEdit};
+use slate_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource};
+use slate_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use slate_media::{FramePlanes, Photo};
 
 use crate::video::{VideoSource, VideoUniform};
@@ -71,6 +73,12 @@ pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSr
 
 /// The tone curve table format: full floats, read with `textureLoad`.
 pub const TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+/// The alpha of a mask: one byte per pixel.
+pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// The rows of the tone curve table: the global edit, then one per mask.
+pub const TABLE_ROWS: u32 = 1 + MAX_MASKS as u32;
 
 /// The most samples per axis the input transform averages per output pixel.
 pub const MAX_TAPS: u32 = 8;
@@ -130,7 +138,8 @@ struct DevelopUniform {
     clarity: f32,
     dehaze: f32,
     flags: u32,
-    _pad: [f32; 2],
+    table_row: u32,
+    opacity: f32,
     atmosphere: [f32; 4],
     cdl_slope: [f32; 4],
     cdl_offset: [f32; 4],
@@ -139,8 +148,9 @@ struct DevelopUniform {
 }
 
 impl DevelopUniform {
-    /// `atmosphere` is the atmospheric light of the source.
-    fn new(edit: &PhotoEdit, atmosphere: [f32; 3]) -> Self {
+    /// The uniform of the global pass. `atmosphere` is the atmospheric light
+    /// of the source.
+    fn new(edit: &Adjustments, atmosphere: [f32; 3]) -> Self {
         let wb =
             basic::white_balance_matrix(edit.white_balance_temperature, edit.white_balance_tint);
         let look = &edit.look;
@@ -175,12 +185,116 @@ impl DevelopUniform {
             clarity: edit.clarity,
             dehaze: edit.dehaze,
             flags,
-            _pad: [0.0; 2],
+            table_row: 0,
+            opacity: 1.0,
             atmosphere: wide(basic::exposed_atmosphere(&wb, atmosphere, edit.exposure)),
             cdl_slope: wide(cdl.slope),
             cdl_offset: wide(cdl.offset),
             cdl_power: wide(cdl.power),
             hsl,
+        }
+    }
+}
+
+impl DevelopUniform {
+    /// The uniform of the pass of the mask at `index` of the list: its
+    /// effective adjustments, its row of the curve table, its opacity. The
+    /// curves run when the global edit or the mask has one.
+    fn for_mask(global: &Adjustments, mask: &Mask, index: usize, atmosphere: [f32; 3]) -> Self {
+        let effective = mask_twin::effective_adjustments(global, &mask.adjust);
+        let mut uniform = Self::new(&effective, atmosphere);
+        if !mask.adjust.look.curves.is_identity() {
+            uniform.flags |= FLAG_CURVES;
+        }
+        uniform.table_row = index as u32 + 1;
+        uniform.opacity = mask.opacity / 100.0;
+        uniform
+    }
+}
+
+/// One component of `mask.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaskComponentUniform {
+    header: [u32; 4],
+    a: [f32; 4],
+    b: [f32; 4],
+}
+
+/// Mirrors the `Uniform` of `mask.wgsl`; a test holds the two layouts equal.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaskUniform {
+    window: [f32; 4],
+    render_size: [f32; 2],
+    aspect: [f32; 2],
+    count: u32,
+    invert: u32,
+    _pad: [u32; 2],
+    components: [MaskComponentUniform; MAX_COMPONENTS],
+}
+
+impl MaskUniform {
+    /// `mask` is sanitised. Everything the twin computes once per mask is
+    /// computed here with the same arithmetic: the sine and the cosine of a
+    /// rotation, the inner share of a feather, the floored falloffs.
+    fn new(mask: &Mask, geometry: &Geometry) -> Self {
+        let mut components = [MaskComponentUniform::zeroed(); MAX_COMPONENTS];
+        for (slot, component) in components.iter_mut().zip(&mask.components) {
+            let (kind, a, b) = match component.source {
+                MaskSource::Linear(g) => {
+                    (0, [g.start[0], g.start[1], g.end[0], g.end[1]], [0.0; 4])
+                }
+                MaskSource::Radial(g) => {
+                    let (sin, cos) = g.rotation.to_radians().sin_cos();
+                    let inner = (1.0 - g.feather / 100.0).min(mask_twin::RADIAL_INNER_CEILING);
+                    (
+                        1,
+                        [g.centre[0], g.centre[1], g.radius[0], g.radius[1]],
+                        [sin, cos, inner, 0.0],
+                    )
+                }
+                MaskSource::Luminance(r) => (
+                    2,
+                    [
+                        r.low,
+                        r.high,
+                        r.falloff.max(mask_twin::LUMINANCE_FALLOFF_FLOOR),
+                        0.0,
+                    ],
+                    [0.0; 4],
+                ),
+                MaskSource::Colour(r) => (
+                    3,
+                    [
+                        r.hue,
+                        r.hue_width / 2.0,
+                        r.chroma_low,
+                        r.falloff.max(mask_twin::HUE_FALLOFF_FLOOR),
+                    ],
+                    [0.0; 4],
+                ),
+            };
+            let op = match component.op {
+                MaskOp::Add => 0,
+                MaskOp::Subtract => 1,
+                MaskOp::Intersect => 2,
+            };
+            *slot = MaskComponentUniform {
+                header: [kind, op, u32::from(component.invert), 0],
+                a,
+                b,
+            };
+        }
+        let window = geometry.window;
+        MaskUniform {
+            window: [window.x, window.y, window.width, window.height],
+            render_size: [geometry.size.0 as f32, geometry.size.1 as f32],
+            aspect: geometry.aspect(),
+            count: mask.components.len().min(MAX_COMPONENTS) as u32,
+            invert: u32::from(mask.invert),
+            _pad: [0; 2],
+            components,
         }
     }
 }
@@ -266,6 +380,21 @@ struct Frame {
     smooth_h_bind: wgpu::BindGroup,
     smooth_v_bind: wgpu::BindGroup,
     develop_bind: wgpu::BindGroup,
+    /// What each mask of the list has on this frame, by its index in the
+    /// list; nothing until the mask first runs.
+    masks: [Option<FrameMask>; MAX_MASKS],
+}
+
+/// The head-pass product of one mask: its alpha, cached like the texture
+/// layer and the transmission map.
+struct FrameMask {
+    alpha: Target,
+    /// The shape `alpha` holds, or `None` when it has to be drawn again: the
+    /// head passes reran or the scissor moved. A slider of the mask's
+    /// adjustments is no part of the shape, so it never redraws the alpha.
+    shape: Option<MaskShape>,
+    raster_bind: wgpu::BindGroup,
+    develop_bind: wgpu::BindGroup,
 }
 
 struct Output {
@@ -284,6 +413,11 @@ pub struct Develop {
     blur: Pass,
     minimum: Pass,
     develop: Pass,
+    /// `mask.wgsl`: draws the alpha of one mask.
+    mask: Pass,
+    /// `develop.wgsl` through `fs_masked` with alpha blending: develops one
+    /// mask over the developed texture.
+    masked: Pass,
     output: Pass,
     input_uniform: wgpu::Buffer,
     video_uniform: wgpu::Buffer,
@@ -296,10 +430,18 @@ pub struct Develop {
     smooth_h_uniform: wgpu::Buffer,
     smooth_v_uniform: wgpu::Buffer,
     develop_uniform: wgpu::Buffer,
-    /// The tone curve table and the curves it was baked from.
+    /// Per mask of the list: the uniform of its alpha and of its develop.
+    mask_uniforms: Vec<wgpu::Buffer>,
+    masked_uniforms: Vec<wgpu::Buffer>,
+    /// The tone curve table and the curves it was baked from: row 0 from
+    /// the global curves, row 1 + i from the global curves and those of
+    /// mask i.
     curve_table: wgpu::Texture,
     curve_table_view: wgpu::TextureView,
     curves_uploaded: Option<ToneCurves>,
+    mask_curves_uploaded: [Option<(ToneCurves, ToneCurves)>; MAX_MASKS],
+    /// How many mask alphas have been drawn, for the cache test.
+    alpha_builds: u64,
     output_uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
     readback: Readback,
@@ -361,11 +503,35 @@ impl Develop {
                 table_entry(5),
             ],
         );
+        let mask = make_pass(
+            device,
+            "mask",
+            include_str!("shaders/mask.wgsl"),
+            ALPHA_FORMAT,
+            &[uniform_entry(0), texture_entry(1)],
+        );
+        let masked = make_pass_with(
+            device,
+            "masked develop",
+            include_str!("shaders/develop.wgsl"),
+            WORKING_FORMAT,
+            &[
+                uniform_entry(0),
+                texture_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                texture_entry(4),
+                table_entry(5),
+                texture_entry(6),
+            ],
+            "fs_masked",
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
         let curve_table = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tone curve table"),
             size: wgpu::Extent3d {
                 width: TABLE_SIZE as u32,
-                height: 1,
+                height: TABLE_ROWS,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -408,6 +574,8 @@ impl Develop {
             blur,
             minimum,
             develop,
+            mask,
+            masked,
             output,
             input_uniform: uniform("input uniform", size_of::<InputUniform>() as u64),
             video_uniform: uniform("video uniform", size_of::<VideoUniform>() as u64),
@@ -420,9 +588,17 @@ impl Develop {
             smooth_h_uniform: uniform("smooth h uniform", size_of::<BlurUniform>() as u64),
             smooth_v_uniform: uniform("smooth v uniform", size_of::<BlurUniform>() as u64),
             develop_uniform: uniform("develop uniform", size_of::<DevelopUniform>() as u64),
+            mask_uniforms: (0..MAX_MASKS)
+                .map(|_| uniform("mask uniform", size_of::<MaskUniform>() as u64))
+                .collect(),
+            masked_uniforms: (0..MAX_MASKS)
+                .map(|_| uniform("masked develop uniform", size_of::<DevelopUniform>() as u64))
+                .collect(),
             curve_table,
             curve_table_view,
             curves_uploaded: None,
+            mask_curves_uploaded: Default::default(),
+            alpha_builds: 0,
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
             sampler,
             readback: Readback::new(device),
@@ -556,6 +732,13 @@ impl Develop {
                 ..
             })
         )
+    }
+
+    /// How many mask alphas this graph has drawn since it was built. A test
+    /// reads it to hold that a slider of a mask never redraws its alpha.
+    #[doc(hidden)]
+    pub fn mask_alpha_builds(&self) -> u64 {
+        self.alpha_builds
     }
 
     /// The size of the source photo, when one is set.
@@ -727,8 +910,21 @@ impl Develop {
             frame.texture_ready = false;
             frame.transmission_ready = false;
             frame.products_region = Some(region);
+            for mask in frame.masks.iter_mut().flatten() {
+                mask.shape = None;
+            }
         }
-        if edit.texture != 0.0 && !frame.texture_ready {
+        // The masks that change the picture, and what each develops with. A
+        // mask that alone turns on texture or dehaze asks for the product
+        // the same way the global slider does.
+        let masks = mask_twin::active_masks(edit);
+        let effective: Vec<Adjustments> = masks
+            .iter()
+            .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
+            .collect();
+        let wants_texture = edit.texture != 0.0 || effective.iter().any(|e| e.texture != 0.0);
+        let wants_transmission = edit.dehaze != 0.0 || effective.iter().any(|e| e.dehaze != 0.0);
+        if wants_texture && !frame.texture_ready {
             let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
             write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
             write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
@@ -750,7 +946,7 @@ impl Develop {
             );
             frame.texture_ready = true;
         }
-        if edit.dehaze != 0.0 && !frame.transmission_ready {
+        if wants_transmission && !frame.transmission_ready {
             let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
             let a = source.atmosphere;
             for (buffer, direction, stage) in [
@@ -809,32 +1005,92 @@ impl Develop {
         }
         let curves = &edit.look.curves;
         if !curves.is_identity() && self.curves_uploaded.as_ref() != Some(curves) {
-            let tables = curve::bake(curves);
-            let texels: Vec<[f32; 4]> = (0..TABLE_SIZE)
-                .map(|i| [tables.red[i], tables.green[i], tables.blue[i], 1.0])
-                .collect();
-            self.queue.write_texture(
-                self.curve_table.as_image_copy(),
-                bytemuck::cast_slice(&texels),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(TABLE_SIZE as u32 * 16),
-                    rows_per_image: Some(1),
-                },
-                wgpu::Extent3d {
-                    width: TABLE_SIZE as u32,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
+            write_table_row(&self.queue, &self.curve_table, 0, &curve::bake(curves));
             self.curves_uploaded = Some(curves.clone());
+        }
+        // The alpha of each mask, drawn once and kept until its shape, the
+        // head passes or the scissor change; its row of the curve table,
+        // uploaded only when the composed curves change; its uniform.
+        let geometry = Geometry {
+            window,
+            size: (width, height),
+            photo: (source.width, source.height),
+        };
+        for (index, mask) in &masks {
+            let index = *index;
+            let slot = frame.masks[index].get_or_insert_with(|| {
+                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
+                let raster_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("mask bind group"),
+                    layout: &self.mask.layout,
+                    entries: &[
+                        buffer_binding(0, &self.mask_uniforms[index]),
+                        texture_binding(1, &frame.working.view),
+                    ],
+                });
+                let develop_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("masked develop bind group"),
+                    layout: &self.masked.layout,
+                    entries: &[
+                        buffer_binding(0, &self.masked_uniforms[index]),
+                        texture_binding(1, &frame.working.view),
+                        texture_binding(2, &frame.base.view),
+                        texture_binding(3, &frame.texture_base.view),
+                        texture_binding(4, &frame.transmission.view),
+                        texture_binding(5, &self.curve_table_view),
+                        texture_binding(6, &alpha.view),
+                    ],
+                });
+                FrameMask {
+                    alpha,
+                    shape: None,
+                    raster_bind,
+                    develop_bind,
+                }
+            });
+            let shape = mask.shape();
+            if slot.shape.as_ref() != Some(&shape) {
+                self.queue.write_buffer(
+                    &self.mask_uniforms[index],
+                    0,
+                    bytemuck::bytes_of(&MaskUniform::new(mask, &geometry)),
+                );
+                draw(
+                    &mut encoder,
+                    "mask alpha",
+                    &self.mask.pipeline,
+                    &slot.raster_bind,
+                    &slot.alpha.view,
+                    Some(region),
+                );
+                slot.shape = Some(shape);
+                self.alpha_builds += 1;
+            }
+            let (ours, theirs) = (&edit.look.curves, &mask.adjust.look.curves);
+            let composed = (!ours.is_identity() || !theirs.is_identity())
+                .then(|| (ours.clone(), theirs.clone()));
+            if composed.is_some() && self.mask_curves_uploaded[index] != composed {
+                let tables = curve::bake_composed(ours, theirs);
+                write_table_row(&self.queue, &self.curve_table, index as u32 + 1, &tables);
+                self.mask_curves_uploaded[index] = composed;
+            }
+            self.queue.write_buffer(
+                &self.masked_uniforms[index],
+                0,
+                bytemuck::bytes_of(&DevelopUniform::for_mask(
+                    &edit.adjust,
+                    mask,
+                    index,
+                    source.atmosphere,
+                )),
+            );
         }
         let frame = self.frame.as_ref().expect("frame built above");
 
         self.queue.write_buffer(
             &self.develop_uniform,
             0,
-            bytemuck::bytes_of(&DevelopUniform::new(edit, source.atmosphere)),
+            bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
         );
         draw(
             &mut encoder,
@@ -844,6 +1100,18 @@ impl Develop {
             &frame.developed.view,
             Some(region),
         );
+        // The ordered blend: each mask in list order over what is there.
+        for (index, _) in &masks {
+            let slot = frame.masks[*index].as_ref().expect("built above");
+            draw_over(
+                &mut encoder,
+                "masked develop",
+                &self.masked.pipeline,
+                &slot.develop_bind,
+                &frame.developed.view,
+                Some(region),
+            );
+        }
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
         let out_stale = self.out.as_ref().is_none_or(|o| {
@@ -1159,8 +1427,35 @@ impl Develop {
             smooth_h_bind,
             smooth_v_bind,
             develop_bind,
+            masks: Default::default(),
         }
     }
+}
+
+/// Writes one row of the tone curve table.
+fn write_table_row(queue: &wgpu::Queue, table: &wgpu::Texture, row: u32, tables: &curve::Tables) {
+    let texels: Vec<[f32; 4]> = (0..TABLE_SIZE)
+        .map(|i| [tables.red[i], tables.green[i], tables.blue[i], 1.0])
+        .collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: table,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: row, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&texels),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(TABLE_SIZE as u32 * 16),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: TABLE_SIZE as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// The pixels the blur must reach: the crop with a margin of two pixels
@@ -1289,6 +1584,27 @@ fn make_pass(
     format: wgpu::TextureFormat,
     entries: &[wgpu::BindGroupLayoutEntry],
 ) -> Pass {
+    make_pass_with(
+        device,
+        label,
+        source,
+        format,
+        entries,
+        "fs_main",
+        wgpu::BlendState::REPLACE,
+    )
+}
+
+/// [`make_pass`] with the fragment entry point and the blend named.
+fn make_pass_with(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+    format: wgpu::TextureFormat,
+    entries: &[wgpu::BindGroupLayoutEntry],
+    fragment: &str,
+    blend: wgpu::BlendState,
+) -> Pass {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -1316,11 +1632,11 @@ fn make_pass(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -1366,6 +1682,32 @@ fn draw(
     target: &wgpu::TextureView,
     scissor: Option<(u32, u32, u32, u32)>,
 ) {
+    let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+    draw_loading(encoder, label, pipeline, bind_group, target, scissor, clear);
+}
+
+/// [`draw`] over what the target holds, for a pipeline that blends.
+fn draw_over(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &wgpu::TextureView,
+    scissor: Option<(u32, u32, u32, u32)>,
+) {
+    let load = wgpu::LoadOp::Load;
+    draw_loading(encoder, label, pipeline, bind_group, target, scissor, load);
+}
+
+fn draw_loading(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &wgpu::TextureView,
+    scissor: Option<(u32, u32, u32, u32)>,
+    load: wgpu::LoadOp<wgpu::Color>,
+) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1373,7 +1715,7 @@ fn draw(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                load,
                 store: wgpu::StoreOp::Store,
             },
         })],
@@ -1392,17 +1734,26 @@ fn draw(
 
 #[cfg(test)]
 mod tests {
-    use super::{DevelopUniform, MinimumUniform, scissor_for};
-    use slate_core::CropRect;
+    use super::{
+        DevelopUniform, FLAG_CURVES, Geometry, MaskComponentUniform, MaskUniform, MinimumUniform,
+        scissor_for,
+    };
+    use slate_core::mask::{Component, LinearGradient, MaskOp, MaskSource, RadialGradient};
+    use slate_core::{Adjustments, CropRect, Mask};
     use std::mem::offset_of;
     use wgpu::naga;
 
     /// The size of the struct named `Uniform` in a shader and the offset of
     /// every member, as naga lays them out.
     fn wgsl_uniform(source: &str) -> (u32, Vec<(String, u32)>) {
+        wgsl_struct(source, "Uniform")
+    }
+
+    /// The same for the struct of any name.
+    fn wgsl_struct(source: &str, name: &str) -> (u32, Vec<(String, u32)>) {
         let module = naga::front::wgsl::parse_str(source).expect("the shader parses");
         for (_, ty) in module.types.iter() {
-            if ty.name.as_deref() != Some("Uniform") {
+            if ty.name.as_deref() != Some(name) {
                 continue;
             }
             if let naga::TypeInner::Struct { members, span } = &ty.inner {
@@ -1413,7 +1764,7 @@ mod tests {
                 return (*span, offsets);
             }
         }
-        panic!("the shader has no struct named Uniform");
+        panic!("the shader has no struct named {name}");
     }
 
     #[test]
@@ -1443,12 +1794,114 @@ mod tests {
         assert_eq!(offset("clarity"), offset_of!(DevelopUniform, clarity));
         assert_eq!(offset("dehaze"), offset_of!(DevelopUniform, dehaze));
         assert_eq!(offset("flags"), offset_of!(DevelopUniform, flags));
+        assert_eq!(offset("table_row"), offset_of!(DevelopUniform, table_row));
+        assert_eq!(offset("opacity"), offset_of!(DevelopUniform, opacity));
         assert_eq!(offset("atmosphere"), offset_of!(DevelopUniform, atmosphere));
         assert_eq!(offset("cdl_slope"), offset_of!(DevelopUniform, cdl_slope));
         assert_eq!(offset("cdl_offset"), offset_of!(DevelopUniform, cdl_offset));
         assert_eq!(offset("cdl_power"), offset_of!(DevelopUniform, cdl_power));
         assert_eq!(offset("hsl"), offset_of!(DevelopUniform, hsl));
-        assert_eq!(offsets.len(), 20, "a member was added without a check here");
+        assert_eq!(offsets.len(), 22, "a member was added without a check here");
+        assert_eq!(size, 304, "the two new members took the old padding");
+    }
+
+    #[test]
+    fn the_mask_uniform_matches_the_wgsl_struct() {
+        let source = include_str!("shaders/mask.wgsl");
+        let (size, offsets) = wgsl_uniform(source);
+        assert_eq!(size as usize, size_of::<MaskUniform>());
+        let expected = [
+            ("window", offset_of!(MaskUniform, window)),
+            ("render_size", offset_of!(MaskUniform, render_size)),
+            ("aspect", offset_of!(MaskUniform, aspect)),
+            ("count", offset_of!(MaskUniform, count)),
+            ("invert", offset_of!(MaskUniform, invert)),
+            ("components", offset_of!(MaskUniform, components)),
+        ];
+        assert_eq!(offsets.len(), expected.len());
+        for ((name, offset), (wanted_name, wanted)) in offsets.iter().zip(expected) {
+            assert_eq!(name, wanted_name);
+            assert_eq!(*offset as usize, wanted, "{name}");
+        }
+        let (size, offsets) = wgsl_struct(source, "Component");
+        assert_eq!(size as usize, size_of::<MaskComponentUniform>());
+        let expected = [
+            ("header", offset_of!(MaskComponentUniform, header)),
+            ("a", offset_of!(MaskComponentUniform, a)),
+            ("b", offset_of!(MaskComponentUniform, b)),
+        ];
+        assert_eq!(offsets.len(), expected.len());
+        for ((name, offset), (wanted_name, wanted)) in offsets.iter().zip(expected) {
+            assert_eq!(name, wanted_name);
+            assert_eq!(*offset as usize, wanted, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_mask_uniform_carries_what_the_twin_computes_once() {
+        let mut mask = Mask::new(
+            "Both",
+            MaskSource::Radial(RadialGradient {
+                centre: [0.4, 0.6],
+                radius: [0.3, 0.2],
+                rotation: 90.0,
+                feather: 25.0,
+            }),
+        );
+        mask.invert = true;
+        mask.components.push(Component {
+            op: MaskOp::Intersect,
+            source: MaskSource::Linear(LinearGradient {
+                start: [0.1, 0.2],
+                end: [0.3, 0.4],
+            }),
+            invert: true,
+        });
+        let geometry = Geometry {
+            window: CropRect {
+                x: 0.25,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0,
+            },
+            size: (200, 100),
+            photo: (4000, 2000),
+        };
+        let uniform = MaskUniform::new(&mask, &geometry);
+        assert_eq!(uniform.window, [0.25, 0.0, 0.5, 1.0]);
+        assert_eq!(uniform.render_size, [200.0, 100.0]);
+        assert_eq!(uniform.aspect, [1.0, 0.5]);
+        assert_eq!((uniform.count, uniform.invert), (2, 1));
+        let radial = uniform.components[0];
+        assert_eq!(radial.header, [1, 0, 0, 0]);
+        assert_eq!(radial.a, [0.4, 0.6, 0.3, 0.2]);
+        assert!((radial.b[0] - 1.0).abs() < 1e-6 && radial.b[1].abs() < 1e-6);
+        assert_eq!(radial.b[2], 0.75);
+        let linear = uniform.components[1];
+        assert_eq!(linear.header, [0, 2, 1, 0]);
+        assert_eq!(linear.a, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(uniform.components[2].header, [0; 4]);
+    }
+
+    #[test]
+    fn a_mask_pass_reads_its_own_row_and_runs_the_curves_of_either_side() {
+        let global = Adjustments {
+            exposure: 0.5,
+            ..Adjustments::default()
+        };
+        let mut mask = Mask::new("Sky", MaskSource::default());
+        mask.adjust.exposure = -1.25;
+        mask.opacity = 40.0;
+        let uniform = DevelopUniform::for_mask(&global, &mask, 3, [1.0; 3]);
+        assert_eq!(uniform.table_row, 4);
+        assert_eq!(uniform.opacity, 0.4);
+        assert_eq!(uniform.exposure, -0.75, "the mask adds to the global edit");
+        assert_eq!(uniform.flags & FLAG_CURVES, 0);
+        mask.adjust.look.curves.red.points.insert(1, [0.5, 0.6]);
+        let uniform = DevelopUniform::for_mask(&global, &mask, 3, [1.0; 3]);
+        assert_eq!(uniform.flags & FLAG_CURVES, FLAG_CURVES);
+        let plain = DevelopUniform::new(&global, [1.0; 3]);
+        assert_eq!((plain.table_row, plain.opacity), (0, 1.0));
     }
 
     #[test]
@@ -1498,7 +1951,7 @@ mod tests {
             let to = rest.find(';').expect("a semicolon");
             rest[from..to].trim().parse().expect("a number")
         };
-        use slate_color::{acescct, dehaze, hsl, local, wheels};
+        use slate_color::{acescct, dehaze, hsl, local, mask, wheels};
         assert_eq!(value("ACES_LINEAR_CUT"), acescct::LINEAR_CUT);
         assert_eq!(value("ACES_ENCODED_CUT"), acescct::ENCODED_CUT);
         assert_eq!(value("ACES_SLOPE"), acescct::SLOPE);
@@ -1513,6 +1966,26 @@ mod tests {
         assert_eq!(value("CHROMA_FULL"), hsl::CHROMA_FULL);
         assert_eq!(value("SHADOWS_END"), wheels::SHADOWS_END);
         assert_eq!(value("HIGHLIGHTS_START"), wheels::HIGHLIGHTS_START);
+
+        // mask.wgsl repeats what it needs of acescct.rs and adds mask.rs.
+        let source = include_str!("shaders/mask.wgsl");
+        let value = |name: &str| -> f32 {
+            let start = source
+                .find(&format!("const {name}: f32 = "))
+                .unwrap_or_else(|| panic!("no constant {name}"));
+            let rest = &source[start..];
+            let from = rest.find("= ").expect("an equals sign") + 2;
+            let to = rest.find(';').expect("a semicolon");
+            rest[from..to].trim().parse().expect("a number")
+        };
+        assert_eq!(value("ACES_LINEAR_CUT"), acescct::LINEAR_CUT);
+        assert_eq!(value("ACES_SLOPE"), acescct::SLOPE);
+        assert_eq!(value("ACES_OFFSET"), acescct::OFFSET);
+        assert_eq!(value("ACES_LOG_SHIFT"), acescct::LOG_SHIFT);
+        assert_eq!(value("ACES_LOG_SCALE"), acescct::LOG_SCALE);
+        assert_eq!(value("CHROMA_RAMP"), mask::CHROMA_RAMP);
+        assert_eq!(value("LINEAR_LENGTH_FLOOR"), mask::LINEAR_LENGTH_FLOOR);
+        assert_eq!(value("DEGREES"), 1f32.to_degrees());
     }
 
     #[test]
