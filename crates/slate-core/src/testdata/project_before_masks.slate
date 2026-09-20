@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "media": [
+    {
+      "path": "sample-5s.mp4"
+    }
+  ],
+  "track": {
+    "clips": [
+      {
+        "media": 0,
+        "source_in": 0.0,
+        "source_out": 5.7
+      }
+    ]
+  },
+  "crop": {
+    "aspect": "Square",
+    "rect": {
+      "x": 0.21875,
+      "y": 0.0,
+      "width": 0.5625,
+      "height": 1.0
+    }
+  },
+  "edit": {
+    "white_balance_temperature": -4.0,
+    "white_balance_tint": 2.0,
+    "exposure": 0.25,
+    "contrast": 10.0,
+    "highlights": -20.0,
+    "shadows": 15.0,
+    "whites": 5.0,
+    "blacks": -5.0,
+    "vibrance": 12.0,
+    "saturation": -3.0,
+    "texture": 20.0,
+    "clarity": 35.0,
+    "dehaze": 8.0,
+    "look": {
+      "curves": {
+        "master": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.25,
+              0.2
+            ],
+            [
+              0.75,
+              0.8
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "red": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "green": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "blue": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      },
+      "hsl": [
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": -40.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        }
+      ],
+      "wheels": {
+        "shadows": {
+          "x": -0.5,
+          "y": -0.3,
+          "luminance": 0.0
+        },
+        "midtones": {
+          "x": 0.0,
+          "y": 0.0,
+          "luminance": 10.0
+        },
+        "highlights": {
+          "x": 0.0,
+          "y": 0.0,
+          "luminance": 0.0
+        }
+      }
+    }
+  }
+}

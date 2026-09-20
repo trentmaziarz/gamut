@@ -7,11 +7,14 @@
 //! relative to it, and presets are JSON subsets of the photo parameters. All
 //! three are text, so they diff in git.
 
+use std::ops::{Deref, DerefMut};
+
 use serde::{Deserialize, Serialize};
 
 pub mod crop;
 pub mod export;
 pub mod look;
+pub mod mask;
 pub mod preset;
 pub mod project;
 pub mod sidecar;
@@ -20,23 +23,25 @@ pub mod timeline;
 pub use crop::{Crop, CropAspect, CropRect};
 pub use export::ExportPreset;
 pub use look::{Curve, HslRange, Look, ToneCurves, Wheel, Wheels};
+pub use mask::{Component, Mask, MaskOp, MaskSource};
 pub use preset::{LookPreset, PartialEdit};
 pub use project::{MediaRef, Project};
 pub use sidecar::{NamedVersion, Sidecar, VersionError};
 pub use timeline::{Clip, Track};
 
-/// The edit parameters of one photo: the Basic panel of M1, the presence
-/// sliders and the look of M3.
+/// Everything an edit adjusts: the Basic panel of M1, the presence sliders
+/// and the look of M3. The global edit holds one and every mask holds one of
+/// its own, which is why it is a type apart from [`PhotoEdit`].
 ///
 /// Every scalar field is a slider. Zero is the neutral position for each of
-/// them, so `PhotoEdit::default()` leaves the photo as it was shot.
+/// them, so `Adjustments::default()` leaves the photo as it was shot.
 /// Temperature and tint are offsets from the white balance read from the
 /// file, exposure is in stops, and the rest run from -100 to 100 in the
 /// Lightroom manner. The tone curves hold point lists, so the type is
 /// `Clone` and not `Copy`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct PhotoEdit {
+pub struct Adjustments {
     pub white_balance_temperature: f32,
     pub white_balance_tint: f32,
     pub exposure: f32,
@@ -53,13 +58,52 @@ pub struct PhotoEdit {
     pub look: Look,
 }
 
+/// The edit parameters of one photo: the global [`Adjustments`] and the
+/// masks that adjust parts of the picture on top of them, in list order.
+///
+/// The adjustments are flattened into the edit in a file, so an edit written
+/// before masks existed reads unchanged, and the edit dereferences to them,
+/// so `edit.exposure` is the global exposure.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoEdit {
+    #[serde(flatten)]
+    pub adjust: Adjustments,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub masks: Vec<Mask>,
+}
+
+impl Deref for PhotoEdit {
+    type Target = Adjustments;
+
+    fn deref(&self) -> &Adjustments {
+        &self.adjust
+    }
+}
+
+impl DerefMut for PhotoEdit {
+    fn deref_mut(&mut self) -> &mut Adjustments {
+        &mut self.adjust
+    }
+}
+
+impl From<Adjustments> for PhotoEdit {
+    /// An edit of these adjustments and no masks.
+    fn from(adjust: Adjustments) -> Self {
+        PhotoEdit {
+            adjust,
+            masks: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PhotoEdit;
+    use super::{Adjustments, PhotoEdit};
 
     #[test]
     fn photo_edit_round_trips_through_json() {
-        let edit = PhotoEdit {
+        let edit = PhotoEdit::from(Adjustments {
             white_balance_temperature: -12.5,
             white_balance_tint: 3.0,
             exposure: 0.35,
@@ -74,7 +118,7 @@ mod tests {
             clarity: -15.0,
             dehaze: 30.0,
             look: Default::default(),
-        };
+        });
         let text = serde_json::to_string(&edit).expect("serialize");
         let back: PhotoEdit = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(edit, back);
@@ -87,10 +131,10 @@ mod tests {
         assert_eq!(back.contrast, 0.0);
         assert_eq!(
             back,
-            PhotoEdit {
+            PhotoEdit::from(Adjustments {
                 exposure: 1.0,
-                ..PhotoEdit::default()
-            }
+                ..Adjustments::default()
+            })
         );
     }
 }

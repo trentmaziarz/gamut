@@ -10,7 +10,7 @@ use slate_color::SourceSpace;
 use slate_color::basic::{self, Neighbourhood, Prepared};
 use slate_color::{dehaze, local};
 use slate_core::look::{Curve, HslRange, Wheel};
-use slate_core::{CropRect, PhotoEdit};
+use slate_core::{Adjustments, CropRect, PhotoEdit};
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::Photo;
 
@@ -298,11 +298,11 @@ fn identity_matches() {
 fn white_balance_matches() {
     check(
         "white balance",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             white_balance_temperature: 40.0,
             white_balance_tint: -20.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -310,10 +310,10 @@ fn white_balance_matches() {
 fn exposure_matches() {
     check(
         "exposure",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             exposure: 1.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -321,10 +321,10 @@ fn exposure_matches() {
 fn contrast_matches() {
     check(
         "contrast",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             contrast: 60.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -332,10 +332,10 @@ fn contrast_matches() {
 fn highlights_match() {
     check(
         "highlights",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             highlights: -70.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -343,10 +343,10 @@ fn highlights_match() {
 fn shadows_match() {
     check(
         "shadows",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             shadows: 60.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -354,10 +354,10 @@ fn shadows_match() {
 fn whites_match() {
     check(
         "whites",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             whites: 40.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -365,10 +365,10 @@ fn whites_match() {
 fn blacks_match() {
     check(
         "blacks",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             blacks: -40.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -376,10 +376,10 @@ fn blacks_match() {
 fn vibrance_matches() {
     check(
         "vibrance",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             vibrance: 60.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -387,10 +387,10 @@ fn vibrance_matches() {
 fn saturation_matches() {
     check(
         "saturation",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             saturation: -50.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -398,7 +398,7 @@ fn saturation_matches() {
 fn every_slider_together_matches_develop_pixel() {
     check(
         "all sliders",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             white_balance_temperature: -30.0,
             white_balance_tint: 15.0,
             exposure: 0.6,
@@ -409,8 +409,8 @@ fn every_slider_together_matches_develop_pixel() {
             blacks: -15.0,
             vibrance: 30.0,
             saturation: 10.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -546,10 +546,10 @@ fn texture_matches() {
     for texture in [70.0, -70.0] {
         check(
             "texture",
-            &PhotoEdit {
+            &PhotoEdit::from(Adjustments {
                 texture,
-                ..PhotoEdit::default()
-            },
+                ..Adjustments::default()
+            }),
         );
     }
 }
@@ -559,10 +559,10 @@ fn clarity_matches() {
     for clarity in [60.0, -60.0] {
         check(
             "clarity",
-            &PhotoEdit {
+            &PhotoEdit::from(Adjustments {
                 clarity,
-                ..PhotoEdit::default()
-            },
+                ..Adjustments::default()
+            }),
         );
     }
 }
@@ -571,10 +571,10 @@ fn clarity_matches() {
 fn positive_dehaze_matches() {
     check(
         "dehaze +",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             dehaze: 70.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
@@ -582,16 +582,16 @@ fn positive_dehaze_matches() {
 fn negative_dehaze_matches() {
     check(
         "dehaze -",
-        &PhotoEdit {
+        &PhotoEdit::from(Adjustments {
             dehaze: -50.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
     );
 }
 
 #[test]
 fn every_operator_together_matches_develop_pixel() {
-    let mut edit = PhotoEdit {
+    let mut edit = PhotoEdit::from(Adjustments {
         white_balance_temperature: -20.0,
         white_balance_tint: 10.0,
         exposure: 0.4,
@@ -605,8 +605,8 @@ fn every_operator_together_matches_develop_pixel() {
         texture: 40.0,
         clarity: 35.0,
         dehaze: 30.0,
-        ..PhotoEdit::default()
-    };
+        ..Adjustments::default()
+    });
     edit.look.curves.master = s_curve();
     edit.look.curves.blue = curve(&[[0.0, 0.03], [0.5, 0.46], [1.0, 1.0]]);
     edit.look.hsl[1].saturation = -40.0;
@@ -643,11 +643,11 @@ fn a_product_switched_on_later_matches_a_fresh_render() {
     };
     println!("adapter: {}", gpu.describe());
     let photo = hazy_photo();
-    let on = PhotoEdit {
+    let on = PhotoEdit::from(Adjustments {
         texture: 50.0,
         dehaze: 60.0,
-        ..PhotoEdit::default()
-    };
+        ..Adjustments::default()
+    });
     let fresh = gpu_render(&gpu, &photo, &on);
 
     let mut develop = Develop::new(&gpu.device, &gpu.queue);

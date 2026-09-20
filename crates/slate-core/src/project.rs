@@ -160,7 +160,7 @@ fn slashes(path: &Path) -> String {
 mod tests {
     use super::{Project, VERSION, relative_path, resolve_path};
     use crate::timeline::{Clip, Track};
-    use crate::{Crop, CropAspect, CropRect, PhotoEdit};
+    use crate::{Adjustments, Crop, CropAspect, CropRect, PhotoEdit};
     use std::path::Path;
 
     #[test]
@@ -171,10 +171,10 @@ mod tests {
                 aspect: CropAspect::Story9x16,
                 rect: CropRect::fitted(CropAspect::Story9x16, 1920, 1080),
             },
-            edit: PhotoEdit {
+            edit: PhotoEdit::from(Adjustments {
                 exposure: 0.5,
-                ..PhotoEdit::default()
-            },
+                ..Adjustments::default()
+            }),
             ..Project::default()
         };
         project.add_media(Path::new("C:/clips"), Path::new("C:/clips/a.mp4"));
@@ -234,11 +234,36 @@ mod tests {
         assert_eq!(back.crop.aspect, CropAspect::Square);
         assert_eq!(
             back.edit,
-            PhotoEdit {
+            PhotoEdit::from(Adjustments {
                 exposure: 0.25,
-                ..PhotoEdit::default()
-            }
+                ..Adjustments::default()
+            })
         );
+    }
+
+    /// A project exactly as the format stood with the look and before masks.
+    const BEFORE_MASKS: &str = include_str!("testdata/project_before_masks.slate");
+
+    #[test]
+    fn a_project_from_before_masks_still_parses_and_saves_the_same() {
+        let back = Project::from_json(BEFORE_MASKS).expect("parse");
+        assert_eq!(back.edit.exposure, 0.25);
+        assert_eq!(back.edit.look.wheels.shadows.x, -0.5);
+        assert!(back.edit.masks.is_empty());
+        assert_eq!(
+            back.to_json().trim(),
+            BEFORE_MASKS.replace("\r\n", "\n").trim()
+        );
+    }
+
+    #[test]
+    fn a_project_carries_masks() {
+        let mut project = Project::default();
+        let mut mask = crate::Mask::new("Face", crate::MaskSource::default());
+        mask.adjust.shadows = 20.0;
+        project.edit.masks.push(mask);
+        let back = Project::from_json(&project.to_json()).expect("parse");
+        assert_eq!(back, project);
     }
 
     #[test]

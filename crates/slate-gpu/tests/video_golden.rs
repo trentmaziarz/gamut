@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use half::f16;
 use slate_color::basic;
 use slate_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
-use slate_core::{CropRect, PhotoEdit};
+use slate_core::{Adjustments, CropRect, PhotoEdit};
 use slate_gpu::video::P010_FEATURE;
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::VideoFrame;
@@ -288,11 +288,11 @@ fn a_windowed_render_matches_the_full_render() {
         height: 1.0,
     };
     let output = (32, 64);
-    let edit = PhotoEdit {
+    let edit = PhotoEdit::from(Adjustments {
         highlights: -60.0,
         shadows: 40.0,
-        ..PhotoEdit::default()
-    };
+        ..Adjustments::default()
+    });
     let readback = Readback::new(&gpu.device);
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_video_frame(&frame, SDR, 0);

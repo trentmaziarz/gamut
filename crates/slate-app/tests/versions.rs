@@ -39,7 +39,7 @@ fn two_versions_survive_a_reload_and_render_by_name() {
 
     let path = save(&photo, &sidecar).expect("save");
     let text = std::fs::read_to_string(&path).expect("read");
-    assert!(text.contains("\"version\": 2"), "{text}");
+    assert!(text.contains("\"version\": 3"), "{text}");
     let back = load(&photo).expect("the sidecar loads");
     assert_eq!(back, sidecar);
     assert_eq!(back.versions.len(), 2);

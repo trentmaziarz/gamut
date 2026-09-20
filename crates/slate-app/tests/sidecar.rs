@@ -1,7 +1,7 @@
 //! Writes and reads a sidecar for a copy of a fixture, as the app does.
 
 use slate_app::sidecar::{load, save};
-use slate_core::{Crop, CropAspect, CropRect, PhotoEdit, Sidecar};
+use slate_core::{Adjustments, Crop, CropAspect, CropRect, PhotoEdit, Sidecar};
 use slate_media::fixtures;
 
 #[test]
@@ -14,12 +14,12 @@ fn a_sidecar_round_trips_next_to_a_copied_fixture() {
     assert_eq!(load(&photo), None, "no sidecar before the first save");
 
     let sidecar = Sidecar::new(
-        PhotoEdit {
+        PhotoEdit::from(Adjustments {
             white_balance_temperature: 12.0,
             exposure: -0.4,
             vibrance: 25.0,
-            ..PhotoEdit::default()
-        },
+            ..Adjustments::default()
+        }),
         Crop {
             aspect: CropAspect::Story9x16,
             rect: CropRect::fitted(CropAspect::Story9x16, 1200, 1800),

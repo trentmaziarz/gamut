@@ -71,7 +71,7 @@ pub fn save(folder: &Path, preset: &LookPreset) -> std::io::Result<PathBuf> {
 mod tests {
     use super::{list, load, save};
     use slate_core::preset::Groups;
-    use slate_core::{LookPreset, PhotoEdit};
+    use slate_core::{Adjustments, LookPreset, PhotoEdit};
 
     #[test]
     fn presets_save_list_and_load_from_a_folder() {
@@ -79,10 +79,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         assert!(list(&folder).is_empty(), "no folder yet, no presets");
 
-        let edit = PhotoEdit {
+        let edit = PhotoEdit::from(Adjustments {
             clarity: 20.0,
-            ..PhotoEdit::default()
-        };
+            ..Adjustments::default()
+        });
         let warm = LookPreset::from_edit("Warm Film", &edit, Groups::ALL);
         let cold = LookPreset::from_edit("cold", &edit, Groups::ALL);
         let path = save(&folder, &warm).expect("save");

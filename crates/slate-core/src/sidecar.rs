@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Crop, PhotoEdit};
 
 /// The sidecar format version this build writes. Version 2 added the
-/// presence sliders and the look to the edit; every new field has a default,
-/// so a version 1 file reads as a version 2 file with a neutral look.
-pub const VERSION: u32 = 2;
+/// presence sliders and the look to the edit, version 3 the masks; every new
+/// field has a default, so a version 1 file reads as a version 3 file with a
+/// neutral look and a version 2 file as one with no masks. A later version
+/// that names a mask source this build does not know is refused by that
+/// name, not read with the mask dropped.
+pub const VERSION: u32 = 3;
 
 /// What is appended to the photo's file name.
 pub const SUFFIX: &str = ".slate.json";
@@ -225,17 +228,17 @@ impl Sidecar {
 #[cfg(test)]
 mod tests {
     use super::{SUFFIX, Sidecar, VERSION, VersionError};
-    use crate::{Crop, CropAspect, CropRect, PhotoEdit};
+    use crate::{Adjustments, Crop, CropAspect, CropRect, Mask, MaskSource, PhotoEdit};
     use std::path::Path;
 
     #[test]
     fn a_sidecar_round_trips_through_json() {
         let sidecar = Sidecar::new(
-            PhotoEdit {
+            PhotoEdit::from(Adjustments {
                 exposure: 0.7,
                 highlights: -30.0,
-                ..PhotoEdit::default()
-            },
+                ..Adjustments::default()
+            }),
             Crop {
                 aspect: CropAspect::Grid3x4,
                 rect: CropRect {
@@ -491,7 +494,7 @@ mod tests {
         assert_eq!(back.version, 1);
         assert_eq!(
             back.edit,
-            PhotoEdit {
+            PhotoEdit::from(Adjustments {
                 white_balance_temperature: -4.0,
                 white_balance_tint: 2.0,
                 exposure: 0.5,
@@ -502,16 +505,79 @@ mod tests {
                 blacks: -5.0,
                 vibrance: 12.0,
                 saturation: -3.0,
-                ..PhotoEdit::default()
-            }
+                ..Adjustments::default()
+            })
         );
         assert!(back.edit.look.is_identity());
         assert_eq!(back.crop.aspect, CropAspect::Feed4x5);
         assert_eq!(back.crop.rect.width, 0.5);
-        // Saved again, it is a version 2 file.
+        assert!(back.edit.masks.is_empty());
+        // Saved again, it is a version 3 file.
         let saved = Sidecar::new(back.edit, back.crop);
-        assert_eq!(saved.version, 2);
-        assert_eq!(VERSION, 2);
+        assert_eq!(saved.version, 3);
+        assert_eq!(VERSION, 3);
+    }
+
+    /// A sidecar exactly as version 2 of the format wrote it, with a look,
+    /// two versions and an active version.
+    const VERSION_2: &str = include_str!("testdata/sidecar_version_2.json");
+
+    #[test]
+    fn a_version_2_sidecar_reads_with_no_masks_and_saves_as_version_3() {
+        let back = Sidecar::from_json(VERSION_2).expect("parse");
+        assert_eq!(back.version, 2);
+        assert!(back.edit.masks.is_empty());
+        assert_eq!(back.edit.exposure, 0.5);
+        assert_eq!(back.edit.clarity, 35.0);
+        assert_eq!(back.edit.look.curves.master.points.len(), 4);
+        assert_eq!(back.edit.look.hsl[4].saturation, -40.0);
+        assert_eq!(back.edit.look.wheels.shadows.x, -0.5);
+        assert_eq!(back.crop.aspect, CropAspect::Feed4x5);
+        assert_eq!(back.versions.len(), 2);
+        assert_eq!(back.active_version.as_deref(), Some("Teal"));
+        assert!(!back.is_dirty());
+        assert!(back.versions.iter().all(|v| v.edit.masks.is_empty()));
+
+        let saved = Sidecar {
+            versions: back.versions.clone(),
+            active_version: back.active_version.clone(),
+            ..Sidecar::new(back.edit.clone(), back.crop)
+        };
+        let text = saved.to_json();
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(
+            !text.contains("masks"),
+            "an edit without masks writes no key"
+        );
+        // Apart from the version number the file is the one version 2 wrote.
+        assert_eq!(
+            text.replace("\"version\": 3", "\"version\": 2").trim(),
+            VERSION_2.replace("\r\n", "\n").trim()
+        );
+    }
+
+    #[test]
+    fn masks_round_trip_in_the_working_edit_and_in_a_version() {
+        let mut sidecar = Sidecar::default();
+        let mut mask = Mask::new("Sky", MaskSource::default());
+        mask.adjust.exposure = -0.8;
+        sidecar.edit.masks.push(mask);
+        sidecar.save_version("With sky").expect("save");
+        sidecar.edit.masks[0].adjust.exposure = -1.2;
+        assert!(sidecar.is_dirty(), "a mask change is a change");
+        let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
+        assert_eq!(back, sidecar);
+        assert_eq!(back.versions[0].edit.masks[0].adjust.exposure, -0.8);
+    }
+
+    #[test]
+    fn a_sidecar_with_an_unknown_mask_source_is_refused_by_name() {
+        let text = r#"{"version": 4, "edit": {"masks": [{"name": "Hair",
+            "components": [{"source": {"type": "Brush"}}]}]}}"#;
+        let message = Sidecar::from_json(text)
+            .expect_err("a later format")
+            .to_string();
+        assert!(message.contains("Brush"), "{message}");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::PhotoEdit;
+use crate::Adjustments;
 use crate::look::{HSL_RANGES, HslRange, ToneCurves, Wheels};
 
 /// The look preset format version this build writes.
@@ -96,7 +96,7 @@ pub struct PartialEdit {
 
 impl PartialEdit {
     /// The part of `edit` that `groups` names.
-    pub fn from_edit(edit: &PhotoEdit, groups: Groups) -> Self {
+    pub fn from_edit(edit: &Adjustments, groups: Groups) -> Self {
         let mut partial = PartialEdit::default();
         if groups.basic {
             partial.white_balance_temperature = Some(edit.white_balance_temperature);
@@ -129,7 +129,7 @@ impl PartialEdit {
 
     /// Overwrites the fields of `edit` that are present here and leaves the
     /// rest as they are.
-    pub fn apply(&self, edit: &mut PhotoEdit) {
+    pub fn apply(&self, edit: &mut Adjustments) {
         let scalars = [
             (
                 self.white_balance_temperature,
@@ -206,7 +206,7 @@ impl Default for LookPreset {
 
 impl LookPreset {
     /// A preset of the named groups of `edit`.
-    pub fn from_edit(name: &str, edit: &PhotoEdit, groups: Groups) -> Self {
+    pub fn from_edit(name: &str, edit: &Adjustments, groups: Groups) -> Self {
         LookPreset {
             version: VERSION,
             name: name.trim().to_string(),
@@ -215,7 +215,7 @@ impl LookPreset {
     }
 
     /// Overwrites the present fields of `edit`. There is no crop to touch.
-    pub fn apply(&self, edit: &mut PhotoEdit) {
+    pub fn apply(&self, edit: &mut Adjustments) {
         self.edit.apply(edit);
     }
 
@@ -258,11 +258,11 @@ pub fn slug(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Groups, LookPreset, PartialEdit, slug};
-    use crate::PhotoEdit;
     use crate::look::{Curve, Wheel};
+    use crate::{Adjustments, PhotoEdit};
 
     fn busy_edit() -> PhotoEdit {
-        let mut edit = PhotoEdit {
+        let mut edit = PhotoEdit::from(Adjustments {
             white_balance_temperature: 8.0,
             exposure: 1.0,
             contrast: 20.0,
@@ -270,8 +270,8 @@ mod tests {
             texture: 10.0,
             clarity: 30.0,
             dehaze: -15.0,
-            ..PhotoEdit::default()
-        };
+            ..Adjustments::default()
+        });
         edit.look.curves.master = Curve {
             points: vec![[0.0, 0.0], [0.3, 0.2], [1.0, 1.0]],
         };

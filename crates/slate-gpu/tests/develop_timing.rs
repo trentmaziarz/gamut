@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use slate_core::look::{Curve, Wheel};
-use slate_core::{CropRect, PhotoEdit};
+use slate_core::{Adjustments, CropRect, PhotoEdit};
 use slate_gpu::{Develop, Headless};
 use slate_media::{fixtures, open_photo};
 
@@ -39,7 +39,7 @@ fn timed_render(gpu: &Headless, develop: &mut Develop, edit: &PhotoEdit, size: (
 
 /// Every operator of the develop chain away from its neutral value.
 fn everything_on() -> PhotoEdit {
-    let mut edit = PhotoEdit {
+    let mut edit = PhotoEdit::from(Adjustments {
         white_balance_temperature: -20.0,
         white_balance_tint: 10.0,
         exposure: 0.0,
@@ -53,8 +53,8 @@ fn everything_on() -> PhotoEdit {
         texture: 40.0,
         clarity: 35.0,
         dehaze: 30.0,
-        ..PhotoEdit::default()
-    };
+        ..Adjustments::default()
+    });
     edit.look.curves.master = Curve {
         points: vec![[0.0, 0.0], [0.25, 0.17], [0.75, 0.85], [1.0, 1.0]],
     };
@@ -87,10 +87,8 @@ fn everything_on() -> PhotoEdit {
 fn stepped(gpu: &Headless, develop: &mut Develop, base: &PhotoEdit) -> (f64, f64, f64) {
     let mut times: Vec<f64> = (0..RENDERS)
         .map(|i| {
-            let edit = PhotoEdit {
-                exposure: -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32,
-                ..base.clone()
-            };
+            let mut edit = base.clone();
+            edit.exposure = -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32;
             timed_render(gpu, develop, &edit, VIEWER_SIZE)
         })
         .collect();
