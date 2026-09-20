@@ -1,25 +1,33 @@
 //! The Adjust tab: collapsing sections for the Basic sliders, Presence, the
-//! tone curve, the HSL mixer, the grading wheels, look presets and named
-//! versions, then the crop controls. Every control is bound to the session
-//! and every change goes through `Session::mark_edited`.
+//! tone curve, the HSL mixer, the grading wheels, masks, look presets and
+//! named versions, then the crop controls. Every control is bound to the
+//! session and every change goes through `Session::mark_edited`.
+//!
+//! While a mask is selected the first five sections edit that mask's
+//! adjustments instead of the global ones, under a banner that says so; the
+//! widgets are the same ones either way.
 
 use std::path::PathBuf;
 
 use egui::{CollapsingHeader, Color32};
 use slate_core::look::HSL_NAMES;
 use slate_core::preset::Groups;
-use slate_core::{Crop, CropAspect, LookPreset, NamedVersion, PhotoEdit};
+use slate_core::{
+    Adjustments, Crop, CropAspect, EXPOSURE_LIMIT, LookPreset, NamedVersion, PhotoEdit,
+    SLIDER_LIMIT,
+};
 
 use crate::app::{Session, SwitchAnswer};
 use crate::curve_editor::{self, CurveEditorState};
+use crate::mask_panel;
 use crate::presets;
 use crate::wheel;
 
 /// The range of the exposure slider in stops.
-pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = -5.0..=5.0;
+pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = -EXPOSURE_LIMIT..=EXPOSURE_LIMIT;
 
 /// The range of every other slider.
-pub const SLIDER_RANGE: std::ops::RangeInclusive<f32> = -100.0..=100.0;
+pub const SLIDER_RANGE: std::ops::RangeInclusive<f32> = -SLIDER_LIMIT..=SLIDER_LIMIT;
 
 /// Which tone curve the editor shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +78,43 @@ pub struct AdjustState {
     /// its active version does not; the Save, Discard, Cancel prompt is up
     /// while this is set.
     pub pending_switch: Option<String>,
+    /// The mask of the list that is selected: the one the adjustment
+    /// sections edit and the one whose handles show on the picture.
+    pub selected_mask: Option<usize>,
+    /// Whether the selected mask shows as a red overlay.
+    pub mask_overlay: bool,
+    /// The component of the selected mask whose Pick button is armed: the
+    /// next click on the picture sets its range.
+    pub picking: Option<usize>,
+    /// The mask being renamed and its new name so far.
+    pub mask_renaming: Option<(usize, String)>,
+}
+
+impl AdjustState {
+    /// Selects a mask, or none. What belonged to the last selection (an
+    /// armed pick, a rename, the curve point in hand) is let go.
+    pub fn select_mask(&mut self, mask: Option<usize>) {
+        if self.selected_mask != mask {
+            self.selected_mask = mask;
+            self.picking = None;
+            self.mask_renaming = None;
+            self.curve_editor = CurveEditorState::default();
+        }
+    }
+
+    /// The mask the viewer shows as an overlay.
+    pub fn overlay(&self) -> Option<usize> {
+        self.selected_mask.filter(|_| self.mask_overlay)
+    }
+}
+
+/// What the adjustment sections edit: the adjustments of the selected mask,
+/// or the global ones when no mask is selected.
+pub fn target(edit: &mut PhotoEdit, selected: Option<usize>) -> &mut Adjustments {
+    match selected {
+        Some(index) if index < edit.masks.len() => &mut edit.masks[index].adjust,
+        _ => &mut edit.adjust,
+    }
 }
 
 /// What a button of the Versions section asked for. It runs after the
@@ -90,10 +135,58 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
 
 fn sections(ui: &mut egui::Ui, session: &mut Session) {
     let mut changed = false;
-    if ui.button("Reset all").clicked() && session.edit != PhotoEdit::default() {
-        session.edit = PhotoEdit::default();
-        changed = true;
+    // A version switch, a preset or a reset can shorten the list under the
+    // selection.
+    if session
+        .adjust
+        .selected_mask
+        .is_some_and(|index| index >= session.edit.masks.len())
+    {
+        session.adjust.select_mask(None);
+        session.develop_dirty = true;
     }
+    let selected = session.adjust.selected_mask;
+    match selected {
+        None => {
+            if ui
+                .button("Reset all")
+                .on_hover_text("Every adjustment back to neutral and every mask removed")
+                .clicked()
+                && session.edit != PhotoEdit::default()
+            {
+                session.edit = PhotoEdit::default();
+                changed = true;
+            }
+        }
+        Some(index) => {
+            let name = session.edit.masks[index].name.clone();
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().selection.bg_fill.gamma_multiply(0.35))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Editing mask: {name}"));
+                        if ui
+                            .button("Done")
+                            .on_hover_text("Back to the global edit")
+                            .clicked()
+                        {
+                            session.adjust.select_mask(None);
+                            session.develop_dirty = true;
+                        }
+                    });
+                    ui.weak("The sections below adjust this mask, on top of the global edit.");
+                    let adjust = &mut session.edit.masks[index].adjust;
+                    if ui.small_button("Reset this mask's adjustments").clicked()
+                        && *adjust != Adjustments::default()
+                    {
+                        *adjust = Adjustments::default();
+                        changed = true;
+                    }
+                });
+        }
+    }
+    let selected = session.adjust.selected_mask;
+    let can_pick = session.pick.is_some();
     let mut message = None;
     let mut version_action = None;
     let version_dirty = session.version_is_dirty();
@@ -105,6 +198,9 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
         photo,
         ..
     } = session;
+    // The first five sections edit the selected mask, or the global edit.
+    let whole = edit;
+    let edit = target(whole, selected);
 
     CollapsingHeader::new("Basic")
         .default_open(true)
@@ -186,9 +282,21 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
         });
     });
 
-    CollapsingHeader::new("Presets").show(ui, |ui| match presets_section(ui, edit, adjust) {
-        Ok(applied) => changed |= applied,
-        Err(error) => message = Some(error),
+    let mut view_changed = false;
+    CollapsingHeader::new("Masks").show(ui, |ui| {
+        let outcome = mask_panel::show(ui, &mut whole.masks, adjust, can_pick);
+        changed |= outcome.edited;
+        view_changed = outcome.view_changed;
+    });
+
+    // The selection may have moved in the Masks section.
+    let edit = target(whole, adjust.selected_mask);
+    CollapsingHeader::new("Presets").show(ui, |ui| {
+        ui.weak("A preset carries adjustments, not masks.");
+        match presets_section(ui, edit, adjust) {
+            Ok(applied) => changed |= applied,
+            Err(error) => message = Some(error),
+        }
     });
 
     CollapsingHeader::new("Versions").show(ui, |ui| {
@@ -207,6 +315,9 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
 
     if changed {
         session.mark_edited();
+    }
+    if view_changed {
+        session.develop_dirty = true;
     }
     if let Some(action) = version_action {
         let result = match &action {
@@ -278,7 +389,7 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
 /// presets of the folder. Returns whether a preset was applied to `edit`.
 fn presets_section(
     ui: &mut egui::Ui,
-    edit: &mut PhotoEdit,
+    edit: &mut Adjustments,
     adjust: &mut AdjustState,
 ) -> Result<bool, String> {
     let Some(folder) = presets::folder() else {

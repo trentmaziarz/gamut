@@ -13,6 +13,7 @@ use slate_gpu::{Develop, TestImage};
 use slate_media::Photo;
 
 use crate::app::Session;
+use crate::mask_handles::{self, PictureMap};
 
 /// The viewer keeps the 4:5 feed-post shape when no photo is open.
 pub const VIEWER_ASPECT: [f32; 2] = [4.0, 5.0];
@@ -100,6 +101,12 @@ impl Viewer {
             (points.x * scale).round().max(1.0) as u32,
             (points.y * scale).round().max(1.0) as u32,
         );
+        // The overlay of the selected mask is part of what is shown.
+        let overlay = session.adjust.overlay();
+        if self.develop.overlay() != overlay {
+            self.develop.set_overlay(overlay);
+            session.develop_dirty = true;
+        }
         let mut has_picture = false;
         if session.photo.is_some() {
             self.show_photo(wanted, session);
@@ -118,6 +125,9 @@ impl Viewer {
         egui::Image::from_texture(SizedTexture::new(self.texture_id, points)).paint_at(ui, image);
         if has_picture {
             draw_crop(ui, image, session);
+            // The handles of the selected mask go over the crop and take the
+            // pointer first; they know the picture only through this map.
+            mask_handles::show(ui, &PictureMap { image }, session);
         }
     }
 

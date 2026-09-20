@@ -19,6 +19,8 @@ pub mod app;
 pub mod curve_editor;
 pub mod export;
 pub mod headless;
+pub mod mask_handles;
+pub mod mask_panel;
 pub mod player;
 pub mod presets;
 pub mod project;

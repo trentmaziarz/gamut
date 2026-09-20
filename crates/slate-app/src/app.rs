@@ -218,6 +218,8 @@ pub struct Session {
     pub active_version: Option<String>,
     /// What the Adjust tab remembers that is not part of the edit.
     pub adjust: crate::adjust::AdjustState,
+    /// A small copy of the open photo that a range mask is picked from.
+    pub pick: Option<crate::mask_handles::PickImage>,
     pub grid_guide: bool,
     /// The Viewer must run the develop graph again.
     pub develop_dirty: bool,
@@ -421,6 +423,8 @@ impl SlateApp {
     fn open_photo(&mut self, path: PathBuf) -> Result<(), String> {
         let photo = open_photo(&path).map_err(|error| error.to_string())?;
         self.viewer.set_photo(&photo);
+        self.session.pick = Some(crate::mask_handles::PickImage::from_photo(&photo));
+        self.session.adjust.select_mask(None);
         let saved = sidecar::load(&path);
         let sidecar = match saved {
             Some(sidecar) => Sidecar {
@@ -460,6 +464,8 @@ impl SlateApp {
             loaded.project.crop
         };
         self.session.photo = None;
+        self.session.pick = None;
+        self.session.adjust.select_mask(None);
         self.session.versions.clear();
         self.session.active_version = None;
         self.session.edit = loaded.project.edit.clone();
