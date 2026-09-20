@@ -2,17 +2,20 @@
 //! a photo it runs the same develop graph the Viewer uses, through the
 //! headless context, so CI and scripts can see the picture. With a video
 //! or a project and `--at`, it renders the frame at that time as the
-//! 1080x1920 Reel crop. Without a file it renders the M0 test image.
+//! 1080x1920 Reel crop. With `--zoom` it renders what the Viewer would show
+//! of the whole photo at that view, through the same plan and the same
+//! render path. Without a file it renders the M0 test image.
 
 use std::path::Path;
 
 use gamut_core::{Crop, CropAspect, PhotoEdit, Project};
 use gamut_gpu::develop::render_size_for_crop;
-use gamut_gpu::{Develop, Headless, Readback, TestImage};
+use gamut_gpu::{Develop, Headless, Readback, TestImage, ViewWindow};
 use gamut_media::VideoSource;
 
 use crate::headless::{EditSource, HeadlessError, Prepared, mask_named};
 use crate::project;
+use crate::view::{RenderPlan, View, Zoom};
 
 /// The video screenshot size: the 9:16 Reel.
 pub const VIDEO_SIZE: (u32, u32) = (1080, 1920);
@@ -62,6 +65,90 @@ pub fn write_developed_showing(
     let (width, height) = SIZE;
     let pixels = Readback::new(&gpu.device).read(&gpu.device, &gpu.queue, view, width, height);
     save_png(out, width, height, pixels)
+}
+
+/// What the Viewer would show of `photo` in a tab of [`SIZE`] pixels at
+/// `percent` zoom with `centre` of the photo in the middle: the whole photo
+/// with its edit, no crop and no frame over it, on black where the photo
+/// does not reach. It goes through the view, the plan and the render the
+/// window uses, magnified past 100 percent the way the window magnifies it.
+pub fn write_zoomed(
+    photo: &Path,
+    source: EditSource,
+    show_mask: Option<&str>,
+    percent: f32,
+    centre: [f32; 2],
+    out: &Path,
+) -> Result<(), HeadlessError> {
+    let prepared = Prepared::open(photo, source)?;
+    let overlay = show_mask
+        .map(|name| mask_named(&prepared.sidecar, name))
+        .transpose()?;
+    let gpu = &prepared.gpu;
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&prepared.photo);
+    develop.set_overlay(overlay);
+    let size = (prepared.photo.width, prepared.photo.height);
+    let tab = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE.0 as f32, SIZE.1 as f32));
+    let view = View {
+        zoom: Zoom::Scale(percent / 100.0),
+        centre,
+    };
+    let placed = view.place(tab, size, 1.0);
+    let edit = &prepared.sidecar.edit;
+    let readback = Readback::new(&gpu.device);
+    // The rendered pixels, the rectangle of the tab they fill, and whether
+    // they are magnified without filtering.
+    let (pixels, (width, height), paint, nearest) = match RenderPlan::of(&placed, tab, size, 1.0) {
+        Some(plan) => {
+            let window = ViewWindow {
+                full: plan.full,
+                window: plan.window(None),
+                visible: plan.visible,
+            };
+            let rendered = develop
+                .render_view(edit, &window)
+                .expect("the source was set");
+            let (width, height) = (plan.visible.2, plan.visible.3);
+            let pixels = readback.read(&gpu.device, &gpu.queue, rendered, width, height);
+            (pixels, (width, height), plan.paint, plan.nearest)
+        }
+        None => {
+            let fitted = (
+                placed.image.width().round().max(1.0) as u32,
+                placed.image.height().round().max(1.0) as u32,
+            );
+            let rendered = develop
+                .render(edit, gamut_core::CropRect::FULL, fitted, fitted)
+                .expect("the source was set");
+            let pixels = readback.read(&gpu.device, &gpu.queue, rendered, fitted.0, fitted.1);
+            (pixels, fitted, placed.image, false)
+        }
+    };
+    let rendered = image::RgbaImage::from_raw(width, height, pixels)
+        .expect("readback returns width times height times four bytes");
+    let target = (
+        paint.width().round().max(1.0) as u32,
+        paint.height().round().max(1.0) as u32,
+    );
+    let magnified = if target == (width, height) {
+        rendered
+    } else {
+        let filter = if nearest {
+            image::imageops::FilterType::Nearest
+        } else {
+            image::imageops::FilterType::Triangle
+        };
+        image::imageops::resize(&rendered, target.0, target.1, filter)
+    };
+    let mut canvas = image::RgbaImage::from_pixel(SIZE.0, SIZE.1, image::Rgba([0, 0, 0, 255]));
+    image::imageops::replace(
+        &mut canvas,
+        &magnified,
+        paint.min.x.round() as i64,
+        paint.min.y.round() as i64,
+    );
+    canvas.save(out).map_err(HeadlessError::Image)
 }
 
 /// Opens `input`, a video or a project, decodes the frame at `at` seconds
