@@ -189,12 +189,7 @@ impl Viewer {
         if let Some(placed) = placed.filter(|_| has_picture) {
             // The one place that knows where the photo is on the screen.
             let map = PictureMap::new(&placed, area);
-            draw_crop(ui, &map, session, &mut pan);
-            // The handles of the selected mask go over the crop and take the
-            // pointer first.
-            mask_handles::show(ui, &map, session, &mut pan);
-            // An armed brush goes over everything and takes the plain drag.
-            brush_tool::show(ui, &map, session, &mut pan);
+            picture_input(ui, &map, session, &mut pan);
         }
         // A pan that began on the crop or on a handle is known only now.
         if let Some(source) = session.source_size() {
@@ -389,10 +384,15 @@ fn view_input(
         session.view_link.space_panned = false;
     }
     // The bare picture, under the crop and the handles: it pans and does
-    // nothing else.
-    let bare = ui.interact(area, ui.id().with("view pan"), Sense::drag());
-    if pan.take(&bare, Over::Picture) == Gesture::Pan {
-        apply_pan(ui, area, source, session, pan);
+    // nothing else. An armed brush covers the same rectangle and reports the
+    // pans itself, and egui gives a drag to the earlier of two drag widgets
+    // of one rectangle (it takes the later for a background), so with a
+    // brush in the hand this widget is not made and the brush's is the one.
+    if session.adjust.brush.armed.is_none() {
+        let bare = ui.interact(area, ui.id().with("view pan"), Sense::drag());
+        if pan.take(&bare, Over::Picture) == Gesture::Pan {
+            apply_pan(ui, area, source, session, pan);
+        }
     }
     if prompt {
         session.view_link.request = None;
@@ -416,6 +416,15 @@ fn view_input(
         session.view = view;
         ui.ctx().request_repaint();
     }
+}
+
+/// Everything on the picture that takes the pointer, bottom to top: the
+/// crop, the handles of the selected mask over it, and an armed brush over
+/// everything, which takes the plain drag.
+fn picture_input(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mut PanInput) {
+    draw_crop(ui, map, session, pan);
+    mask_handles::show(ui, map, session, pan);
+    brush_tool::show(ui, map, session, pan);
 }
 
 /// The crop rectangle, draggable, under the phone frame and its guides.
@@ -538,11 +547,157 @@ pub fn fit_aspect(available: egui::Vec2, aspect: [f32; 2]) -> egui::Vec2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{VIEWER_ASPECT, dragged_crop, fit_aspect};
+    use super::{VIEWER_ASPECT, dragged_crop, fit_aspect, picture_input, view_input};
+    use crate::app::Session;
     use crate::mask_handles::PictureMap;
-    use crate::view::{View, Zoom};
+    use crate::view::{PanInput, View, Zoom};
     use egui::{Pos2, Rect, Vec2};
-    use gamut_core::CropRect;
+    use gamut_core::brush::Brush;
+    use gamut_core::{CropRect, Mask, MaskSource};
+
+    const SOURCE: (u32, u32) = (1200, 800);
+
+    /// One frame of the picture's input as the Viewer runs it, without the
+    /// render: the view input, then the crop, the handles and the brush.
+    fn frame(ctx: &egui::Context, session: &mut Session, events: Vec<egui::Event>) {
+        frame_with(ctx, session, events, egui::Modifiers::NONE);
+    }
+
+    /// The same with keys held: egui reads them from the frame, not the event.
+    fn frame_with(
+        ctx: &egui::Context,
+        session: &mut Session,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            // The keys held come first, as the window sends them.
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(events)
+                .collect(),
+            ..Default::default()
+        };
+        // No renderer takes the font texture here, so it is let go by hand.
+        let mut output = ctx.run_ui(input, |ui| {
+            let area = ui.max_rect();
+            let mut pan = PanInput::default();
+            view_input(ui, area, SOURCE, session, &mut pan);
+            let placed = session.view.place(area, SOURCE, 1.0);
+            session.view = placed.view;
+            let map = PictureMap::new(&placed, area);
+            picture_input(ui, &map, session, &mut pan);
+        });
+        output.textures_delta.clear();
+    }
+
+    fn button(pos: Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        }
+    }
+
+    /// Presses at `from`, moves to `to` over ten frames and lets go.
+    fn drag(
+        ctx: &egui::Context,
+        session: &mut Session,
+        from: Pos2,
+        to: Pos2,
+        modifiers: egui::Modifiers,
+    ) {
+        frame(ctx, session, vec![egui::Event::PointerMoved(from)]);
+        frame_with(ctx, session, vec![button(from, true, modifiers)], modifiers);
+        for step in 1..=10 {
+            let at = from + (to - from) * (step as f32 / 10.0);
+            frame_with(ctx, session, vec![egui::Event::PointerMoved(at)], modifiers);
+        }
+        frame_with(ctx, session, vec![button(to, false, modifiers)], modifiers);
+        frame(ctx, session, Vec::new());
+    }
+
+    fn strokes(session: &Session) -> &Brush {
+        match &session.edit.masks[0].components[0].source {
+            MaskSource::Brush(brush) => brush,
+            _ => panic!("a brush"),
+        }
+    }
+
+    /// The window's own path from the pointer to a stroke. It was found
+    /// broken by driving the window: the bare pan widget has the rectangle
+    /// of the brush's and took its drags, so nothing was ever painted.
+    #[test]
+    fn a_drag_on_the_picture_paints_with_a_brush_in_the_hand_and_moves_the_crop_without() {
+        let ctx = egui::Context::default();
+        let mut session = Session::default();
+        session
+            .edit
+            .masks
+            .push(Mask::new("Brush", MaskSource::Brush(Brush::default())));
+        session.adjust.select_mask(Some(0));
+        // A crop with room to move, under where the pointer will press.
+        session.crop.rect = CropRect {
+            x: 0.3,
+            y: 0.2,
+            width: 0.4,
+            height: 0.6,
+        };
+        let crop = session.crop.rect;
+        let none = egui::Modifiers::NONE;
+        // Warm up: egui tests a pointer against the widgets of the frame before.
+        frame(&ctx, &mut session, Vec::new());
+
+        // No brush in the hand: a plain drag inside the crop moves the crop.
+        let (from, to) = (Pos2::new(560.0, 400.0), Pos2::new(640.0, 430.0));
+        drag(&ctx, &mut session, from, to, none);
+        assert_ne!(session.crop.rect, crop, "the crop moved");
+        assert!(strokes(&session).strokes.is_empty());
+
+        // The brush in the hand: the same drag paints and the crop stays.
+        let crop = session.crop.rect;
+        session.toggle_brush(0);
+        frame(&ctx, &mut session, Vec::new());
+        drag(&ctx, &mut session, from, to, none);
+        assert_eq!(session.crop.rect, crop, "the crop stays where it is");
+        assert_eq!(strokes(&session).strokes.len(), 1, "one drag, one stroke");
+        let stroke = &strokes(&session).strokes[0];
+        assert!(stroke.points.len() >= 3, "{} points", stroke.points.len());
+        assert!(!stroke.erase);
+        assert!(!session.adjust.brush.is_painting(), "the release ends it");
+        // The stroke is where the pointer was: the fitted photo fills the
+        // tab, so the press is that share of the way across it.
+        let first = stroke.points[0];
+        assert!((first[0] - 560.0 / 1200.0).abs() < 0.02, "{first:?}");
+        assert!((first[1] - 400.0 / 800.0).abs() < 0.02, "{first:?}");
+
+        // A click without a move is one dab, Alt erases, Shift draws a line
+        // from the end of the last stroke.
+        drag(
+            &ctx,
+            &mut session,
+            Pos2::new(300.0, 300.0),
+            Pos2::new(300.0, 300.0),
+            none,
+        );
+        assert_eq!(strokes(&session).strokes[1].points.len(), 1);
+        drag(&ctx, &mut session, from, to, egui::Modifiers::ALT);
+        assert!(strokes(&session).strokes[2].erase);
+        let end = *strokes(&session).strokes[2].points.last().expect("points");
+        let at = Pos2::new(900.0, 200.0);
+        drag(&ctx, &mut session, at, at, egui::Modifiers::SHIFT);
+        let line = &strokes(&session).strokes[3];
+        assert_eq!(line.points.len(), 2);
+        assert_eq!(line.points[0], end);
+
+        // Put down, the drag is the crop's again.
+        session.put_brush_down();
+        frame(&ctx, &mut session, Vec::new());
+        drag(&ctx, &mut session, from, to, none);
+        assert_ne!(session.crop.rect, crop);
+        assert_eq!(strokes(&session).strokes.len(), 4);
+    }
 
     #[test]
     fn a_wide_tab_is_limited_by_its_height() {

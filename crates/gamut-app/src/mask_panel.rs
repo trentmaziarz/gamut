@@ -39,6 +39,16 @@ pub struct Outcome {
     pub brush: Option<BrushRequest>,
 }
 
+impl Outcome {
+    /// Takes in what a part of the section did, so nothing a part asks for
+    /// is lost on the way to the session.
+    fn take(&mut self, part: Outcome) {
+        self.edited |= part.edited;
+        self.view_changed |= part.view_changed;
+        self.brush = part.brush.or(self.brush);
+    }
+}
+
 /// The five sources a new mask or a new component starts from, with the
 /// word a button and a mask name use for each.
 pub fn new_sources() -> [(&'static str, MaskSource); 5] {
@@ -509,14 +519,12 @@ pub fn show(
     }
     ui.weak("Masks blend in list order, each over the ones above it.");
     let listed = mask_list(ui, masks, adjust);
-    outcome.edited |= listed.edited;
-    outcome.view_changed |= listed.view_changed;
+    outcome.take(listed);
 
     if let Some(index) = adjust.selected_mask.filter(|index| *index < masks.len()) {
         ui.separator();
         let chosen = selected_mask(ui, &mut masks[index], adjust, can_pick);
-        outcome.edited |= chosen.edited;
-        outcome.view_changed |= chosen.view_changed;
+        outcome.take(chosen);
     }
     outcome
 }
@@ -549,6 +557,35 @@ mod tests {
         }
         assert_eq!(add_mask(&mut masks, "Radial", source), None);
         assert_eq!(masks.len(), MAX_MASKS);
+    }
+
+    #[test]
+    fn what_a_part_of_the_section_asks_for_reaches_the_whole() {
+        let mut whole = Outcome {
+            edited: true,
+            ..Outcome::default()
+        };
+        whole.take(Outcome {
+            view_changed: true,
+            brush: Some(BrushRequest::Paint(2)),
+            ..Outcome::default()
+        });
+        assert_eq!(
+            whole,
+            Outcome {
+                edited: true,
+                view_changed: true,
+                brush: Some(BrushRequest::Paint(2)),
+            }
+        );
+        // A part that asks for nothing takes nothing away.
+        whole.take(Outcome::default());
+        assert_eq!(whole.brush, Some(BrushRequest::Paint(2)));
+        whole.take(Outcome {
+            brush: Some(BrushRequest::Clear(0)),
+            ..Outcome::default()
+        });
+        assert_eq!(whole.brush, Some(BrushRequest::Clear(0)));
     }
 
     #[test]
