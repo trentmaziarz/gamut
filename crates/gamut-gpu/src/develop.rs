@@ -371,6 +371,10 @@ struct Frame {
     transmission_ready: bool,
     /// The scissor the two products above were last drawn under.
     products_region: Option<(u32, u32, u32, u32)>,
+    /// The edit and the scissor `developed` was last drawn for, or `None`
+    /// when it has to be drawn again. While both hold, a render only runs
+    /// the output pass.
+    developed_for: Option<(PhotoEdit, (u32, u32, u32, u32))>,
     input_bind: wgpu::BindGroup,
     blur_h_bind: wgpu::BindGroup,
     blur_v_bind: wgpu::BindGroup,
@@ -829,11 +833,12 @@ impl Develop {
         self.render_window(edit, inner, window_size, output_size, window, full, inner)
     }
 
-    /// Renders what a zoomed viewer shows. The head-pass products and the
-    /// develop pass cover the whole of `view.window`, a padded rectangle
-    /// around what is seen, and the output takes `view.visible` out of it
-    /// one to one. A pan that stays inside the window therefore redraws the
-    /// output pass only, and a slider step the develop pass over the window.
+    /// Renders what a zoomed viewer shows. The head-pass products (the base
+    /// blur, the texture layer, the transmission map, the mask alphas) cover
+    /// the whole of `view.window`, a padded rectangle around what is seen;
+    /// the develop passes cover `view.visible` and the output takes it out
+    /// one to one. A pan that stays inside the window therefore runs no
+    /// head pass, and a slider step develops only what is seen.
     /// The frame holds the window plus the reach of the widest head pass on
     /// every side, so the picture is the one [`render`](Self::render) gives
     /// at `view.full`.
@@ -878,9 +883,10 @@ impl Develop {
     }
 
     /// The shared body: renders `window` of the source at `render_size`
-    /// with the blur sigma of `sigma_size`, draws the head-pass products and
-    /// the develop pass over `products` of that render, then crops `crop`
-    /// of it into the output. `crop` lies inside `products`.
+    /// with the blur sigma of `sigma_size`, draws the head-pass products
+    /// over `products` of that render and the develop passes over `crop`,
+    /// then crops `crop` of it into the output. `crop` lies inside
+    /// `products`.
     #[allow(clippy::too_many_arguments)]
     fn render_window(
         &mut self,
@@ -985,10 +991,16 @@ impl Develop {
         let frame = self.frame.as_mut().expect("frame built above");
         let columns = scissor_for(products, (width, height), true);
         let region = scissor_for(products, (width, height), false);
+        // The develop passes cover only what the output shows. For a zoomed
+        // viewer that is far less than the products cover, so a slider step
+        // costs what it costs on a fitted picture, and a pan inside the
+        // window develops what came into view and runs no head pass.
+        let seen = scissor_for(crop, (width, height), false);
         if rerun || frame.products_region != Some(region) {
             frame.texture_ready = false;
             frame.transmission_ready = false;
             frame.products_region = Some(region);
+            frame.developed_for = None;
             for mask in frame.masks.iter_mut().flatten() {
                 mask.shape = None;
             }
@@ -1180,33 +1192,43 @@ impl Develop {
                 )),
             );
         }
-        let frame = self.frame.as_ref().expect("frame built above");
+        let frame = self.frame.as_mut().expect("frame built above");
 
-        self.queue.write_buffer(
-            &self.develop_uniform,
-            0,
-            bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
-        );
-        draw(
-            &mut encoder,
-            "develop",
-            &self.develop.pipeline,
-            &frame.develop_bind,
-            &frame.developed.view,
-            Some(region),
-        );
-        // The ordered blend: each mask in list order over what is there.
-        for (index, _) in &masks {
-            let slot = frame.masks[*index].as_ref().expect("built above");
-            draw_over(
-                &mut encoder,
-                "masked develop",
-                &self.masked.pipeline,
-                &slot.develop_bind,
-                &frame.developed.view,
-                Some(region),
+        // The developed texture is kept while the edit and the scissor are
+        // the ones it was drawn for: a pan changes neither.
+        let developed = frame
+            .developed_for
+            .as_ref()
+            .is_some_and(|(drawn, scissor)| *scissor == seen && drawn == edit);
+        if !developed {
+            self.queue.write_buffer(
+                &self.develop_uniform,
+                0,
+                bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
             );
+            draw(
+                &mut encoder,
+                "develop",
+                &self.develop.pipeline,
+                &frame.develop_bind,
+                &frame.developed.view,
+                Some(seen),
+            );
+            // The ordered blend: each mask in list order over what is there.
+            for (index, _) in &masks {
+                let slot = frame.masks[*index].as_ref().expect("built above");
+                draw_over(
+                    &mut encoder,
+                    "masked develop",
+                    &self.masked.pipeline,
+                    &slot.develop_bind,
+                    &frame.developed.view,
+                    Some(seen),
+                );
+            }
+            frame.developed_for = Some((edit.clone(), seen));
         }
+        let frame = self.frame.as_ref().expect("frame built above");
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
         let overlay = overlaid.as_ref().map(|(index, _)| *index);
@@ -1535,6 +1557,7 @@ impl Develop {
             texture_ready: false,
             transmission_ready: false,
             products_region: None,
+            developed_for: None,
             input_bind,
             blur_h_bind,
             blur_v_bind,
@@ -1621,9 +1644,40 @@ pub struct ViewWindow {
     /// size of the source.
     pub full: (u32, u32),
     /// The padded rectangle the products and the develop pass cover.
-    pub window: (u32, u32, u32, u32),
+    pub window: PixelRect,
     /// The part of `window` the output shows, one to one.
-    pub visible: (u32, u32, u32, u32),
+    pub visible: PixelRect,
+}
+
+/// A rectangle of pixels: x, y, width, height.
+pub type PixelRect = (u32, u32, u32, u32);
+
+/// `visible` with `pad` on every side, its edges moved outward onto `grid`,
+/// kept inside `full`.
+pub fn padded_window(
+    full: (u32, u32),
+    visible: PixelRect,
+    pad: (u32, u32),
+    grid: u32,
+) -> PixelRect {
+    let grid = grid.max(1);
+    let axis = |start: u32, size: u32, pad: u32, full: u32| {
+        let low = start.saturating_sub(pad) / grid * grid;
+        let high = (start + size + pad).div_ceil(grid) * grid;
+        let high = high.min(full).max(low + 1);
+        (low, high - low)
+    };
+    let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
+    let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
+    (x, y, width, height)
+}
+
+/// Whether `inner` lies inside `window`.
+pub fn holds(window: PixelRect, inner: PixelRect) -> bool {
+    inner.0 >= window.0
+        && inner.1 >= window.1
+        && inner.0 + inner.2 <= window.0 + window.2
+        && inner.1 + inner.3 <= window.1 + window.3
 }
 
 /// How far the widest head pass reads around a pixel at a render of `full`:

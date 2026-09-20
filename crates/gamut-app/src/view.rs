@@ -19,6 +19,8 @@
 
 use egui::{Pos2, Rect, Vec2};
 
+pub use gamut_gpu::develop::{PixelRect, holds, padded_window};
+
 use crate::viewer::fit_aspect;
 
 /// The most a picture is magnified: 800 percent, unless fitting the tab
@@ -403,9 +405,6 @@ impl View {
     }
 }
 
-/// A rectangle of pixels: x, y, width, height.
-pub type PixelRect = (u32, u32, u32, u32);
-
 /// What a zoomed view renders, in pixels of the whole picture at the render
 /// scale, and where the result is painted.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -484,34 +483,6 @@ impl RenderPlan {
             _ => padded_window(self.full, self.visible, self.pad, self.grid),
         }
     }
-}
-
-/// `visible` with `pad` on every side, its edges moved outward onto `grid`,
-/// kept inside `full`.
-pub fn padded_window(
-    full: (u32, u32),
-    visible: PixelRect,
-    pad: (u32, u32),
-    grid: u32,
-) -> PixelRect {
-    let grid = grid.max(1);
-    let axis = |start: u32, size: u32, pad: u32, full: u32| {
-        let low = start.saturating_sub(pad) / grid * grid;
-        let high = (start + size + pad).div_ceil(grid) * grid;
-        let high = high.min(full).max(low + 1);
-        (low, high - low)
-    };
-    let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
-    let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
-    (x, y, width, height)
-}
-
-/// Whether `inner` lies inside `window`.
-pub fn holds(window: PixelRect, inner: PixelRect) -> bool {
-    inner.0 >= window.0
-        && inner.1 >= window.1
-        && inner.0 + inner.2 <= window.0 + window.2
-        && inner.1 + inner.3 <= window.1 + window.3
 }
 
 /// The size of the whole picture in points at a scale.
