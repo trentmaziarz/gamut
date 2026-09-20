@@ -141,7 +141,34 @@ fn half(value: f32, rounding: Rounding) -> f32 {
     }
 }
 
-fn cpu_reference(photo: &Photo, edit: &PhotoEdit, rounding: Rounding) -> Vec<[u8; 3]> {
+/// A half float moved by whole steps of its own grid, held at 0.
+fn half_steps(value: f32, steps: i32) -> f32 {
+    let bits = i32::from(f16::from_f32(value).to_bits()) + steps;
+    f16::from_bits(bits.clamp(0, 0x7bff) as u16).to_f32()
+}
+
+/// The steps of the half float grid the stored transmission map may sit
+/// from the modelled one. The map comes out of a minimum filter and two
+/// blur passes, where the order of the sums decides which side of a
+/// rounding boundary a value lands on, and dehaze divides by it next to a
+/// subtraction of the atmosphere: on a saturated pixel whose red is near
+/// black after the output matrix, one step of the map is 2 to 3 codes. So
+/// with dehaze on the GPU has to match the reference at the modelled map or
+/// at the map one step either way.
+fn transmission_steps(edit: &PhotoEdit) -> &'static [i32] {
+    if edit.dehaze != 0.0 {
+        &[0, -1, 1]
+    } else {
+        &[0]
+    }
+}
+
+fn cpu_reference(
+    photo: &Photo,
+    edit: &PhotoEdit,
+    rounding: Rounding,
+    transmission_step: i32,
+) -> Vec<[u8; 3]> {
     let linear: Vec<[f32; 3]> = photo
         .rgba8
         .as_chunks::<4>()
@@ -179,7 +206,7 @@ fn cpu_reference(photo: &Photo, edit: &PhotoEdit, rounding: Rounding) -> Vec<[u8
             let around = Neighbourhood {
                 base_luma: base[i],
                 texture_luma: texture[i],
-                transmission: transmission[i],
+                transmission: half_steps(transmission[i], transmission_step),
             };
             let developed = basic::develop_pixel_with(linear[i], &around, edit, &prepared)
                 .map(|c| half(c, rounding));
@@ -221,31 +248,33 @@ fn check_on(name: &str, photo: &Photo, edit: &PhotoEdit) {
         return;
     };
     println!("adapter: {}", gpu.describe());
-    let nearest = cpu_reference(photo, edit, Rounding::Nearest);
-    let toward_zero = cpu_reference(photo, edit, Rounding::TowardZero);
+    let references: Vec<Vec<[u8; 3]>> = transmission_steps(edit)
+        .iter()
+        .flat_map(|step| {
+            [Rounding::Nearest, Rounding::TowardZero]
+                .map(|rounding| cpu_reference(photo, edit, rounding, *step))
+        })
+        .collect();
     let gpu_pixels = gpu_render(&gpu, photo, edit);
-    assert_eq!(nearest.len(), gpu_pixels.len());
+    assert_eq!(references[0].len(), gpu_pixels.len());
     let mut max = 0;
     let mut sum = 0u64;
     let mut worst = (0usize, [0u8; 3], [0u8; 3]);
-    for (i, ((n, z), g)) in nearest
-        .iter()
-        .zip(&toward_zero)
-        .zip(&gpu_pixels)
-        .enumerate()
-    {
+    for (i, g) in gpu_pixels.iter().enumerate() {
         for k in 0..3 {
-            let d = (i32::from(n[k]) - i32::from(g[k]))
-                .abs()
-                .min((i32::from(z[k]) - i32::from(g[k])).abs());
+            let d = references
+                .iter()
+                .map(|reference| (i32::from(reference[i][k]) - i32::from(g[k])).abs())
+                .min()
+                .expect("at least one reference");
             sum += d as u64;
             if d > max {
                 max = d;
-                worst = (i, *z, *g);
+                worst = (i, references[0][i], *g);
             }
         }
     }
-    let mean = sum as f64 / (nearest.len() * 3) as f64;
+    let mean = sum as f64 / (gpu_pixels.len() * 3) as f64;
     println!(
         "{name}: max {max} at pixel {} (cpu {:?}, gpu {:?}), mean {mean:.3}",
         worst.0, worst.1, worst.2
@@ -410,8 +439,8 @@ fn the_acescct_round_trip_matches_and_changes_nothing() {
     assert!(!edit.look.curves.is_identity());
     check("acescct round trip", &edit);
     for photo in [synthetic_photo(), hazy_photo()] {
-        let through = cpu_reference(&photo, &edit, Rounding::Nearest);
-        let plain = cpu_reference(&photo, &PhotoEdit::default(), Rounding::Nearest);
+        let through = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+        let plain = cpu_reference(&photo, &PhotoEdit::default(), Rounding::Nearest, 0);
         for (a, b) in through.iter().zip(&plain) {
             for k in 0..3 {
                 assert!(
