@@ -43,8 +43,24 @@ pub const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "mov", "m4v"];
 /// How long after the last change the sidecar or project is written.
 pub const SIDECAR_DELAY: Duration = Duration::from_millis(500);
 
-/// The eframe options: the wgpu renderer, the title, the launch size and
-/// the device features the video planes need.
+/// The icon of the window and the taskbar, the 256 pixel rendering of the
+/// mark. The exe carries the same mark as a resource (build.rs).
+const ICON_PNG: &[u8] = include_bytes!("../assets/gamut-256.png");
+
+/// [`ICON_PNG`] decoded to the unmultiplied RGBA pixels egui takes.
+pub fn window_icon() -> egui::IconData {
+    let icon = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png)
+        .expect("the icon is a PNG checked into the repository")
+        .into_rgba8();
+    egui::IconData {
+        width: icon.width(),
+        height: icon.height(),
+        rgba: icon.into_raw(),
+    }
+}
+
+/// The eframe options: the wgpu renderer, the title, the icon, the launch
+/// size and the device features the video planes need.
 pub fn native_options() -> eframe::NativeOptions {
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     let base = setup.device_descriptor.clone();
@@ -56,6 +72,7 @@ pub fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
+            .with_icon(window_icon())
             .with_inner_size(WINDOW_SIZE),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
@@ -762,5 +779,21 @@ impl TabViewer for Tabs<'_> {
 
     fn closeable(&mut self, _tab: &mut Tab) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_icon;
+
+    #[test]
+    fn the_window_icon_is_the_256_pixel_mark() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // The corner is the dark background, the middle the light mark.
+        assert_eq!(icon.rgba[..4], [20, 20, 20, 255]);
+        let middle = (128 * 256 + 128) * 4;
+        assert_eq!(icon.rgba[middle..middle + 4], [242, 240, 233, 255]);
     }
 }

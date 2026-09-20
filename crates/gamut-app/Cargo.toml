@@ -21,5 +21,8 @@ gamut-core = { path = "../gamut-core" }
 gamut-gpu = { path = "../gamut-gpu" }
 gamut-media = { path = "../gamut-media" }
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
+
 [dev-dependencies]
 serde_json = { workspace = true }
