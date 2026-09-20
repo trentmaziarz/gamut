@@ -193,7 +193,7 @@ impl Prepared {
         let look = &edit.look;
         Prepared {
             white_balance,
-            atmosphere: exposure(white_balance.apply(atmosphere), edit.exposure),
+            atmosphere: exposed_atmosphere(&white_balance, atmosphere, edit.exposure),
             tables: (!look.curves.is_identity()).then(|| curve::bake(&look.curves)),
             hsl: (!look.hsl_is_identity()).then(|| HslParams::new(&look.hsl)),
             cdl: (!look.wheels.is_identity()).then(|| Cdl::new(&look.wheels)),
@@ -204,6 +204,12 @@ impl Prepared {
     pub fn runs_the_look(&self) -> bool {
         self.tables.is_some() || self.hsl.is_some() || self.cdl.is_some()
     }
+}
+
+/// The atmospheric light as dehaze meets it, after the two linear operators
+/// ahead of it: the white balance and the exposure.
+pub fn exposed_atmosphere(white_balance: &Mat3, atmosphere: [f32; 3], ev: f32) -> [f32; 3] {
+    exposure(white_balance.apply(atmosphere), ev)
 }
 
 /// The whole develop chain of one pixel with no detail and no haze around
@@ -308,6 +314,19 @@ pub fn base_layer(pixels: &[[f32; 3]], width: u32, height: u32) -> Vec<f32> {
 /// Every blurred layer of the develop graph goes through this: the base
 /// layer, the texture layer and the smoothing of the transmission map.
 pub fn gaussian(source: &[f32], width: u32, height: u32, sigma: f32) -> Vec<f32> {
+    gaussian_stored(source, width, height, sigma, &|v| v)
+}
+
+/// [`gaussian`] with `store` applied to every value each of the two passes
+/// writes. The GPU keeps both passes in half float textures; a golden test
+/// passes the rounding of that format here.
+pub fn gaussian_stored(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
     let radius = blur_radius(sigma);
     let weights: Vec<f32> = (-radius..=radius)
         .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
@@ -326,7 +345,7 @@ pub fn gaussian(source: &[f32], width: u32, height: u32, sigma: f32) -> Vec<f32>
                     sum += weight * source[(sy * w + sx) as usize];
                     weight_sum += weight;
                 }
-                out[(y * w + x) as usize] = sum / weight_sum;
+                out[(y * w + x) as usize] = store(sum / weight_sum);
             }
         }
         out

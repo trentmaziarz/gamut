@@ -9,7 +9,10 @@
 //! with one gaussian at the patch size instead, which is cheap on the GPU
 //! and hides the patch edges well enough for a slider.
 
-use crate::basic::gaussian;
+use crate::SourceSpace;
+use crate::basic::gaussian_stored;
+use crate::matrices;
+use crate::transfer::srgb8_to_linear;
 
 /// The patch of the minimum filter as a fraction of the short edge.
 pub const PATCH_FRACTION: f32 = 0.015;
@@ -56,8 +59,21 @@ pub fn dark(px: [f32; 3], atmosphere: [f32; 3]) -> f32 {
 /// A square minimum filter, run as a row pass and a column pass, clamped at
 /// the edges.
 pub fn minimum(source: &[f32], width: u32, height: u32, radius: i32) -> Vec<f32> {
+    minimum_stored(source, width, height, radius, &|v| v, &|v| v)
+}
+
+/// [`minimum`] with `store_rows` applied to what the row pass writes and
+/// `store_columns` to what the column pass writes, for the golden tests.
+pub fn minimum_stored(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    radius: i32,
+    store_rows: &dyn Fn(f32) -> f32,
+    store_columns: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
     let (w, h) = (width as i32, height as i32);
-    let pass = |source: &[f32], dx: i32, dy: i32| -> Vec<f32> {
+    let pass = |source: &[f32], dx: i32, dy: i32, store: &dyn Fn(f32) -> f32| -> Vec<f32> {
         let mut out = vec![0.0; source.len()];
         for y in 0..h {
             for x in 0..w {
@@ -67,33 +83,18 @@ pub fn minimum(source: &[f32], width: u32, height: u32, radius: i32) -> Vec<f32>
                     let sy = (y + i * dy).clamp(0, h - 1);
                     least = least.min(source[(sy * w + sx) as usize]);
                 }
-                out[(y * w + x) as usize] = least;
+                out[(y * w + x) as usize] = store(least);
             }
         }
         out
     };
-    let rows = pass(source, 1, 0);
-    pass(&rows, 0, 1)
+    let rows = pass(source, 1, 0, store_rows);
+    pass(&rows, 0, 1, store_columns)
 }
 
 /// The transmission of a dark channel value.
 pub fn transmission_of(dark: f32) -> f32 {
     (1.0 - OMEGA * dark).clamp(TRANSMISSION_FLOOR, 1.0)
-}
-
-/// The transmission map before smoothing.
-pub fn raw_transmission(
-    pixels: &[[f32; 3]],
-    width: u32,
-    height: u32,
-    atmosphere: [f32; 3],
-    radius: i32,
-) -> Vec<f32> {
-    let dark_channel: Vec<f32> = pixels.iter().map(|px| dark(*px, atmosphere)).collect();
-    minimum(&dark_channel, width, height, radius)
-        .into_iter()
-        .map(transmission_of)
-        .collect()
 }
 
 /// The transmission map of a linear image.
@@ -103,23 +104,38 @@ pub fn transmission(
     height: u32,
     atmosphere: [f32; 3],
 ) -> Vec<f32> {
-    let raw = raw_transmission(
-        pixels,
-        width,
-        height,
-        atmosphere,
-        patch_radius(width, height),
-    );
-    gaussian(&raw, width, height, smoothing_sigma(width, height))
+    transmission_stored(pixels, width, height, atmosphere, &|v| v)
 }
 
-/// The atmospheric light of a linear image: the image is box-averaged down
-/// to at most [`ATMOSPHERE_EDGE`] on its long edge, and the answer is the
-/// mean colour of the brightest [`BRIGHTEST_FRACTION`] of the dark channel.
-pub fn atmosphere(pixels: &[[f32; 3]], width: u32, height: u32) -> [f32; 3] {
-    if pixels.is_empty() {
-        return WHITE_ATMOSPHERE;
-    }
+/// [`transmission`] with `store` applied wherever the GPU writes a texture:
+/// the row minimum, the transmission of the column minimum, and the two
+/// passes of the smoothing.
+pub fn transmission_stored(
+    pixels: &[[f32; 3]],
+    width: u32,
+    height: u32,
+    atmosphere: [f32; 3],
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
+    let dark_channel: Vec<f32> = pixels.iter().map(|px| dark(*px, atmosphere)).collect();
+    let raw = minimum_stored(
+        &dark_channel,
+        width,
+        height,
+        patch_radius(width, height),
+        store,
+        &|least| store(transmission_of(least)),
+    );
+    gaussian_stored(&raw, width, height, smoothing_sigma(width, height), store)
+}
+
+/// A linear image box-averaged down to at most [`ATMOSPHERE_EDGE`] on its
+/// long edge, with its new size. `pixel` reads one source pixel.
+fn downsample(
+    width: u32,
+    height: u32,
+    pixel: impl Fn(usize) -> [f32; 3],
+) -> (Vec<[f32; 3]>, u32, u32) {
     let factor = width.max(height).div_ceil(ATMOSPHERE_EDGE).max(1);
     let (small_w, small_h) = (width.div_ceil(factor), height.div_ceil(factor));
     let mut small = Vec::with_capacity((small_w * small_h) as usize);
@@ -129,7 +145,7 @@ pub fn atmosphere(pixels: &[[f32; 3]], width: u32, height: u32) -> [f32; 3] {
             let mut count = 0.0;
             for y in sy * factor..((sy + 1) * factor).min(height) {
                 for x in sx * factor..((sx + 1) * factor).min(width) {
-                    let px = pixels[(y * width + x) as usize];
+                    let px = pixel((y * width + x) as usize);
                     sum = [sum[0] + px[0], sum[1] + px[1], sum[2] + px[2]];
                     count += 1.0;
                 }
@@ -137,6 +153,41 @@ pub fn atmosphere(pixels: &[[f32; 3]], width: u32, height: u32) -> [f32; 3] {
             small.push(sum.map(|c| c / count));
         }
     }
+    (small, small_w, small_h)
+}
+
+/// The atmospheric light of a linear image: the image is box-averaged down
+/// to at most [`ATMOSPHERE_EDGE`] on its long edge, and the answer is the
+/// mean colour of the brightest [`BRIGHTEST_FRACTION`] of the dark channel.
+pub fn atmosphere(pixels: &[[f32; 3]], width: u32, height: u32) -> [f32; 3] {
+    if pixels.is_empty() {
+        return WHITE_ATMOSPHERE;
+    }
+    let (small, small_w, small_h) = downsample(width, height, |i| pixels[i]);
+    atmosphere_of_downsample(&small, small_w, small_h)
+}
+
+/// [`atmosphere`] of an 8-bit RGBA photo in `space`. The sRGB curve is
+/// decoded through a table and the box average is taken before the matrix,
+/// which is linear, so a 24 megapixel photo costs one table read per byte.
+pub fn atmosphere_rgba8(rgba8: &[u8], width: u32, height: u32, space: SourceSpace) -> [f32; 3] {
+    if rgba8.len() < (width as usize) * (height as usize) * 4 || width == 0 || height == 0 {
+        return WHITE_ATMOSPHERE;
+    }
+    let table: Vec<f32> = (0..=255u8).map(srgb8_to_linear).collect();
+    let (small, small_w, small_h) = downsample(width, height, |i| {
+        [
+            table[rgba8[i * 4] as usize],
+            table[rgba8[i * 4 + 1] as usize],
+            table[rgba8[i * 4 + 2] as usize],
+        ]
+    });
+    let matrix = matrices::input_matrix(space);
+    let small: Vec<[f32; 3]> = small.into_iter().map(|px| matrix.apply(px)).collect();
+    atmosphere_of_downsample(&small, small_w, small_h)
+}
+
+fn atmosphere_of_downsample(small: &[[f32; 3]], small_w: u32, small_h: u32) -> [f32; 3] {
     let dark_channel: Vec<f32> = small.iter().map(|px| dark(*px, WHITE_ATMOSPHERE)).collect();
     let filtered = minimum(
         &dark_channel,

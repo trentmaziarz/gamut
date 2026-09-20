@@ -35,10 +35,11 @@ impl Default for Curve {
 }
 
 impl Curve {
-    /// True when every point sits on the diagonal, so the curve changes
-    /// nothing and the lookup can be skipped.
+    /// True for the default curve, the two end points and nothing else, so
+    /// the lookup can be skipped. A curve with more points runs the lookup
+    /// even when every point sits on the diagonal.
     pub fn is_identity(&self) -> bool {
-        self.points.iter().all(|p| p[0] == p[1])
+        self.points == [[0.0, 0.0], [1.0, 1.0]]
     }
 
     /// The curve made safe to interpolate: points that are not finite are
