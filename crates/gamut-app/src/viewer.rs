@@ -344,7 +344,8 @@ fn view_input(
     pan: &mut PanInput,
 ) {
     let scale = ui.pixels_per_point();
-    let typing = ui.ctx().egui_wants_keyboard_input();
+    // A slider keeps the focus after a click, so focus alone is not typing.
+    let typing = ui.ctx().text_edit_focused();
     let prompt = session.adjust.pending_switch.is_some();
     let (keys, space, space_released, steps, pinch, pointer) = ui.input(|i| {
         let mut steps = 0.0;

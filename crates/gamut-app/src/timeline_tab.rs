@@ -45,7 +45,8 @@ pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
         ui.weak("Open a video: File > Open, drop a file on the window, or gamut-app <path>.");
         return;
     };
-    let typing = ui.ctx().egui_wants_keyboard_input();
+    // A slider keeps the focus after a click, so focus alone is not typing.
+    let typing = ui.ctx().text_edit_focused();
     let space = ui.input(|i| i.key_released(egui::Key::Space))
         && space_release_toggles(session.view_link.space_panned, typing);
     if ui.input(|i| i.key_released(egui::Key::Space)) {
