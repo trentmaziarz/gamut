@@ -67,8 +67,8 @@ pub struct Sidecar {
     pub crop: Crop,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<NamedVersion>,
-    /// The version the working state was last switched to or saved as, so a
-    /// later switch knows where to save the working state back.
+    /// The version the working state was last switched to, saved as or
+    /// updated into: the one [`Sidecar::is_dirty`] compares against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_version: Option<String>,
 }
@@ -132,26 +132,45 @@ impl Sidecar {
         Ok(())
     }
 
-    /// Copies a version into the working state. When the working state came
-    /// from another version, it is saved back to that version first, so
-    /// nothing done since is lost. A switch to the version already in use
-    /// saves nothing back: it brings the version back as it was saved.
+    /// Copies a version into the working state and makes it the active
+    /// version. A switch never writes into a version: what the working state
+    /// held is gone unless [`Sidecar::update_version`] or
+    /// [`Sidecar::save_version`] kept it first, which is what
+    /// [`Sidecar::is_dirty`] is there to ask about.
     pub fn switch_to(&mut self, name: &str) -> Result<(), VersionError> {
         let target = self
             .find_version(name)
             .ok_or_else(|| self.not_found(name))?;
-        if let Some(active) = self.active_version.clone()
-            && let Some(index) = self.find_version(&active)
-            && index != target
-        {
-            self.versions[index].edit = self.edit.clone();
-            self.versions[index].crop = self.crop;
-        }
         let version = self.versions[target].clone();
         self.edit = version.edit;
         self.crop = version.crop;
         self.active_version = Some(version.name);
         Ok(())
+    }
+
+    /// Copies the working state into the version with this name and makes it
+    /// the active version. The only way a version changes after it is saved.
+    pub fn update_version(&mut self, name: &str) -> Result<(), VersionError> {
+        let index = self
+            .find_version(name)
+            .ok_or_else(|| self.not_found(name))?;
+        self.versions[index].edit = self.edit.clone();
+        self.versions[index].crop = self.crop;
+        self.active_version = Some(self.versions[index].name.clone());
+        Ok(())
+    }
+
+    /// Whether the working state holds work its active version does not:
+    /// true when an active version exists and the working edit or crop
+    /// differs from it. With no active version there is nothing to be behind.
+    pub fn is_dirty(&self) -> bool {
+        self.active_version
+            .as_deref()
+            .and_then(|active| self.find_version(active))
+            .is_some_and(|index| {
+                let version = &self.versions[index];
+                version.edit != self.edit || version.crop != self.crop
+            })
     }
 
     pub fn rename_version(&mut self, name: &str, new_name: &str) -> Result<(), VersionError> {
@@ -267,31 +286,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn switching_saves_the_working_state_back_to_the_version_it_came_from() {
+    /// Two versions, Bright (exposure 1) and Dark (exposure -1), with Dark
+    /// the active one.
+    fn bright_and_dark() -> Sidecar {
         let mut sidecar = Sidecar::default();
         sidecar.edit.exposure = 1.0;
         sidecar.save_version("Bright").expect("save");
         sidecar.edit.exposure = -1.0;
-        sidecar.active_version = None;
         sidecar.save_version("Dark").expect("save");
+        sidecar
+    }
+
+    #[test]
+    fn switching_on_a_clean_state_brings_the_version_in() {
+        let mut sidecar = bright_and_dark();
+        assert!(!sidecar.is_dirty());
+        sidecar.switch_to("bright").expect("switch");
+        assert_eq!(sidecar.edit.exposure, 1.0);
+        assert_eq!(sidecar.active_version.as_deref(), Some("Bright"));
+        assert!(!sidecar.is_dirty());
+        assert_eq!(sidecar.version("Dark").expect("found").edit.exposure, -1.0);
+    }
+
+    /// The rule that replaced the save-back of version 2: a switch never
+    /// writes into a version, so work that was not kept is gone.
+    #[test]
+    fn switching_on_a_dirty_state_leaves_the_version_it_came_from_untouched() {
+        let mut sidecar = bright_and_dark();
+        let before = sidecar.versions.clone();
 
         // Working on Dark: a change, then a switch away and back.
         sidecar.edit.contrast = 30.0;
+        assert!(sidecar.is_dirty());
         sidecar.switch_to("bright").expect("switch");
+        assert_eq!(sidecar.versions, before, "no version was written");
         assert_eq!(sidecar.edit.exposure, 1.0);
         assert_eq!(sidecar.edit.contrast, 0.0);
-        assert_eq!(sidecar.active_version.as_deref(), Some("Bright"));
         sidecar.switch_to("Dark").expect("switch back");
         assert_eq!(sidecar.edit.exposure, -1.0);
-        assert_eq!(sidecar.edit.contrast, 30.0);
+        assert_eq!(sidecar.edit.contrast, 0.0, "Dark is as it was saved");
+        assert_eq!(sidecar.versions, before);
 
         let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
         assert_eq!(back, sidecar);
-        sidecar.delete_version("dark").expect("delete");
+    }
+
+    #[test]
+    fn update_version_writes_the_working_state_into_the_named_version() {
+        let mut sidecar = bright_and_dark();
+        sidecar.edit.contrast = 30.0;
+        sidecar.crop.rect.width = 0.5;
+        sidecar.update_version("dark").expect("update");
+        assert!(!sidecar.is_dirty());
+        let dark = sidecar.version("Dark").expect("found");
+        assert_eq!(dark.edit.contrast, 30.0);
+        assert_eq!(dark.crop.rect.width, 0.5);
+        assert_eq!(sidecar.version("Bright").expect("found").edit.contrast, 0.0);
+
+        // Updating another version makes that one the active version.
+        sidecar.edit.contrast = 45.0;
+        sidecar.update_version("Bright").expect("update");
+        assert_eq!(sidecar.active_version.as_deref(), Some("Bright"));
+        assert_eq!(sidecar.version("Bright").expect("found").edit.contrast, 45.0);
+        assert_eq!(sidecar.version("Dark").expect("found").edit.contrast, 30.0);
+        assert!(!sidecar.is_dirty());
+
+        let error = sidecar.update_version("nope").expect_err("unknown");
+        assert_eq!(
+            error.to_string(),
+            "no version named nope: the versions are Bright, Dark"
+        );
+    }
+
+    #[test]
+    fn is_dirty_follows_the_edit_and_the_crop() {
+        let mut sidecar = Sidecar::default();
+        sidecar.edit.exposure = 0.5;
+        assert!(!sidecar.is_dirty(), "no active version, nothing to be behind");
+        sidecar.save_version("One").expect("save");
+        assert!(!sidecar.is_dirty());
+
+        sidecar.edit.exposure = 0.75;
+        assert!(sidecar.is_dirty());
+        sidecar.edit.exposure = 0.5;
+        assert!(!sidecar.is_dirty(), "back where the version is");
+
+        sidecar.crop.rect.x = 0.1;
+        assert!(sidecar.is_dirty());
+        sidecar.switch_to("One").expect("switch");
+        assert!(!sidecar.is_dirty());
+        assert_eq!(sidecar.crop.rect.x, 0.0);
+
+        sidecar.edit.look.wheels.shadows.x = 0.2;
+        assert!(sidecar.is_dirty());
+        sidecar.delete_version("One").expect("delete");
+        assert!(!sidecar.is_dirty(), "the active version is gone");
+    }
+
+    #[test]
+    fn rename_and_delete_keep_working_around_the_active_version() {
+        let mut sidecar = bright_and_dark();
+        sidecar.edit.contrast = 30.0;
+        sidecar.rename_version("dark", "Night").expect("rename");
+        assert_eq!(sidecar.active_version.as_deref(), Some("Night"));
+        assert!(sidecar.is_dirty(), "a rename keeps the comparison");
+        sidecar.update_version("Night").expect("update");
+        assert!(!sidecar.is_dirty());
+
+        sidecar.delete_version("night").expect("delete");
         assert_eq!(sidecar.active_version, None);
         assert_eq!(sidecar.versions.len(), 1);
         assert_eq!(sidecar.edit.contrast, 30.0, "the working state stays");
+        sidecar.delete_version("Bright").expect("delete");
+        assert!(sidecar.versions.is_empty());
+    }
+
+    #[test]
+    fn versions_and_the_active_version_round_trip_through_json() {
+        let mut sidecar = bright_and_dark();
+        sidecar.edit.contrast = 30.0;
+        let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
+        assert_eq!(back, sidecar);
+        assert!(back.is_dirty(), "the unsaved work survives a reload as unsaved");
+        assert_eq!(back.active_version.as_deref(), Some("Dark"));
     }
 
     /// Trent at the window, 2026-09-20: save a version, change the look,
