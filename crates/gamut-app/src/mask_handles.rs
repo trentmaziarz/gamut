@@ -741,4 +741,158 @@ mod tests {
         let linear = MaskSource::default();
         assert_eq!(picked(&linear, px), linear);
     }
+
+    /// Within a twentieth of a point: f32 positions run to tens of
+    /// thousands of points at 400 percent.
+    fn lands_on(a: Pos2, b: Pos2) -> bool {
+        (a - b).length() < 0.05
+    }
+
+    /// Pointer positions inside the tab of [`zoomed`].
+    fn pointers() -> [Pos2; 3] {
+        [
+            Pos2::new(173.0, 88.0),
+            Pos2::new(490.0, 380.0),
+            Pos2::new(911.0, 702.5),
+        ]
+    }
+
+    #[test]
+    fn a_dragged_linear_handle_lands_under_the_pointer_at_every_zoom() {
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            for pointer in pointers() {
+                // What linear_handles stores for a dragged end.
+                let end = map.to_picture(pointer);
+                let gradient = LinearGradient {
+                    end,
+                    ..LinearGradient::default()
+                };
+                assert!(
+                    lands_on(map.to_screen(gradient.end), pointer),
+                    "{scale} {pointer:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dragged_radial_centre_lands_under_the_pointer_at_every_zoom() {
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            for pointer in pointers() {
+                let gradient = RadialGradient {
+                    centre: map.to_picture(pointer),
+                    ..RadialGradient::default()
+                };
+                assert!(lands_on(radial_handles(&map, &gradient).centre, pointer));
+            }
+        }
+    }
+
+    #[test]
+    fn dragged_radius_handles_land_under_the_pointer_at_every_zoom() {
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            let gradient = RadialGradient {
+                centre: [0.31, 0.64],
+                radius: [0.02, 0.012],
+                rotation: 35.0,
+                feather: 20.0,
+            };
+            let (x_axis, y_axis) = radial_axes(&gradient);
+            let centre = map.to_screen(gradient.centre);
+            for (axis, along, reach) in [(0, x_axis, 212.0), (1, y_axis, 97.0)] {
+                // The pointer sits on the axis, this far from the centre.
+                let pointer = centre + along * reach;
+                let mut moved = gradient;
+                moved.radius[axis] = dragged_radius(&map, &gradient, axis, pointer);
+                let at = radial_handles(&map, &moved);
+                let handle = if axis == 0 { at.radius_x } else { at.radius_y };
+                assert!(lands_on(handle, pointer), "{scale} axis {axis}");
+                // The same drag asks for a quarter of the radius at four
+                // times the zoom: the distance is on the photo.
+                let expected = reach / (6000.0 * scale);
+                assert!((moved.radius[axis] - expected).abs() < 1e-6);
+            }
+            // The 4b tests, through the zoomed map.
+            let at = radial_handles(&map, &gradient);
+            assert!((dragged_radius(&map, &gradient, 0, at.radius_x) - 0.02).abs() < 1e-6);
+            assert!((dragged_radius(&map, &gradient, 1, at.radius_y) - 0.012).abs() < 1e-6);
+            let aside = at.radius_x + y_axis * 40.0;
+            assert!((dragged_radius(&map, &gradient, 0, aside) - 0.02).abs() < 1e-6);
+            assert_eq!(dragged_radius(&map, &gradient, 0, at.centre), MIN_RADIUS);
+        }
+    }
+
+    #[test]
+    fn a_dragged_rotation_handle_points_at_the_pointer_at_every_zoom() {
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            let mut gradient = RadialGradient {
+                centre: [0.31, 0.64],
+                radius: [0.02, 0.012],
+                rotation: 0.0,
+                feather: 20.0,
+            };
+            let centre = map.to_screen(gradient.centre);
+            for degrees in [-135.0_f32, -20.0, 0.0, 35.0, 90.0, 170.0] {
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                let pointer = centre + Vec2::new(cos, sin) * 240.0;
+                gradient.rotation = dragged_rotation(&map, &gradient, pointer);
+                assert!((gradient.rotation - degrees).abs() < 1e-3, "{degrees}");
+                // The handle is on the line from the centre through the
+                // pointer, past the first radius.
+                let at = radial_handles(&map, &gradient);
+                let along = (at.rotation - centre).normalized();
+                assert!((along - Vec2::new(cos, sin)).length() < 1e-4);
+                // Back from the handle is the rotation again (the 4b test).
+                let back = dragged_rotation(&map, &gradient, at.rotation);
+                assert!((back - degrees).abs() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pick_reads_the_source_pixel_under_the_pointer_at_every_zoom() {
+        // A photo of six blocks by four whose colour names the block. The pick
+        // works on positions of the photo, so its pixel size does not matter.
+        let photo = photo(1200, 800, |x, y| {
+            [(x / 200 * 40) as u8, (y / 200 * 60) as u8, 7]
+        });
+        let image = PickImage::from_photo(&photo);
+        let mut read = 0;
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            for pointer in pointers() {
+                let at = map.to_picture(pointer);
+                let (bx, by) = (at[0] * 6.0, at[1] * 4.0);
+                // Away from a block edge the averaged copy holds the block.
+                if (bx.fract() - 0.5).abs() > 0.45 || (by.fract() - 0.5).abs() > 0.45 {
+                    continue;
+                }
+                let expected = basic::decode_rgb8(
+                    [(bx as u32 * 40) as u8, (by as u32 * 60) as u8, 7],
+                    SourceSpace::Srgb,
+                );
+                assert_eq!(
+                    image.source_pixel(at),
+                    Some(expected),
+                    "{scale} {pointer:?}"
+                );
+                read += 1;
+            }
+        }
+        assert!(
+            read >= 4,
+            "only {read} pointers were away from a block edge"
+        );
+        // The middle of the tab is the point of the view: block (1, 2).
+        let map = zoomed(4.0);
+        let middle = map.to_picture(map.visible.center());
+        assert_eq!(
+            image.source_pixel(middle),
+            Some(basic::decode_rgb8([40, 120, 7], SourceSpace::Srgb))
+        );
+    }
 }
