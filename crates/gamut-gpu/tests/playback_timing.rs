@@ -5,13 +5,15 @@
 //! maximum per frame are printed with the decode, copy and upload shares.
 //! The p95 must be under 33.3 ms and the mean under 25 ms only when
 //! GAMUT_TIMING_GATE=1 is set; the test skips when the clip is not on the
-//! machine or no CUDA device answers.
+//! machine or no CUDA device answers. For the record, a second run of 100
+//! frames renders what a Viewer zoomed to 100 percent shows of the frame,
+//! through the padded window; nothing is asserted on it.
 
 use std::time::Instant;
 
 use gamut_core::{CropAspect, CropRect, PhotoEdit};
-use gamut_gpu::develop::render_size_for_crop;
-use gamut_gpu::{Develop, Headless};
+use gamut_gpu::develop::{padded_window, render_size_for_crop};
+use gamut_gpu::{Develop, Headless, ViewWindow};
 use gamut_media::hwaccel::nvdec_available;
 use gamut_media::{Decoder, VideoSource, fixtures};
 
@@ -105,6 +107,46 @@ fn playback_at_4k30_is_fast_enough() {
         copy / n as f64,
         upload / n as f64
     );
+    // For the record: the same clip with the view at 100 percent in a tab
+    // of the output size. Every frame is new content, so the head passes run
+    // over the padded window on each one.
+    let full = (source.width, source.height);
+    let seen = ((OUTPUT.0 + 1).min(full.0), (OUTPUT.1 + 1).min(full.1));
+    let visible = ((full.0 - seen.0) / 2, (full.1 - seen.1) / 2, seen.0, seen.1);
+    let view = ViewWindow {
+        full,
+        window: padded_window(full, visible, (OUTPUT.0 / 2, OUTPUT.1 / 2), 64),
+        visible,
+    };
+    let mut zoomed = Vec::with_capacity(100);
+    for i in 0..=100 {
+        let started = Instant::now();
+        let Some(frame) = source.next_frame().expect("decode") else {
+            break;
+        };
+        develop.set_video_frame(&frame, colour, rotation);
+        develop
+            .render_view(&edit, &view)
+            .expect("the source is set");
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        if i > 0 {
+            zoomed.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    if !zoomed.is_empty() {
+        zoomed.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        let n = zoomed.len();
+        println!(
+            "playback with the view at 100 percent, window {:?} of {full:?}, {n} frames (not asserted): p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+            (view.window.2, view.window.3),
+            zoomed[n / 2],
+            zoomed[(n * 95 / 100).min(n - 1)],
+            zoomed[n - 1]
+        );
+    }
+
     if std::env::var(GATE).as_deref() == Ok("1") {
         assert!(
             p95 < GATE_P95_MS,

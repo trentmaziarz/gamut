@@ -9,13 +9,21 @@
 //! exposure and holds that no mask alpha is drawn again. The one-off cost of
 //! the texture and dehaze head passes, of the four mask alphas and of one
 //! full-resolution render are timed as well, for the record.
+//!
+//! The zoomed viewer is measured the same way, with every operator and the
+//! four masks on: a slider step at 100 percent, which develops what is seen
+//! and not the whole photo; a pan of 32 source pixels a step inside the
+//! padded window, which develops what came into view and runs no head pass;
+//! the same slider step at 400 percent; and, for the record, what replacing
+//! the padded window costs and how often a steady pan pays it.
 
 use std::time::Instant;
 
 use gamut_core::look::{Curve, Wheel};
 use gamut_core::mask::{ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient};
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
-use gamut_gpu::{Develop, Headless};
+use gamut_gpu::develop::{PixelRect, holds, padded_window};
+use gamut_gpu::{Develop, Headless, ViewWindow};
 use gamut_media::{fixtures, open_photo};
 
 /// The 4:5 fit of the viewer on the reference laptop, in pixels.
@@ -39,6 +47,69 @@ fn timed_render(gpu: &Headless, develop: &mut Develop, edit: &PhotoEdit, size: (
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("wait for the render");
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// The grid the viewer snaps its padded window to, in source pixels, and the
+/// pan of one step.
+const WINDOW_GRID: u32 = 64;
+const PAN_STEP: u32 = 32;
+
+/// What the viewer renders of a photo of `full` pixels at `zoom` (1 is 100
+/// percent) with the middle of the photo in the middle of a tab of
+/// [`VIEWER_SIZE`] pixels: what is seen, padded by half a tab and snapped.
+fn zoomed_view(full: (u32, u32), zoom: u32) -> (ViewWindow, (u32, u32)) {
+    let seen = (
+        (VIEWER_SIZE.0.div_ceil(zoom) + 1).min(full.0),
+        (VIEWER_SIZE.1.div_ceil(zoom) + 1).min(full.1),
+    );
+    let visible = ((full.0 - seen.0) / 2, (full.1 - seen.1) / 2, seen.0, seen.1);
+    let pad = (
+        VIEWER_SIZE.0.div_ceil(2 * zoom),
+        VIEWER_SIZE.1.div_ceil(2 * zoom),
+    );
+    let view = ViewWindow {
+        full,
+        window: padded_window(full, visible, pad, WINDOW_GRID),
+        visible,
+    };
+    (view, pad)
+}
+
+fn timed_view(gpu: &Headless, develop: &mut Develop, edit: &PhotoEdit, view: &ViewWindow) -> f64 {
+    let start = Instant::now();
+    develop.render_view(edit, view).expect("the source is set");
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("wait for the render");
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// The median, the 95th percentile and the maximum of `RENDERS` timed runs.
+fn percentiles(mut times: Vec<f64>) -> (f64, f64, f64) {
+    times.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    (
+        times[RENDERS / 2],
+        times[(RENDERS * 95 / 100).min(RENDERS - 1)],
+        times[RENDERS - 1],
+    )
+}
+
+/// `RENDERS` renders of a zoomed view with the exposure slider stepping.
+fn stepped_view(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: &ViewWindow,
+) -> (f64, f64, f64) {
+    percentiles(
+        (0..RENDERS)
+            .map(|i| {
+                let mut edit = base.clone();
+                edit.exposure = -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32;
+                timed_view(gpu, develop, &edit, view)
+            })
+            .collect(),
+    )
 }
 
 /// Every operator of the develop chain away from its neutral value.
@@ -252,7 +323,100 @@ fn develop_at_viewer_size_is_fast_enough() {
         "a slider of a mask drew its alpha again"
     );
 
+    // The zoomed viewer. On a CPU adapter a window of several megapixels
+    // takes minutes and proves nothing, so the lines are skipped there.
     let info = gpu.adapter.get_info();
+    let mut zoomed_p95 = None;
+    if info.device_type == wgpu::DeviceType::Cpu {
+        println!("zoomed viewer lines skipped on a CPU adapter");
+    } else {
+        let full = (photo.width, photo.height);
+        let (actual, pad) = zoomed_view(full, 1);
+        let builds = develop.mask_alpha_builds();
+        let first = timed_view(&gpu, &mut develop, &masked, &actual);
+        println!(
+            "first render of the padded window at 100 percent, window {:?} of {full:?}, seen {:?}: {first:.2} ms",
+            (actual.window.2, actual.window.3),
+            (actual.visible.2, actual.visible.3)
+        );
+        assert_eq!(develop.mask_alpha_builds() - builds, 4);
+        let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &masked, &actual);
+        println!(
+            "slider step at 100 percent, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+        );
+
+        // A pan of 32 source pixels a step, there and back inside the pad:
+        // the window stays, so no head pass and no mask alpha runs again.
+        let reach = pad.0 / PAN_STEP;
+        let pans: Vec<PixelRect> = (0..RENDERS as u32)
+            .map(|i| {
+                let leg = i % (2 * reach);
+                let offset = PAN_STEP * if leg < reach { leg } else { 2 * reach - leg };
+                let (x, y, w, h) = actual.visible;
+                (x + offset, y, w, h)
+            })
+            .collect();
+        assert!(pans.iter().all(|visible| holds(actual.window, *visible)));
+        let (pan_p50, pan_p95, pan_max) = percentiles(
+            pans.iter()
+                .map(|visible| {
+                    let view = ViewWindow {
+                        visible: *visible,
+                        ..actual
+                    };
+                    timed_view(&gpu, &mut develop, &masked, &view)
+                })
+                .collect(),
+        );
+        println!(
+            "pan of {PAN_STEP} source pixels a step inside the padded window, {RENDERS} renders: p50 {pan_p50:.2} ms, p95 {pan_p95:.2} ms, max {pan_max:.2} ms"
+        );
+        assert_eq!(
+            develop.mask_alpha_builds() - builds,
+            4,
+            "a slider step or a pan inside the window drew a mask alpha again"
+        );
+
+        // For the record: a pan that leaves the window replaces it, which
+        // runs the head passes and the four alphas over the new one.
+        let mut replaced = Vec::new();
+        for k in 1..=5u32 {
+            let (x, y, w, h) = actual.visible;
+            let visible = (x + k * (pad.0 + PAN_STEP), y, w, h);
+            if visible.0 + w > full.0 {
+                break;
+            }
+            let view = ViewWindow {
+                full,
+                window: padded_window(full, visible, pad, WINDOW_GRID),
+                visible,
+            };
+            replaced.push(timed_view(&gpu, &mut develop, &masked, &view));
+        }
+        replaced.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        println!(
+            "replacing the padded window, {} times: least {:.2} ms, most {:.2} ms; a steady pan of {PAN_STEP} pixels a step pays it every {} steps across and every {} down",
+            replaced.len(),
+            replaced.first().copied().unwrap_or(0.0),
+            replaced.last().copied().unwrap_or(0.0),
+            pad.0 / PAN_STEP,
+            pad.1 / PAN_STEP
+        );
+
+        let (deep, _) = zoomed_view(full, 4);
+        let first = timed_view(&gpu, &mut develop, &masked, &deep);
+        println!(
+            "first render of the padded window at 400 percent, window {:?}, seen {:?}: {first:.2} ms",
+            (deep.window.2, deep.window.3),
+            (deep.visible.2, deep.visible.3)
+        );
+        let (deep_p50, deep_p95, deep_max) = stepped_view(&gpu, &mut develop, &masked, &deep);
+        println!(
+            "slider step at 400 percent, {RENDERS} renders: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
+        );
+        zoomed_p95 = Some((step_p95, pan_p95, deep_p95));
+    }
+
     if info.device_type == wgpu::DeviceType::Cpu {
         println!("full-resolution render skipped on a CPU adapter");
     } else {
@@ -271,6 +435,20 @@ fn develop_at_viewer_size_is_fast_enough() {
             masks_p95 < GATE_MS,
             "p95 with four full masks on, {masks_p95:.2} ms, is not under {GATE_MS} ms"
         );
+        if let Some((step_p95, pan_p95, deep_p95)) = zoomed_p95 {
+            assert!(
+                step_p95 < GATE_MS,
+                "p95 of a slider step at 100 percent, {step_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                pan_p95 < GATE_MS,
+                "p95 of a pan inside the padded window, {pan_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                deep_p95 < GATE_MS,
+                "p95 of a slider step at 400 percent, {deep_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
     } else {
         println!("{GATE} is not set, so the {GATE_MS} ms gate is printed and not asserted");
     }
