@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod crop;
 pub mod export;
+pub mod history;
 pub mod look;
 pub mod mask;
 pub mod preset;
@@ -22,6 +23,7 @@ pub mod timeline;
 
 pub use crop::{Crop, CropAspect, CropRect};
 pub use export::ExportPreset;
+pub use history::History;
 pub use look::{Curve, HslRange, Look, ToneCurves, Wheel, Wheels};
 pub use mask::{Component, Mask, MaskOp, MaskSource};
 pub use preset::{LookPreset, PartialEdit};
