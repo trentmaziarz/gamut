@@ -1,16 +1,20 @@
 //! Times the develop render of the 24 megapixel fixture at the viewer's
 //! pixel size: 100 renders with the exposure slider stepping, a device poll
 //! after each submit, and the median, 95th percentile and maximum printed.
-//! It is measured twice: with every other slider at rest, and with every
-//! operator of the develop chain on. Each p95 must be under 16 ms only when
-//! SLATE_TIMING_GATE=1 is set, so CI on WARP prints and never fails. The
-//! one-off cost of the texture and dehaze head passes and one
+//! It is measured three times: with every other slider at rest, with every
+//! operator of the develop chain on, and with four masks on top of that, one
+//! of each source, each carrying every adjustment. Each p95 must be under
+//! 16 ms only when SLATE_TIMING_GATE=1 is set, so CI on WARP prints and never
+//! fails. A fourth run steps a slider of a mask instead of the global
+//! exposure and holds that no mask alpha is drawn again. The one-off cost of
+//! the texture and dehaze head passes, of the four mask alphas and of one
 //! full-resolution render are timed as well, for the record.
 
 use std::time::Instant;
 
 use slate_core::look::{Curve, Wheel};
-use slate_core::{Adjustments, CropRect, PhotoEdit};
+use slate_core::mask::{ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient};
+use slate_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use slate_gpu::{Develop, Headless};
 use slate_media::{fixtures, open_photo};
 
@@ -82,13 +86,94 @@ fn everything_on() -> PhotoEdit {
     edit
 }
 
+/// [`everything_on`] with four enabled masks over it, one of each source,
+/// each carrying every adjustment: Basic, Presence, curves, mixer, wheels.
+fn everything_on_with_four_masks() -> PhotoEdit {
+    let mut edit = everything_on();
+    let sources = [
+        MaskSource::Linear(LinearGradient {
+            start: [0.5, 0.7],
+            end: [0.45, 0.2],
+        }),
+        MaskSource::Radial(RadialGradient {
+            centre: [0.55, 0.45],
+            radius: [0.35, 0.25],
+            rotation: 20.0,
+            feather: 60.0,
+        }),
+        MaskSource::Luminance(LuminanceRange {
+            low: 0.35,
+            high: 0.9,
+            falloff: 0.1,
+        }),
+        MaskSource::Colour(ColourRange {
+            hue: 250.0,
+            hue_width: 120.0,
+            chroma_low: 0.01,
+            falloff: 30.0,
+        }),
+    ];
+    for (k, source) in sources.into_iter().enumerate() {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        let mut mask = Mask::new(&format!("Mask {k}"), source);
+        mask.opacity = 90.0 - 10.0 * k as f32;
+        mask.adjust = Adjustments {
+            white_balance_temperature: 15.0 * sign,
+            white_balance_tint: -8.0 * sign,
+            exposure: 0.5 * sign,
+            contrast: 12.0,
+            highlights: 20.0 * sign,
+            shadows: -15.0 * sign,
+            whites: 8.0,
+            blacks: -6.0,
+            vibrance: 18.0 * sign,
+            saturation: -12.0 * sign,
+            texture: 20.0 * sign,
+            clarity: 15.0,
+            dehaze: 10.0 * sign,
+            ..Adjustments::default()
+        };
+        mask.adjust.look.curves.master = Curve {
+            points: vec![[0.0, 0.02], [0.4, 0.45 + 0.02 * k as f32], [1.0, 0.98]],
+        };
+        mask.adjust.look.curves.blue = Curve {
+            points: vec![[0.0, 0.0], [0.5, 0.46], [1.0, 1.0]],
+        };
+        mask.adjust.look.hsl[k].saturation = 30.0 * sign;
+        mask.adjust.look.hsl[(k + 3) % 8].hue = -25.0;
+        mask.adjust.look.wheels.shadows = Wheel {
+            x: 0.2 * sign,
+            y: 0.1,
+            luminance: 5.0,
+        };
+        mask.adjust.look.wheels.highlights = Wheel {
+            x: -0.15,
+            y: 0.25 * sign,
+            luminance: -5.0,
+        };
+        edit.masks.push(mask);
+    }
+    edit
+}
+
 /// The median, the 95th percentile and the maximum of `RENDERS` renders of
 /// `base` with the exposure slider stepping from -1 to 1.
 fn stepped(gpu: &Headless, develop: &mut Develop, base: &PhotoEdit) -> (f64, f64, f64) {
+    stepped_with(gpu, develop, base, |edit, value| edit.exposure = value)
+}
+
+/// The same with `step` putting a value that runs from -1 to 1 into the
+/// edit before each render.
+fn stepped_with(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    step: impl Fn(&mut PhotoEdit, f32),
+) -> (f64, f64, f64) {
     let mut times: Vec<f64> = (0..RENDERS)
         .map(|i| {
             let mut edit = base.clone();
-            edit.exposure = -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32;
+            step(&mut edit, -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32);
             timed_render(gpu, develop, &edit, VIEWER_SIZE)
         })
         .collect();
@@ -135,6 +220,38 @@ fn develop_at_viewer_size_is_fast_enough() {
         "develop with every operator on at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {all_p50:.2} ms, p95 {all_p95:.2} ms, max {all_max:.2} ms"
     );
 
+    // Four masks of every source over that, each carrying every adjustment:
+    // the first render draws the four alphas and uploads four table rows,
+    // and no slider change after it repeats either.
+    let masked = everything_on_with_four_masks();
+    let builds_before = develop.mask_alpha_builds();
+    let masks_on = timed_render(&gpu, &mut develop, &masked, VIEWER_SIZE);
+    assert_eq!(develop.mask_alpha_builds() - builds_before, 4);
+    println!("first render with four masks on (four alphas, four table rows): {masks_on:.2} ms");
+    let (masks_p50, masks_p95, masks_max) = stepped(&gpu, &mut develop, &masked);
+    println!(
+        "develop with every operator and four full masks on at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {masks_p50:.2} ms, p95 {masks_p95:.2} ms, max {masks_max:.2} ms"
+    );
+    assert_eq!(
+        develop.mask_alpha_builds() - builds_before,
+        4,
+        "a global slider drew a mask alpha again"
+    );
+
+    // Informational: the same with a slider of one mask stepping.
+    let (slider_p50, slider_p95, slider_max) =
+        stepped_with(&gpu, &mut develop, &masked, |edit, value| {
+            edit.masks[1].adjust.exposure = value;
+        });
+    println!(
+        "the same with a mask slider stepping: p50 {slider_p50:.2} ms, p95 {slider_p95:.2} ms, max {slider_max:.2} ms"
+    );
+    assert_eq!(
+        develop.mask_alpha_builds() - builds_before,
+        4,
+        "a slider of a mask drew its alpha again"
+    );
+
     let info = gpu.adapter.get_info();
     if info.device_type == wgpu::DeviceType::Cpu {
         println!("full-resolution render skipped on a CPU adapter");
@@ -149,6 +266,10 @@ fn develop_at_viewer_size_is_fast_enough() {
         assert!(
             all_p95 < GATE_MS,
             "p95 with every operator on, {all_p95:.2} ms, is not under {GATE_MS} ms"
+        );
+        assert!(
+            masks_p95 < GATE_MS,
+            "p95 with four full masks on, {masks_p95:.2} ms, is not under {GATE_MS} ms"
         );
     } else {
         println!("{GATE} is not set, so the {GATE_MS} ms gate is printed and not asserted");
