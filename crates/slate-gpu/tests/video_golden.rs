@@ -141,13 +141,12 @@ fn cpu_reference(
         .collect();
     let base = basic::base_layer(&linear, SIZE, SIZE);
     let edit = PhotoEdit::default();
-    let wb = basic::white_balance_matrix(0.0, 0.0);
     linear
         .iter()
         .zip(&base)
         .map(|(px, b)| {
-            let developed = basic::develop_pixel_with(*px, half(*b, rounding), &edit, &wb)
-                .map(|c| half(c, rounding));
+            let developed =
+                basic::develop_pixel(*px, half(*b, rounding), &edit).map(|c| half(c, rounding));
             basic::output_srgb8(developed)
         })
         .collect()

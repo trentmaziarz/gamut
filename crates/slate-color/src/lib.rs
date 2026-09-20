@@ -9,14 +9,24 @@
 //! In M1: [`matrices`], [`transfer`], [`bradford`], [`daylight`], the six
 //! Basic operators in [`basic`], and the ICC classifier in [`icc`]. M2 adds
 //! [`video`], the twin of the YCbCr pass with the provisional HLG decode.
+//! M3 adds [`acescct`] and the operators that run in it ([`curve`], [`hsl`]
+//! on the hue model of [`hue`], [`wheels`]), and the local operators
+//! [`local`] (texture and clarity) and [`dehaze`].
 
+pub mod acescct;
 pub mod basic;
 pub mod bradford;
+pub mod curve;
 pub mod daylight;
+pub mod dehaze;
+pub mod hsl;
+pub mod hue;
 pub mod icc;
+pub mod local;
 pub mod matrices;
 pub mod transfer;
 pub mod video;
+pub mod wheels;
 
 pub use icc::SourceSpace;
 pub use matrices::Mat3;

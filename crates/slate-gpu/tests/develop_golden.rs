@@ -7,7 +7,8 @@ use std::sync::Mutex;
 
 use half::f16;
 use slate_color::SourceSpace;
-use slate_color::basic;
+use slate_color::basic::{self, Neighbourhood, Prepared};
+use slate_color::{dehaze, local};
 use slate_core::{CropRect, PhotoEdit};
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::Photo;
@@ -105,13 +106,39 @@ fn cpu_reference(photo: &Photo, edit: &PhotoEdit, rounding: Rounding) -> Vec<[u8
             basic::decode_rgb8([px[0], px[1], px[2]], photo.source).map(|c| half(c, rounding))
         })
         .collect();
-    let base = basic::base_layer(&linear, photo.width, photo.height);
-    let wb = basic::white_balance_matrix(edit.white_balance_temperature, edit.white_balance_tint);
-    linear
+    let (width, height) = (photo.width, photo.height);
+    let base = basic::base_layer(&linear, width, height);
+    let texture = local::texture_layer(&linear, width, height);
+    // The atmospheric light is read from the decoded photo on the CPU, before
+    // any half float store, exactly as Develop::set_source reads it.
+    let decoded: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
         .iter()
-        .zip(&base)
-        .map(|(px, b)| {
-            let developed = basic::develop_pixel_with(*px, half(*b, rounding), edit, &wb)
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let atmosphere = dehaze::atmosphere(&decoded, width, height);
+    let raw: Vec<f32> = dehaze::raw_transmission(
+        &linear,
+        width,
+        height,
+        atmosphere,
+        dehaze::patch_radius(width, height),
+    )
+    .into_iter()
+    .map(|t| half(t, rounding))
+    .collect();
+    let transmission = basic::gaussian(&raw, width, height, dehaze::smoothing_sigma(width, height));
+    let prepared = Prepared::new(edit, atmosphere);
+    (0..linear.len())
+        .map(|i| {
+            let around = Neighbourhood {
+                base_luma: half(base[i], rounding),
+                texture_luma: half(texture[i], rounding),
+                transmission: half(transmission[i], rounding),
+            };
+            let developed = basic::develop_pixel_with(linear[i], &around, edit, &prepared)
                 .map(|c| half(c, rounding));
             basic::output_srgb8(developed)
         })

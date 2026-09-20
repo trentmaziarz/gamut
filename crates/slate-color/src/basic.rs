@@ -1,16 +1,22 @@
 //! The Basic panel on the CPU: one function per operator on a linear
-//! Rec.2020 pixel. Every function here is the reference the shader in
-//! slate-gpu's develop.wgsl is tested against, so the two mirror each other
-//! line for line. Nothing in this module clips; clipping happens in the
-//! output transform.
+//! Rec.2020 pixel, and the whole develop chain of one pixel. Every function
+//! here is the reference the shader in slate-gpu's develop.wgsl is tested
+//! against, so the two mirror each other line for line. Nothing in this
+//! module clips; clipping happens in the output transform.
 
 use slate_core::PhotoEdit;
 
 use crate::SourceSpace;
+use crate::acescct;
 use crate::bradford;
+use crate::curve::{self, Tables};
 use crate::daylight::{NEUTRAL_CCT, daylight_xy};
+use crate::dehaze;
+use crate::hsl::{self, HslParams};
+use crate::local;
 use crate::matrices::{self, Mat3, xyz_from_xy};
 use crate::transfer::{linear_to_srgb8, srgb8_to_linear};
+use crate::wheels::{self, Cdl};
 
 /// The Rec.2020 luminance weights.
 pub const LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
@@ -150,23 +156,121 @@ pub fn vibrance_saturation(px: [f32; 3], vibrance: f32, saturation: f32) -> [f32
     ]
 }
 
-/// The whole Basic panel in the ruled order: white balance, exposure,
-/// highlights and shadows, whites and blacks, contrast, vibrance and
-/// saturation. `base_luma` is the blurred luminance of the input pixel
-/// before any operator; the exposure is applied to it here.
-pub fn develop_pixel(px: [f32; 3], base_luma: f32, edit: &PhotoEdit) -> [f32; 3] {
-    let wb = white_balance_matrix(edit.white_balance_temperature, edit.white_balance_tint);
-    develop_pixel_with(px, base_luma, edit, &wb)
+/// What the develop chain reads from around one pixel, all of it measured
+/// on the input image before any operator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Neighbourhood {
+    /// The base layer under the pixel: luminance at [`base_sigma`].
+    pub base_luma: f32,
+    /// The texture layer under the pixel: luminance at
+    /// [`local::texture_sigma`].
+    pub texture_luma: f32,
+    /// The transmission map under the pixel; 1 is no haze.
+    pub transmission: f32,
 }
 
-/// [`develop_pixel`] with the white balance matrix computed once.
-pub fn develop_pixel_with(px: [f32; 3], base_luma: f32, edit: &PhotoEdit, wb: &Mat3) -> [f32; 3] {
-    let px = wb.apply(px);
+/// Everything about an edit that is computed once and not per pixel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prepared {
+    pub white_balance: Mat3,
+    /// The atmospheric light carried through the white balance and the
+    /// exposure, the two linear operators ahead of dehaze.
+    pub atmosphere: [f32; 3],
+    /// The baked tone curves, absent while every curve is the identity.
+    pub tables: Option<Tables>,
+    /// The mixer, absent while every range is at rest.
+    pub hsl: Option<HslParams>,
+    /// The wheels, absent while every wheel is at rest.
+    pub cdl: Option<Cdl>,
+}
+
+impl Prepared {
+    /// `atmosphere` is the atmospheric light of the source in linear
+    /// Rec.2020, from [`dehaze::atmosphere`].
+    pub fn new(edit: &PhotoEdit, atmosphere: [f32; 3]) -> Self {
+        let white_balance =
+            white_balance_matrix(edit.white_balance_temperature, edit.white_balance_tint);
+        let look = &edit.look;
+        Prepared {
+            white_balance,
+            atmosphere: exposure(white_balance.apply(atmosphere), edit.exposure),
+            tables: (!look.curves.is_identity()).then(|| curve::bake(&look.curves)),
+            hsl: (!look.hsl_is_identity()).then(|| HslParams::new(&look.hsl)),
+            cdl: (!look.wheels.is_identity()).then(|| Cdl::new(&look.wheels)),
+        }
+    }
+
+    /// True when the pixel has to pass through ACEScct at all.
+    pub fn runs_the_look(&self) -> bool {
+        self.tables.is_some() || self.hsl.is_some() || self.cdl.is_some()
+    }
+}
+
+/// The whole develop chain of one pixel with no detail and no haze around
+/// it. `base_luma` is the blurred luminance of the input pixel before any
+/// operator.
+pub fn develop_pixel(px: [f32; 3], base_luma: f32, edit: &PhotoEdit) -> [f32; 3] {
+    let around = Neighbourhood {
+        base_luma,
+        texture_luma: luma(px),
+        transmission: 1.0,
+    };
+    develop_pixel_with(
+        px,
+        &around,
+        edit,
+        &Prepared::new(edit, dehaze::WHITE_ATMOSPHERE),
+    )
+}
+
+/// The develop chain in the ruled order: white balance, exposure, highlights
+/// and shadows, whites and blacks, contrast, texture and clarity, dehaze;
+/// then in ACEScct the tone curves, the HSL mixer and the colour wheels;
+/// then back in linear light vibrance and saturation. Look presets are
+/// portable only because this order never changes. Every operator is
+/// skipped at its neutral value, as in the shader.
+pub fn develop_pixel_with(
+    px: [f32; 3],
+    around: &Neighbourhood,
+    edit: &PhotoEdit,
+    prepared: &Prepared,
+) -> [f32; 3] {
+    let input_luma = luma(px);
+    let px = prepared.white_balance.apply(px);
     let px = exposure(px, edit.exposure);
-    let base = base_luma * 2f32.powf(edit.exposure);
+    let base = around.base_luma * 2f32.powf(edit.exposure);
     let px = highlights_shadows(px, base, edit.highlights, edit.shadows);
     let px = whites_blacks(px, edit.whites, edit.blacks);
-    let px = contrast(px, edit.contrast);
+    let mut px = contrast(px, edit.contrast);
+    if edit.texture != 0.0 || edit.clarity != 0.0 {
+        px = scale(
+            px,
+            local::gain(
+                input_luma,
+                around.base_luma,
+                around.texture_luma,
+                base,
+                edit.texture,
+                edit.clarity,
+            ),
+        );
+    }
+    if edit.dehaze != 0.0 {
+        px = dehaze::recover(px, around.transmission, prepared.atmosphere, edit.dehaze);
+    }
+    if prepared.runs_the_look() {
+        let mut v = acescct::encode_pixel(px);
+        if let Some(tables) = &prepared.tables {
+            v = curve::apply(v, tables);
+        }
+        if let Some(params) = &prepared.hsl {
+            v = hsl::apply(v, params);
+        }
+        if let Some(cdl) = &prepared.cdl {
+            v = wheels::apply(v, cdl);
+        }
+        px = acescct::decode_pixel(v);
+    }
     vibrance_saturation(px, edit.vibrance, edit.saturation)
 }
 
@@ -196,13 +300,19 @@ pub fn blur_radius(sigma: f32) -> i32 {
 /// gaussian of [`base_sigma`], clamped at the edges. The shader does the
 /// same arithmetic in the same order.
 pub fn base_layer(pixels: &[[f32; 3]], width: u32, height: u32) -> Vec<f32> {
-    let sigma = base_sigma(width, height);
+    let luma_image: Vec<f32> = pixels.iter().map(|px| luma(*px)).collect();
+    gaussian(&luma_image, width, height, base_sigma(width, height))
+}
+
+/// A one-channel image under a separable gaussian, clamped at the edges.
+/// Every blurred layer of the develop graph goes through this: the base
+/// layer, the texture layer and the smoothing of the transmission map.
+pub fn gaussian(source: &[f32], width: u32, height: u32, sigma: f32) -> Vec<f32> {
     let radius = blur_radius(sigma);
     let weights: Vec<f32> = (-radius..=radius)
         .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
         .collect();
     let (w, h) = (width as i32, height as i32);
-    let luma_image: Vec<f32> = pixels.iter().map(|px| luma(*px)).collect();
     let pass = |source: &[f32], dx: i32, dy: i32| -> Vec<f32> {
         let mut out = vec![0.0; source.len()];
         for y in 0..h {
@@ -221,7 +331,7 @@ pub fn base_layer(pixels: &[[f32; 3]], width: u32, height: u32) -> Vec<f32> {
         }
         out
     };
-    let horizontal = pass(&luma_image, 1, 0);
+    let horizontal = pass(source, 1, 0);
     pass(&horizontal, 0, 1)
 }
 
