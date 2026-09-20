@@ -12,7 +12,7 @@
 //! The settings (size, feather, flow, erase) are tool state: never saved,
 //! never part of the history.
 
-use egui::{PointerButton, Pos2, Sense};
+use egui::{Color32, CursorIcon, Key, PointerButton, Pos2, Sense, Stroke as Line, Vec2};
 use gamut_core::brush::{Brush, MAX_BRUSH_SIZE, MIN_BRUSH_SIZE, MIN_FLOW, SharedStroke, Stroke};
 use gamut_core::mask::MaskSource;
 
@@ -147,7 +147,8 @@ pub struct BrushKeys {
     pub armed: bool,
     /// A text field has the keyboard.
     pub typing: bool,
-    /// Ctrl, Cmd or Alt is held: the key belongs to something else.
+    /// Ctrl or Cmd is held: the key belongs to something else. Alt does not
+    /// count, because a hand that erases holds it.
     pub other_modifier: bool,
     pub shift: bool,
     /// `[` and `]`, and what Shift makes of them on a keyboard that reports
@@ -193,6 +194,38 @@ pub fn brush_key(keys: BrushKeys) -> Option<BrushKey> {
 pub fn cursor_rings(size: f32, feather: f32, long_side: f32) -> (f32, f32) {
     let radius = size * long_side;
     (radius, radius * (1.0 - feather / 100.0))
+}
+
+/// Under this many points a ring is too small to see and a cross marks the
+/// place instead.
+const SMALLEST_RING: f32 = 2.5;
+
+/// The brush cursor at the pointer: a ring of the brush radius at this zoom
+/// and an inner ring where the feather starts, each drawn twice, dark under
+/// light, so it shows on any picture. A dash in the middle says the stroke
+/// will erase.
+fn draw_cursor(painter: &egui::Painter, at: Pos2, rings: (f32, f32), erase: bool) {
+    let dark = Color32::from_black_alpha(170);
+    let light = Color32::from_white_alpha(235);
+    let (radius, inner) = rings;
+    if radius >= SMALLEST_RING {
+        painter.circle_stroke(at, radius, Line::new(3.0, dark));
+        painter.circle_stroke(at, radius, Line::new(1.0, light));
+        if inner >= SMALLEST_RING && radius - inner >= 2.0 {
+            painter.circle_stroke(at, inner, Line::new(2.0, Color32::from_black_alpha(110)));
+            painter.circle_stroke(at, inner, Line::new(1.0, Color32::from_white_alpha(150)));
+        }
+    } else {
+        for arm in [Vec2::new(6.0, 0.0), Vec2::new(0.0, 6.0)] {
+            painter.line_segment([at - arm, at + arm], Line::new(3.0, dark));
+            painter.line_segment([at - arm, at + arm], Line::new(1.0, light));
+        }
+    }
+    if erase {
+        let arm = Vec2::new(4.0, 0.0);
+        painter.line_segment([at - arm, at + arm], Line::new(3.0, dark));
+        painter.line_segment([at - arm, at + arm], Line::new(1.0, light));
+    }
 }
 
 impl Session {
@@ -369,6 +402,28 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
     if session.adjust.brush.armed.is_none() {
         return;
     }
+    // The keys first, so the ring of this frame has the size they ask for.
+    // A slider keeps the focus after a click, so focus alone is not typing.
+    let typing = ui.ctx().text_edit_focused();
+    let keys = ui.input(|i| BrushKeys {
+        armed: true,
+        typing,
+        other_modifier: i.modifiers.command || i.modifiers.ctrl,
+        shift: i.modifiers.shift,
+        open: i.key_pressed(Key::OpenBracket),
+        close: i.key_pressed(Key::CloseBracket),
+        open_curly: i.key_pressed(Key::OpenCurlyBracket),
+        close_curly: i.key_pressed(Key::CloseCurlyBracket),
+        o: i.key_pressed(Key::O),
+        escape: i.key_pressed(Key::Escape),
+    });
+    if let Some(key) = brush_key(keys) {
+        session.brush_key(key);
+        ui.ctx().request_repaint();
+        if session.adjust.brush.armed.is_none() {
+            return;
+        }
+    }
     let response = ui.interact(map.visible, ui.id().with("brush paint"), Sense::drag());
     let paints = pan.take(&response, Over::Brush) == Gesture::Paint;
     let (alt, shift, origin, moves) = ui.input(|i| {
@@ -407,6 +462,21 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
         if !response.dragged_by(PointerButton::Primary) {
             session.end_stroke();
         }
+    }
+    // The ring in place of the system pointer, over the picture only. With
+    // Space held or a pan under way the viewer shows the hand instead.
+    let pointer = ui
+        .input(|i| i.pointer.hover_pos())
+        .filter(|_| response.hovered() || response.dragged());
+    if let Some(at) = pointer
+        && !pan.space
+        && !pan.panning
+    {
+        ui.ctx().set_cursor_icon(CursorIcon::None);
+        let tool = &session.adjust.brush;
+        let rings = cursor_rings(tool.size, tool.feather, map.long_side());
+        let painter = ui.painter().with_clip_rect(map.visible);
+        draw_cursor(&painter, at, rings, tool.erase || alt);
     }
 }
 
@@ -584,6 +654,54 @@ mod tests {
         assert_eq!((tool.size, tool.feather), (MIN_BRUSH_SIZE, 0.0));
         tool.set_flow(0.0);
         assert_eq!(tool.flow, MIN_FLOW);
+    }
+
+    #[test]
+    fn the_ring_is_the_brush_radius_on_the_screen_at_fit_at_100_and_at_400_percent() {
+        use crate::view::{View, Zoom};
+        use egui::Rect;
+        let tab = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(1200.0, 900.0));
+        let source = (6000, 4000);
+        let size = 0.05;
+        // Fitted, the longer side of the photo is the width of the tab; at a
+        // scale it is that many screen pixels for every pixel of the photo.
+        for (zoom, long_side) in [
+            (Zoom::Fit, 1200.0),
+            (Zoom::Scale(1.0), 6000.0),
+            (Zoom::Scale(4.0), 24000.0),
+        ] {
+            let view = View {
+                zoom,
+                centre: [0.4, 0.6],
+            };
+            let map = PictureMap::new(&view.place(tab, source, 1.0), tab);
+            assert!(
+                (map.long_side() - long_side).abs() < 0.5,
+                "{zoom:?}: {}",
+                map.long_side()
+            );
+            let (radius, inner) = cursor_rings(size, 40.0, map.long_side());
+            assert!(
+                (radius - size * long_side).abs() < 0.05,
+                "{zoom:?}: {radius}"
+            );
+            assert!((inner - radius * 0.6).abs() < 0.05);
+            // What the ring shows is what gets painted: a point on the ring
+            // is one brush radius from the centre on the photo.
+            let centre = map.to_screen([0.4, 0.6]);
+            let on_ring = map.to_picture(centre + Vec2::new(radius, 0.0));
+            assert!(
+                (on_ring[0] - 0.4 - size).abs() < 1e-4,
+                "{zoom:?}: {on_ring:?}"
+            );
+        }
+        // On a screen of two pixels a point the ring is half as many points.
+        let view = View {
+            zoom: Zoom::Scale(1.0),
+            centre: [0.5, 0.5],
+        };
+        let map = PictureMap::new(&view.place(tab, source, 2.0), tab);
+        assert!((cursor_rings(size, 0.0, map.long_side()).0 - 150.0).abs() < 0.05);
     }
 
     #[test]
