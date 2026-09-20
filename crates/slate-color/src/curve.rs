@@ -114,6 +114,33 @@ pub fn bake(curves: &ToneCurves) -> Tables {
     }
 }
 
+/// The three tables of a mask: per channel the global channel curve, the
+/// global master, then the mask's channel curve, then the mask's master, all
+/// in one table, so a masked pixel still costs one lookup per channel. A mask
+/// curve that is the identity is skipped, so with no mask curve the tables
+/// are exactly the global ones.
+pub fn bake_composed(global: &ToneCurves, mask: &ToneCurves) -> Tables {
+    let after = |mut table: Box<Table>, channel: &Curve| {
+        for curve in [channel, &mask.master] {
+            if curve.is_identity() {
+                continue;
+            }
+            let curve = curve.sanitised();
+            let m = tangents(&curve.points);
+            for entry in table.iter_mut() {
+                *entry = evaluate_sanitised(&curve.points, &m, *entry);
+            }
+        }
+        table
+    };
+    let global = bake(global);
+    Tables {
+        red: after(global.red, &mask.red),
+        green: after(global.green, &mask.green),
+        blue: after(global.blue, &mask.blue),
+    }
+}
+
 /// The table at `x`: linear interpolation between the two neighbours inside
 /// 0 to 1, slope 1 from the end entry outside. The shader reads its table
 /// texture with the same arithmetic.

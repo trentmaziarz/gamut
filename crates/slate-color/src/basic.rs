@@ -4,7 +4,7 @@
 //! against, so the two mirror each other line for line. Nothing in this
 //! module clips; clipping happens in the output transform.
 
-use slate_core::PhotoEdit;
+use slate_core::{Adjustments, PhotoEdit};
 
 use crate::SourceSpace;
 use crate::acescct;
@@ -197,6 +197,20 @@ impl Prepared {
             tables: (!look.curves.is_identity()).then(|| curve::bake(&look.curves)),
             hsl: (!look.hsl_is_identity()).then(|| HslParams::new(&look.hsl)),
             cdl: (!look.wheels.is_identity()).then(|| Cdl::new(&look.wheels)),
+        }
+    }
+
+    /// What a mask develops with: [`Prepared::new`] of the mask's effective
+    /// adjustments, with the tone curves of the global edit and of the mask
+    /// composed into one set of tables. With default mask adjustments this
+    /// is the global [`Prepared`].
+    pub fn composed(global: &Adjustments, mask: &Adjustments, atmosphere: [f32; 3]) -> Self {
+        let effective = PhotoEdit::from(crate::mask::effective_adjustments(global, mask));
+        let (ours, theirs) = (&global.look.curves, &mask.look.curves);
+        Prepared {
+            tables: (!ours.is_identity() || !theirs.is_identity())
+                .then(|| curve::bake_composed(ours, theirs)),
+            ..Prepared::new(&effective, atmosphere)
         }
     }
 

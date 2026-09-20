@@ -23,6 +23,7 @@ pub mod hsl;
 pub mod hue;
 pub mod icc;
 pub mod local;
+pub mod mask;
 pub mod matrices;
 pub mod transfer;
 pub mod video;

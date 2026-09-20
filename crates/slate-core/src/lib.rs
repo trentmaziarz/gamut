@@ -29,6 +29,12 @@ pub use project::{MediaRef, Project};
 pub use sidecar::{NamedVersion, Sidecar, VersionError};
 pub use timeline::{Clip, Track};
 
+/// The exposure slider runs from minus to plus this many stops.
+pub const EXPOSURE_LIMIT: f32 = 5.0;
+
+/// Every other slider runs from minus to plus this.
+pub const SLIDER_LIMIT: f32 = 100.0;
+
 /// Everything an edit adjusts: the Basic panel of M1, the presence sliders
 /// and the look of M3. The global edit holds one and every mask holds one of
 /// its own, which is why it is a type apart from [`PhotoEdit`].
