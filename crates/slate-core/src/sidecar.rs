@@ -133,14 +133,16 @@ impl Sidecar {
     }
 
     /// Copies a version into the working state. When the working state came
-    /// from a version, it is saved back to that version first, so nothing
-    /// done since is lost.
+    /// from another version, it is saved back to that version first, so
+    /// nothing done since is lost. A switch to the version already in use
+    /// saves nothing back: it brings the version back as it was saved.
     pub fn switch_to(&mut self, name: &str) -> Result<(), VersionError> {
         let target = self
             .find_version(name)
             .ok_or_else(|| self.not_found(name))?;
         if let Some(active) = self.active_version.clone()
             && let Some(index) = self.find_version(&active)
+            && index != target
         {
             self.versions[index].edit = self.edit.clone();
             self.versions[index].crop = self.crop;
@@ -290,6 +292,39 @@ mod tests {
         assert_eq!(sidecar.active_version, None);
         assert_eq!(sidecar.versions.len(), 1);
         assert_eq!(sidecar.edit.contrast, 30.0, "the working state stays");
+    }
+
+    /// Trent at the window, 2026-09-20: save a version, change the look,
+    /// switch back to the version. The version must come back as it was
+    /// saved, and a second version saved after a reset must not replace it.
+    #[test]
+    fn switching_to_the_version_in_use_brings_it_back_as_saved() {
+        let mut sidecar = Sidecar::default();
+        sidecar.edit.exposure = 1.0;
+        sidecar.save_version("Sunset Version").expect("save");
+        sidecar.edit = PhotoEdit::default();
+        sidecar.switch_to("Sunset Version").expect("switch");
+        assert_eq!(sidecar.edit.exposure, 1.0, "the look comes back");
+        assert_eq!(
+            sidecar.versions[0].edit.exposure, 1.0,
+            "the version is kept"
+        );
+
+        sidecar.edit = PhotoEdit::default();
+        sidecar.save_version("Normal Version").expect("save");
+        sidecar.switch_to("Sunset Version").expect("switch");
+        assert_eq!(sidecar.edit.exposure, 1.0);
+        sidecar.switch_to("Normal Version").expect("switch");
+        assert_eq!(sidecar.edit.exposure, 0.0);
+        let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
+        assert_eq!(
+            back.version("Sunset Version").expect("found").edit.exposure,
+            1.0
+        );
+        assert_eq!(
+            back.version("Normal Version").expect("found").edit.exposure,
+            0.0
+        );
     }
 
     #[test]
