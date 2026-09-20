@@ -305,6 +305,8 @@ impl Session {
         if self.version_is_dirty() {
             self.sidecar().version(name)?;
             self.adjust.pending_switch = Some(name.to_string());
+            // What the last action said is not about this one.
+            self.status = None;
             return Ok(());
         }
         self.with_versions(|sidecar| sidecar.switch_to(name))?;

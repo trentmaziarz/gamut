@@ -114,10 +114,12 @@ fn a_switch_over_unsaved_work_waits_for_an_answer() {
     let mut session = sunset_and_normal();
     session.edit.contrast = 30.0;
     assert!(session.version_is_dirty());
+    session.status = Some("Switched to Normal.".to_string());
     session
         .request_switch("Sunset")
         .expect("the prompt goes up");
     assert_eq!(session.adjust.pending_switch.as_deref(), Some("Sunset"));
+    assert_eq!(session.status, None, "no stale line under the prompt");
     assert_eq!(session.edit.contrast, 30.0, "nothing moved yet");
     assert_eq!(session.active_version.as_deref(), Some("Normal"));
 

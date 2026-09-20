@@ -112,7 +112,12 @@ fn number(
 ) -> bool {
     ui.horizontal(|ui| {
         let changed = ui
-            .add(egui::DragValue::new(value).range(range).speed(speed))
+            .add(
+                egui::DragValue::new(value)
+                    .range(range)
+                    .speed(speed)
+                    .fixed_decimals(1),
+            )
             .changed();
         ui.label(label);
         changed
@@ -125,7 +130,12 @@ fn point(ui: &mut egui::Ui, label: &str, value: &mut [f32; 2]) -> bool {
         let mut changed = false;
         for axis in value.iter_mut() {
             changed |= ui
-                .add(egui::DragValue::new(axis).range(-1.0..=2.0).speed(0.002))
+                .add(
+                    egui::DragValue::new(axis)
+                        .range(-1.0..=2.0)
+                        .speed(0.002)
+                        .fixed_decimals(3),
+                )
                 .changed();
         }
         ui.label(label);
@@ -150,7 +160,8 @@ fn source_fields(ui: &mut egui::Ui, source: &mut MaskSource) -> bool {
                         .add(
                             egui::DragValue::new(radius)
                                 .range(MIN_RADIUS..=MAX_RADIUS)
-                                .speed(0.002),
+                                .speed(0.002)
+                                .fixed_decimals(3),
                         )
                         .changed();
                 }
@@ -163,13 +174,25 @@ fn source_fields(ui: &mut egui::Ui, source: &mut MaskSource) -> bool {
         }
         MaskSource::Luminance(range) => {
             changed |= ui
-                .add(egui::Slider::new(&mut range.low, 0.0..=1.0).text("Low"))
+                .add(
+                    egui::Slider::new(&mut range.low, 0.0..=1.0)
+                        .text("Low")
+                        .fixed_decimals(2),
+                )
                 .changed();
             changed |= ui
-                .add(egui::Slider::new(&mut range.high, 0.0..=1.0).text("High"))
+                .add(
+                    egui::Slider::new(&mut range.high, 0.0..=1.0)
+                        .text("High")
+                        .fixed_decimals(2),
+                )
                 .changed();
             changed |= ui
-                .add(egui::Slider::new(&mut range.falloff, 0.0..=0.5).text("Falloff"))
+                .add(
+                    egui::Slider::new(&mut range.falloff, 0.0..=0.5)
+                        .text("Falloff")
+                        .fixed_decimals(2),
+                )
                 .changed();
             if range.low > range.high {
                 (range.low, range.high) = (range.high, range.low);
@@ -177,7 +200,11 @@ fn source_fields(ui: &mut egui::Ui, source: &mut MaskSource) -> bool {
         }
         MaskSource::Colour(range) => {
             changed |= ui
-                .add(egui::Slider::new(&mut range.hue, 0.0..=360.0).text("Hue"))
+                .add(
+                    egui::Slider::new(&mut range.hue, 0.0..=360.0)
+                        .text("Hue")
+                        .fixed_decimals(0),
+                )
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut range.hue_width, 0.0..=360.0).text("Width"))
@@ -204,7 +231,7 @@ fn mask_list(ui: &mut egui::Ui, masks: &mut Vec<Mask>, adjust: &mut AdjustState)
     let mut moved = None;
     let count = masks.len();
     for index in 0..count {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             outcome.edited |= ui
                 .checkbox(&mut masks[index].enabled, "")
                 .on_hover_text("Apply this mask")
@@ -334,7 +361,7 @@ fn selected_mask(
                 "Pick from the picture"
             };
             let button = ui
-                .add_enabled(can_pick, egui::Button::selectable(armed, label))
+                .add_enabled(can_pick, egui::Button::new(label).selected(armed))
                 .on_disabled_hover_text("A range is picked from an open photo");
             if button.clicked() {
                 adjust.picking = (!armed).then_some(index);
