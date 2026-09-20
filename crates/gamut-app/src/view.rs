@@ -246,6 +246,15 @@ pub enum Over {
     Crop,
     /// The picture, or the tab around it.
     Picture,
+    /// Anywhere on the picture while a brush is armed: the brush owns the
+    /// plain drag, over the crop and where a handle would be too.
+    Brush,
+}
+
+/// What a drag starts over: whatever is under the pointer, unless a brush is
+/// armed, which takes the place of all of it.
+pub fn over(brush_armed: bool, under: Over) -> Over {
+    if brush_armed { Over::Brush } else { under }
 }
 
 /// What a drag on the picture does.
@@ -254,13 +263,16 @@ pub enum Gesture {
     Pan,
     HandleDrag,
     CropDrag,
+    /// A stroke of the armed brush.
+    Paint,
     Nothing,
 }
 
 /// What a pointer and key state means. The middle button pans wherever it
 /// starts, and so does the primary button while Space is held. A plain drag
 /// does what it did before the viewer could zoom: it moves the handle or the
-/// crop it starts on, and nothing on the bare picture.
+/// crop it starts on, and nothing on the bare picture. With a brush armed it
+/// paints.
 pub fn gesture(over: Over, primary: bool, middle: bool, space: bool) -> Gesture {
     if middle || (primary && space) {
         Gesture::Pan
@@ -269,6 +281,7 @@ pub fn gesture(over: Over, primary: bool, middle: bool, space: bool) -> Gesture 
             Over::Handle => Gesture::HandleDrag,
             Over::Crop => Gesture::CropDrag,
             Over::Picture => Gesture::Nothing,
+            Over::Brush => Gesture::Paint,
         }
     } else {
         Gesture::Nothing
@@ -854,8 +867,27 @@ mod tests {
     }
 
     #[test]
+    fn an_armed_brush_paints_on_the_picture_on_the_crop_and_over_a_handle() {
+        for under in [Over::Picture, Over::Crop, Over::Handle] {
+            let armed = over(true, under);
+            assert_eq!(gesture(armed, true, false, false), Gesture::Paint);
+            // The pans go by, and nothing happens with no button down.
+            assert_eq!(gesture(armed, true, false, true), Gesture::Pan);
+            assert_eq!(gesture(armed, false, true, false), Gesture::Pan);
+            assert_eq!(gesture(armed, false, false, false), Gesture::Nothing);
+            assert_eq!(gesture(armed, false, false, true), Gesture::Nothing);
+            // With no brush armed the drag is what it was.
+            assert_eq!(over(false, under), under);
+        }
+        assert_eq!(
+            gesture(over(false, Over::Crop), true, false, false),
+            Gesture::CropDrag
+        );
+    }
+
+    #[test]
     fn space_with_a_drag_and_a_middle_drag_pan_wherever_they_start() {
-        for over in [Over::Handle, Over::Crop, Over::Picture] {
+        for over in [Over::Handle, Over::Crop, Over::Picture, Over::Brush] {
             assert_eq!(gesture(over, true, false, true), Gesture::Pan);
             assert_eq!(gesture(over, false, true, false), Gesture::Pan);
             assert_eq!(gesture(over, false, true, true), Gesture::Pan);

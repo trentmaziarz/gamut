@@ -1,19 +1,32 @@
 //! The Masks section of the Adjust tab: the list of masks, the buttons that
 //! make one of each source, and under the selected mask its opacity, invert
 //! and overlay, its components with their operators, and the numbers of each
-//! source.
+//! source. A brush component has a Paint button that arms it, the settings
+//! of the brush, how many strokes it holds and Clear strokes.
 //!
 //! Selecting a mask is what points the Basic, Presence, Curve, Mixer and
 //! Grading sections at it (see `adjust.rs`), and what shows its handles on
 //! the picture (see `mask_handles.rs`). The list operations keep the
 //! selection on the same mask while the list changes around it.
 
+use gamut_core::brush::{Brush, MAX_BRUSH_SIZE, MIN_BRUSH_SIZE, MIN_FLOW};
 use gamut_core::mask::{
     ColourRange, Component, LinearGradient, LuminanceRange, MAX_COMPONENTS, MAX_MASKS, MAX_RADIUS,
     MIN_RADIUS, Mask, MaskOp, MaskSource, RadialGradient, free_name,
 };
 
 use crate::adjust::AdjustState;
+use crate::brush_tool::BrushTool;
+
+/// What a button of a brush component asked for. The session carries it out
+/// once the section is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushRequest {
+    /// The Paint button of this component: arm it, or put it down.
+    Paint(usize),
+    /// Clear strokes.
+    Clear(usize),
+}
 
 /// What the section did this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,11 +36,12 @@ pub struct Outcome {
     /// Only what is shown changed (the selection, the overlay): the picture
     /// is stale and the file is not.
     pub view_changed: bool,
+    pub brush: Option<BrushRequest>,
 }
 
-/// The four sources a new mask or a new component starts from, with the
+/// The five sources a new mask or a new component starts from, with the
 /// word a button and a mask name use for each.
-pub fn new_sources() -> [(&'static str, MaskSource); 4] {
+pub fn new_sources() -> [(&'static str, MaskSource); 5] {
     [
         ("Linear", MaskSource::Linear(LinearGradient::default())),
         ("Radial", MaskSource::Radial(RadialGradient::default())),
@@ -36,6 +50,7 @@ pub fn new_sources() -> [(&'static str, MaskSource); 4] {
             MaskSource::Luminance(LuminanceRange::default()),
         ),
         ("Colour", MaskSource::Colour(ColourRange::default())),
+        ("Brush", MaskSource::Brush(Brush::default())),
     ]
 }
 
@@ -220,11 +235,67 @@ fn source_fields(ui: &mut egui::Ui, source: &mut MaskSource) -> bool {
                 )
                 .changed();
         }
-        MaskSource::Brush(brush) => {
-            ui.label(format!("{} strokes", brush.strokes.len()));
-        }
+        // A brush has no numbers of its own: see `brush_fields`.
+        MaskSource::Brush(_) => {}
     }
     changed
+}
+
+/// The size of the brush as the slider shows it: percent of the longer side.
+const SIZE_PERCENT: std::ops::RangeInclusive<f32> = MIN_BRUSH_SIZE * 100.0..=MAX_BRUSH_SIZE * 100.0;
+
+/// What a brush component shows: the Paint button, the settings of the
+/// brush, how many strokes it holds and Clear strokes.
+fn brush_fields(
+    ui: &mut egui::Ui,
+    brush: &Brush,
+    index: usize,
+    tool: &mut BrushTool,
+) -> Option<BrushRequest> {
+    let mut request = None;
+    let armed = tool.armed == Some(index);
+    ui.horizontal(|ui| {
+        let label = if armed { "Painting..." } else { "Paint" };
+        let button = ui
+            .add(egui::Button::new(label).selected(armed))
+            .on_hover_text("Paint this mask on the picture. Esc or Done puts the brush down.");
+        if button.clicked() {
+            request = Some(BrushRequest::Paint(index));
+        }
+        ui.checkbox(&mut tool.erase, "Erase")
+            .on_hover_text("Strokes take away what was painted. Alt held does the same.");
+    });
+    let mut percent = tool.size * 100.0;
+    let size = egui::Slider::new(&mut percent, SIZE_PERCENT)
+        .logarithmic(true)
+        .fixed_decimals(2)
+        .suffix(" %")
+        .text("Size");
+    if ui
+        .add(size)
+        .on_hover_text("The radius, as a share of the longer side. [ and ]")
+        .changed()
+    {
+        tool.size = (percent / 100.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+    }
+    ui.add(egui::Slider::new(&mut tool.feather, 0.0..=100.0).text("Feather"))
+        .on_hover_text("How much of the radius the edge fades over. Shift+[ and Shift+]");
+    ui.add(egui::Slider::new(&mut tool.flow, MIN_FLOW..=100.0).text("Flow"))
+        .on_hover_text("How much one dab paints; passes over the same place build up");
+    ui.horizontal(|ui| {
+        let count = brush.strokes.len();
+        ui.label(match count {
+            1 => "1 stroke".to_string(),
+            count => format!("{count} strokes"),
+        });
+        if ui
+            .add_enabled(count > 0, egui::Button::new("Clear strokes").small())
+            .clicked()
+        {
+            request = Some(BrushRequest::Clear(index));
+        }
+    });
+    request
 }
 
 /// The list of masks. Returns whether the edit changed.
@@ -356,6 +427,11 @@ fn selected_mask(
             outcome.edited |= ui.checkbox(&mut component.invert, "Invert").changed();
         });
         outcome.edited |= source_fields(ui, &mut component.source);
+        if let MaskSource::Brush(brush) = &component.source
+            && let Some(request) = brush_fields(ui, brush, index, &mut adjust.brush)
+        {
+            outcome.brush = Some(request);
+        }
         if component.source.reads_the_pixel() {
             let armed = adjust.picking == Some(index);
             let label = if armed {
@@ -377,6 +453,8 @@ fn selected_mask(
             first.op = MaskOp::Add;
         }
         adjust.picking = None;
+        // The armed component may be the one that went, or have moved up.
+        outcome.view_changed |= adjust.put_brush_down();
         outcome.edited = true;
     }
 
@@ -409,6 +487,7 @@ pub fn show(
         let room = masks.len() < MAX_MASKS;
         for (word, source) in new_sources() {
             let label = match word {
+                "Brush" => "New brush".to_string(),
                 "Luminance" => "New luminance range".to_string(),
                 "Colour" => "New colour range".to_string(),
                 word => format!("New {}", word.to_lowercase()),
@@ -473,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn there_is_a_new_button_for_each_of_the_four_sources() {
+    fn there_is_a_new_button_for_each_of_the_five_sources() {
         let labels: Vec<&str> = new_sources()
             .iter()
             .map(|(_, source)| source.label())
@@ -484,7 +563,8 @@ mod tests {
                 "Linear gradient",
                 "Radial gradient",
                 "Luminance range",
-                "Colour range"
+                "Colour range",
+                "Brush"
             ]
         );
     }

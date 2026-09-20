@@ -419,6 +419,11 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
     if selected >= session.edit.masks.len() {
         return;
     }
+    // An armed brush owns the picture: the handles of the mask's other
+    // components are hidden, and the viewer paints (`viewer::paint_brush`).
+    if session.adjust.brush.armed.is_some() {
+        return;
+    }
     let base = ui.id().with(("mask handles", selected));
     let mut changed = false;
 

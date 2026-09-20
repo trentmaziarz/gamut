@@ -18,6 +18,7 @@ use gamut_core::{
 };
 
 use crate::app::{Session, SwitchAnswer};
+use crate::brush_tool::BrushTool;
 use crate::curve_editor::{self, CurveEditorState};
 use crate::mask_panel;
 use crate::presets;
@@ -89,6 +90,9 @@ pub struct AdjustState {
     pub picking: Option<usize>,
     /// The mask being renamed and its new name so far.
     pub mask_renaming: Option<(usize, String)>,
+    /// The brush: which component is armed, and its size, feather, flow and
+    /// erase. Tool state, never saved and never part of the history.
+    pub brush: BrushTool,
 }
 
 impl AdjustState {
@@ -96,11 +100,18 @@ impl AdjustState {
     /// armed pick, a rename, the curve point in hand) is let go.
     pub fn select_mask(&mut self, mask: Option<usize>) {
         if self.selected_mask != mask {
+            self.put_brush_down();
             self.selected_mask = mask;
             self.picking = None;
             self.mask_renaming = None;
             self.curve_editor = CurveEditorState::default();
         }
+    }
+
+    /// Puts an armed brush down and gives the overlay back as it was before
+    /// the brush was armed. Whether what is shown changed.
+    pub fn put_brush_down(&mut self) -> bool {
+        self.brush.put_down(&mut self.mask_overlay)
     }
 
     /// The mask the viewer shows as an overlay.
@@ -317,10 +328,12 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
     });
 
     let mut view_changed = false;
+    let mut brush_request = None;
     CollapsingHeader::new("Masks").show(ui, |ui| {
         let outcome = mask_panel::show(ui, &mut whole.masks, adjust, can_pick);
         changed |= outcome.edited;
         view_changed = outcome.view_changed;
+        brush_request = outcome.brush;
     });
 
     // The selection may have moved in the Masks section.
@@ -352,6 +365,11 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
     }
     if view_changed {
         session.develop_dirty = true;
+    }
+    match brush_request {
+        Some(mask_panel::BrushRequest::Paint(component)) => session.toggle_brush(component),
+        Some(mask_panel::BrushRequest::Clear(component)) => session.clear_strokes(component),
+        None => {}
     }
     if let Some(action) = version_action {
         let result = match &action {

@@ -13,6 +13,7 @@ use gamut_gpu::{Develop, TestImage, ViewWindow};
 use gamut_media::Photo;
 
 use crate::app::Session;
+use crate::brush_tool;
 use crate::mask_handles::{self, PictureMap};
 use crate::view::{self, Gesture, Over, PanInput, RenderPlan, ViewKeys, Zoom};
 
@@ -192,6 +193,8 @@ impl Viewer {
             // The handles of the selected mask go over the crop and take the
             // pointer first.
             mask_handles::show(ui, &map, session, &mut pan);
+            // An armed brush goes over everything and takes the plain drag.
+            brush_tool::show(ui, &map, session, &mut pan);
         }
         // A pan that began on the crop or on a handle is known only now.
         if let Some(source) = session.source_size() {
@@ -419,10 +422,12 @@ fn view_input(
 fn draw_crop(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mut PanInput) {
     let id = ui.id().with("crop drag");
     // Only the part of the crop inside the tab takes the pointer; a drag
-    // under way keeps going when the pointer leaves it.
+    // under way keeps going when the pointer leaves it. An armed brush
+    // paints inside the crop too, so the crop stays where it is.
     let grab = map
         .touchable(map.rect_to_screen(session.crop.rect))
-        .or_else(|| ui.ctx().is_being_dragged(id).then_some(map.visible));
+        .or_else(|| ui.ctx().is_being_dragged(id).then_some(map.visible))
+        .filter(|_| view::over(session.adjust.brush.armed.is_some(), Over::Crop) == Over::Crop);
     if let Some(grab) = grab {
         let response = ui.interact(grab, id, Sense::drag());
         // A plain drag moves the crop, as it always did; the pans go by.

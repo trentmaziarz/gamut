@@ -16,6 +16,7 @@
 
 pub mod adjust;
 pub mod app;
+pub mod brush_tool;
 pub mod curve_editor;
 pub mod export;
 pub mod headless;

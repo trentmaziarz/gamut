@@ -510,6 +510,10 @@ impl Session {
         self.adjust.renaming = None;
         self.adjust.pending_switch = None;
         self.adjust.curve_editor = Default::default();
+        // The stroke in hand is gone with the state it was painted into, and
+        // so is the brush when its component is.
+        self.end_stroke();
+        self.check_brush();
         self.mark_edited();
     }
 
