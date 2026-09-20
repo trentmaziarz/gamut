@@ -9,11 +9,12 @@ use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_wgpu::RenderState;
 use egui_wgpu::wgpu;
 use gamut_core::{CropAspect, CropRect, ExportPreset, PhotoEdit};
-use gamut_gpu::{Develop, TestImage};
+use gamut_gpu::{Develop, TestImage, ViewWindow};
 use gamut_media::Photo;
 
 use crate::app::Session;
 use crate::mask_handles::{self, PictureMap};
+use crate::view::RenderPlan;
 
 /// The viewer keeps the 4:5 feed-post shape when no photo is open.
 pub const VIEWER_ASPECT: [f32; 2] = [4.0, 5.0];
@@ -29,8 +30,27 @@ pub const SAFE_ZONE: (f32, f32, f32) = (0.14, 0.35, 0.06);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shown {
     Placeholder((u32, u32)),
-    /// The developed photo at a pixel size, from a given output texture.
-    Photo((u32, u32), u64),
+    /// The developed photo at a pixel size, from a given output texture,
+    /// and whether the texture is registered with the nearest filter.
+    Photo((u32, u32), u64, bool),
+}
+
+/// What the develop graph is asked to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// The whole picture at the fitted size: a Fit view.
+    Whole((u32, u32)),
+    /// A padded window of a zoomed view and what is seen of it.
+    Window(ViewWindow),
+}
+
+impl Target {
+    fn output_size(&self) -> (u32, u32) {
+        match self {
+            Target::Whole(size) => *size,
+            Target::Window(view) => (view.visible.2, view.visible.3),
+        }
+    }
 }
 
 /// The offscreen picture and the egui texture that shows it.
@@ -42,6 +62,9 @@ pub struct Viewer {
     shown: Shown,
     /// The player frame the develop graph holds.
     frame_serial: u64,
+    /// What the develop graph rendered last: a pan changes it without
+    /// touching the session.
+    rendered: Option<Target>,
 }
 
 impl Viewer {
@@ -62,6 +85,7 @@ impl Viewer {
             texture_id,
             shown: Shown::Placeholder((width, height)),
             frame_serial: 0,
+            rendered: None,
         }
     }
 
@@ -110,6 +134,10 @@ impl Viewer {
                 None => VIEWER_ASPECT,
             },
         );
+        // A zoomed view renders a window of the source; a Fit view renders
+        // the whole picture at the fitted size, exactly as before.
+        let plan =
+            placed.and_then(|placed| RenderPlan::of(&placed, area, session.source_size()?, scale));
         let wanted = (
             (points.x * scale).round().max(1.0) as u32,
             (points.y * scale).round().max(1.0) as u32,
@@ -120,12 +148,21 @@ impl Viewer {
             self.develop.set_overlay(overlay);
             session.develop_dirty = true;
         }
+        let target = match plan {
+            Some(plan) => Target::Window(ViewWindow {
+                full: plan.full,
+                window: plan.window(self.window_rendered()),
+                visible: plan.visible,
+            }),
+            None => Target::Whole(wanted),
+        };
+        let nearest = plan.is_some_and(|plan| plan.nearest);
         let mut has_picture = false;
         if session.photo.is_some() {
-            self.show_photo(wanted, session);
+            self.show_photo(target, nearest, session);
             has_picture = true;
         } else if session.project.is_some() {
-            has_picture = self.show_video(wanted, session);
+            has_picture = self.show_video(target, nearest, session);
             if !has_picture {
                 self.show_placeholder(wanted);
             }
@@ -133,12 +170,15 @@ impl Viewer {
             self.show_placeholder(wanted);
         }
 
-        let image = placed.map_or_else(
-            || Rect::from_center_size(area.center(), points),
-            |placed| placed.image,
-        );
-        egui::Image::from_texture(SizedTexture::new(self.texture_id, image.size()))
-            .paint_at(ui, image);
+        // Zoomed, the texture holds only what is seen and goes where that
+        // is; otherwise it holds the whole picture, or the test image.
+        let paint = match (placed, plan) {
+            (Some(_), Some(plan)) if has_picture => plan.paint,
+            (Some(placed), None) if has_picture => placed.image,
+            _ => Rect::from_center_size(area.center(), points),
+        };
+        egui::Image::from_texture(SizedTexture::new(self.texture_id, paint.size()))
+            .paint_at(ui, paint);
         if let Some(placed) = placed.filter(|_| has_picture) {
             // The one place that knows where the photo is on the screen.
             let map = PictureMap::new(&placed, area);
@@ -151,7 +191,7 @@ impl Viewer {
 
     /// Uploads the player's current frame when it changed and draws it.
     /// `false` when no frame has arrived yet.
-    fn show_video(&mut self, wanted: (u32, u32), session: &mut Session) -> bool {
+    fn show_video(&mut self, target: Target, nearest: bool, session: &mut Session) -> bool {
         let Some(project) = session.project.as_mut() else {
             return false;
         };
@@ -170,29 +210,49 @@ impl Viewer {
         if !self.develop.has_video() {
             return false;
         }
-        self.show_photo(wanted, session);
+        self.show_photo(target, nearest, session);
         true
     }
 
-    fn show_photo(&mut self, wanted: (u32, u32), session: &mut Session) {
-        let current = Shown::Photo(wanted, self.develop.output_generation());
-        if self.shown == current && !session.develop_dirty {
+    /// The window the develop graph holds, for a zoomed view to keep.
+    fn window_rendered(&self) -> Option<((u32, u32), crate::view::PixelRect)> {
+        match self.rendered {
+            Some(Target::Window(view)) => Some((view.full, view.window)),
+            _ => None,
+        }
+    }
+
+    fn show_photo(&mut self, target: Target, nearest: bool, session: &mut Session) {
+        let size = target.output_size();
+        let current = Shown::Photo(size, self.develop.output_generation(), nearest);
+        if self.shown == current && self.rendered == Some(target) && !session.develop_dirty {
             return;
         }
-        let view = self
-            .develop
-            .render(&session.edit, CropRect::FULL, wanted, wanted)
-            .expect("a photo is set")
-            .clone();
-        let now = Shown::Photo(wanted, self.develop.output_generation());
+        let view = match &target {
+            Target::Whole(wanted) => {
+                self.develop
+                    .render(&session.edit, CropRect::FULL, *wanted, *wanted)
+            }
+            Target::Window(window) => self.develop.render_view(&session.edit, window),
+        }
+        .expect("a photo is set")
+        .clone();
+        self.rendered = Some(target);
+        let now = Shown::Photo(size, self.develop.output_generation(), nearest);
         if self.shown != now {
+            // Magnified far enough, single pixels are judged: no filtering.
+            let filter = if nearest {
+                wgpu::FilterMode::Nearest
+            } else {
+                wgpu::FilterMode::Linear
+            };
             self.render_state
                 .renderer
                 .write()
                 .update_egui_texture_from_wgpu_texture(
                     &self.render_state.device,
                     &view,
-                    wgpu::FilterMode::Linear,
+                    filter,
                     self.texture_id,
                 );
             self.shown = now;

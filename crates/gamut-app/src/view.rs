@@ -6,8 +6,16 @@
 //! least scale is the one that fits the whole picture into the tab and the
 //! view at that scale is [`Zoom::Fit`], which keeps fitting when the tab is
 //! resized. Everything here is arithmetic on rectangles: the viewer asks
-//! where the picture goes ([`View::place`]) and the pointer code asks for a
-//! view that keeps a point still ([`View::zoomed_about`]).
+//! where the picture goes ([`View::place`]) and what to render for it
+//! ([`RenderPlan`]), and the pointer code asks for a view that keeps a point
+//! still ([`View::zoomed_about`]).
+//!
+//! A zoomed view never renders the whole picture. It renders a window of
+//! the source: what is seen, padded by half a tab on every side and snapped
+//! to a grid, so that a pan inside the window moves the output crop only.
+//! The render never passes one source pixel per output pixel, because above
+//! that the blur radius meets its cap and the look would change with the
+//! zoom; past 100 percent the 100 percent render is magnified.
 
 use egui::{Pos2, Rect, Vec2};
 
@@ -22,6 +30,13 @@ pub const ZOOM_STEP: f32 = 1.25;
 
 /// A scale this close to the fit scale is the fit scale.
 const FIT_SNAP: f32 = 1e-3;
+
+/// The grid the padded window is snapped to, in source pixels.
+pub const WINDOW_GRID: u32 = 64;
+
+/// From this magnification single pixels are shown as squares; under it
+/// the magnified render is filtered.
+pub const NEAREST_FROM: f32 = 4.0;
 
 /// How far the picture is zoomed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,8 +126,25 @@ impl View {
     }
 
     /// Where the picture goes in `tab`. A Fit view is placed exactly as the
-    /// viewer placed the picture before it could zoom.
+    /// viewer placed the picture before it could zoom. A zoomed picture
+    /// starts on a whole pixel of the screen, so that at 100 percent every
+    /// source pixel is one screen pixel and nothing is filtered.
     pub fn place(&self, tab: Rect, source: (u32, u32), pixels_per_point: f32) -> Placement {
+        let mut placed = self.place_exact(tab, source, pixels_per_point);
+        if placed.view.zoom != Zoom::Fit {
+            let ppp = pixels_per_point.max(1e-6);
+            let min = Pos2::new(
+                (placed.image.min.x * ppp).round() / ppp,
+                (placed.image.min.y * ppp).round() / ppp,
+            );
+            placed.image = Rect::from_min_size(min, placed.image.size());
+        }
+        placed
+    }
+
+    /// [`place`](Self::place) before the snap to the pixels of the screen:
+    /// what the zoom and the pan are worked out on.
+    pub fn place_exact(&self, tab: Rect, source: (u32, u32), pixels_per_point: f32) -> Placement {
         let view = self.clamped(tab.size(), source, pixels_per_point);
         match view.zoom {
             Zoom::Fit => {
@@ -146,7 +178,7 @@ impl View {
         anchor: Pos2,
         scale: f32,
     ) -> View {
-        let placed = self.place(tab, source, pixels_per_point);
+        let placed = self.place_exact(tab, source, pixels_per_point);
         let fit = fit_scale(tab.size(), source, pixels_per_point);
         let scale = scale.clamp(fit, max_scale(fit));
         let under = [
@@ -174,7 +206,7 @@ impl View {
         anchor: Pos2,
         steps: f32,
     ) -> View {
-        let placed = self.place(tab, source, pixels_per_point);
+        let placed = self.place_exact(tab, source, pixels_per_point);
         let scale = placed.scale * ZOOM_STEP.powf(steps);
         self.zoomed_about(tab, source, pixels_per_point, anchor, scale)
     }
@@ -188,7 +220,7 @@ impl View {
         pixels_per_point: f32,
         delta: Vec2,
     ) -> View {
-        let placed = self.place(tab, source, pixels_per_point);
+        let placed = self.place_exact(tab, source, pixels_per_point);
         if placed.view.zoom == Zoom::Fit {
             return placed.view;
         }
@@ -201,6 +233,117 @@ impl View {
         }
         .clamped(tab.size(), source, pixels_per_point)
     }
+}
+
+/// A rectangle of pixels: x, y, width, height.
+pub type PixelRect = (u32, u32, u32, u32);
+
+/// What a zoomed view renders, in pixels of the whole picture at the render
+/// scale, and where the result is painted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderPlan {
+    /// The size of the whole picture at the render scale: the view's scale,
+    /// or the size of the source from 100 percent up.
+    pub full: (u32, u32),
+    /// The part of `full` that is seen, on whole pixels. Its size depends on
+    /// the tab and the zoom only, so a pan never resizes the output.
+    pub visible: PixelRect,
+    /// Half a tab, the padding of the window on every side.
+    pub pad: (u32, u32),
+    /// [`WINDOW_GRID`] at the render scale.
+    pub grid: u32,
+    /// Where the rendered `visible` goes on the screen, in points.
+    pub paint: Rect,
+    /// Whether the magnified render shows its pixels as squares.
+    pub nearest: bool,
+}
+
+impl RenderPlan {
+    /// The plan of a placed view, or `None` for a Fit view, which renders
+    /// the whole picture at the fitted size as it always did.
+    pub fn of(
+        placed: &Placement,
+        tab: Rect,
+        source: (u32, u32),
+        pixels_per_point: f32,
+    ) -> Option<RenderPlan> {
+        if placed.view.zoom == Zoom::Fit {
+            return None;
+        }
+        let render_scale = placed.scale.min(1.0);
+        let full = (
+            ((source.0.max(1) as f32 * render_scale).round() as u32).clamp(1, source.0.max(1)),
+            ((source.1.max(1) as f32 * render_scale).round() as u32).clamp(1, source.1.max(1)),
+        );
+        let image = placed.image;
+        let seen = tab.intersect(image);
+        // Pixels of `full` per point of the screen, on each axis.
+        let per_point = Vec2::new(
+            full.0 as f32 / image.width().max(1e-6),
+            full.1 as f32 / image.height().max(1e-6),
+        );
+        let axis = |from: f32, extent: f32, per_point: f32, full: u32| {
+            let size = ((extent * per_point).ceil() as u32 + 1).clamp(1, full);
+            let start = ((from * per_point).floor().max(0.0) as u32).min(full - size);
+            (start, size)
+        };
+        let (x, width) = axis(seen.min.x - image.min.x, seen.width(), per_point.x, full.0);
+        let (y, height) = axis(seen.min.y - image.min.y, seen.height(), per_point.y, full.1);
+        let tab_pixels = tab.size() * pixels_per_point * (render_scale / placed.scale.max(1e-6));
+        Some(RenderPlan {
+            full,
+            visible: (x, y, width, height),
+            pad: (
+                (tab_pixels.x / 2.0).ceil() as u32,
+                (tab_pixels.y / 2.0).ceil() as u32,
+            ),
+            grid: ((WINDOW_GRID as f32 * render_scale).round() as u32).max(1),
+            paint: Rect::from_min_size(
+                image.min + Vec2::new(x as f32 / per_point.x, y as f32 / per_point.y),
+                Vec2::new(width as f32 / per_point.x, height as f32 / per_point.y),
+            ),
+            nearest: placed.scale >= NEAREST_FROM,
+        })
+    }
+
+    /// The window to render for this plan: the one already rendered while
+    /// it is of the same picture size and still holds what is seen, a new
+    /// padded one otherwise. From 100 percent up the picture size no longer
+    /// changes, so zooming further in keeps the window too.
+    pub fn window(&self, rendered: Option<((u32, u32), PixelRect)>) -> PixelRect {
+        match rendered {
+            Some((full, window)) if full == self.full && holds(window, self.visible) => window,
+            _ => padded_window(self.full, self.visible, self.pad, self.grid),
+        }
+    }
+}
+
+/// `visible` with `pad` on every side, its edges moved outward onto `grid`,
+/// kept inside `full`.
+pub fn padded_window(
+    full: (u32, u32),
+    visible: PixelRect,
+    pad: (u32, u32),
+    grid: u32,
+) -> PixelRect {
+    let grid = grid.max(1);
+    let axis = |start: u32, size: u32, pad: u32, full: u32| {
+        let low = start.saturating_sub(pad) / grid * grid;
+        let high = (start + size + pad).div_ceil(grid) * grid;
+        let high = high.min(full).max(low + 1);
+        (low, high - low)
+    };
+    let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
+    let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
+    (x, y, width, height)
+}
+
+/// Whether `inner` lies inside `window`.
+pub fn holds(window: PixelRect, inner: PixelRect) -> bool {
+    inner.0 >= window.0
+        && inner.1 >= window.1
+        && inner.0 + inner.2 <= window.0 + window.2
+        && inner.1 + inner.3 <= window.1 + window.3
 }
 
 /// The size of the whole picture in points at a scale.
@@ -220,7 +363,7 @@ mod tests {
 
     /// The point of the picture under a screen position.
     fn under(view: &View, at: Pos2, pixels_per_point: f32) -> [f32; 2] {
-        let image = view.place(tab(), SOURCE, pixels_per_point).image;
+        let image = view.place_exact(tab(), SOURCE, pixels_per_point).image;
         [
             (at.x - image.min.x) / image.width(),
             (at.y - image.min.y) / image.height(),
@@ -375,17 +518,181 @@ mod tests {
             zoom: Zoom::Scale(1.0),
             centre: [0.5, 0.5],
         };
-        let before = view.place(tab(), SOURCE, 1.0).image;
+        let before = view.place_exact(tab(), SOURCE, 1.0).image;
         let panned = view.panned(tab(), SOURCE, 1.0, Vec2::new(120.0, -80.0));
-        let after = panned.place(tab(), SOURCE, 1.0).image;
+        let after = panned.place_exact(tab(), SOURCE, 1.0).image;
         assert!((after.min - before.min - Vec2::new(120.0, -80.0)).length() < 1e-2);
         let far = view.panned(tab(), SOURCE, 1.0, Vec2::new(1e6, 1e6));
-        let image = far.place(tab(), SOURCE, 1.0).image;
+        let image = far.place_exact(tab(), SOURCE, 1.0).image;
         assert!((image.min - tab().min).length() < 1e-2);
         // A fitted picture has nowhere to go.
         assert_eq!(
             View::default().panned(tab(), SOURCE, 1.0, Vec2::new(50.0, 50.0)),
             View::default()
         );
+    }
+
+    fn at(scale: f32, centre: [f32; 2]) -> View {
+        View {
+            zoom: Zoom::Scale(scale),
+            centre,
+        }
+    }
+
+    fn plan(view: &View, pixels_per_point: f32) -> RenderPlan {
+        let placed = view.place(tab(), SOURCE, pixels_per_point);
+        RenderPlan::of(&placed, tab(), SOURCE, pixels_per_point).expect("a zoomed view")
+    }
+
+    #[test]
+    fn a_zoomed_picture_starts_on_a_whole_pixel_of_the_screen() {
+        for pixels_per_point in [1.0, 1.5, 2.0] {
+            let view = at(1.0, [0.31337, 0.64123]);
+            let exact = view.place_exact(tab(), SOURCE, pixels_per_point).image;
+            let placed = view.place(tab(), SOURCE, pixels_per_point).image;
+            let min = placed.min.to_vec2() * pixels_per_point;
+            assert!((min.x - min.x.round()).abs() < 1e-3 && (min.y - min.y.round()).abs() < 1e-3);
+            // Never more than half a pixel from where the arithmetic put it.
+            assert!(
+                ((placed.min - exact.min) * pixels_per_point)
+                    .abs()
+                    .max_elem()
+                    <= 0.5 + 1e-3
+            );
+            assert_eq!(placed.size(), exact.size());
+        }
+        // A fitted picture is where it always was.
+        let fit = View::default();
+        assert_eq!(
+            fit.place(tab(), SOURCE, 1.5).image,
+            fit.place_exact(tab(), SOURCE, 1.5).image
+        );
+    }
+
+    #[test]
+    fn a_fit_view_has_no_plan_and_renders_as_before() {
+        let placed = View::default().place(tab(), SOURCE, 1.0);
+        assert_eq!(RenderPlan::of(&placed, tab(), SOURCE, 1.0), None);
+    }
+
+    #[test]
+    fn the_render_never_passes_the_resolution_of_the_source() {
+        for scale in [0.2, 0.5, 1.0, 2.0, 4.0, 8.0] {
+            let plan = plan(&at(scale, [0.4, 0.6]), 1.0);
+            assert!(
+                plan.full.0 <= SOURCE.0 && plan.full.1 <= SOURCE.1,
+                "{scale}"
+            );
+            if scale >= 1.0 {
+                assert_eq!(plan.full, SOURCE, "from 100 percent up it is the source");
+            }
+            assert_eq!(plan.nearest, scale >= NEAREST_FROM);
+        }
+        assert_eq!(plan(&at(0.5, [0.5, 0.5]), 1.0).full, (3000, 2000));
+    }
+
+    #[test]
+    fn what_is_seen_covers_the_tab_on_whole_pixels() {
+        // At 100 percent the tab of 900 by 700 sees 900 by 700 source pixels,
+        // and one more so the last partial pixel is covered.
+        let view = at(1.0, [0.4, 0.6]);
+        let plan = plan(&view, 1.0);
+        assert_eq!((plan.visible.2, plan.visible.3), (901, 701));
+        assert!(holds((0, 0, SOURCE.0, SOURCE.1), plan.visible));
+        assert!(plan.paint.contains_rect(tab()));
+        // The painted pixels are one screen pixel each.
+        assert!((plan.paint.width() - 901.0).abs() < 1e-3);
+        // At 400 percent a quarter of that is seen and it is magnified.
+        let deep = self::plan(&at(4.0, [0.4, 0.6]), 1.0);
+        assert_eq!((deep.visible.2, deep.visible.3), (226, 176));
+        assert!((deep.paint.width() - 226.0 * 4.0).abs() < 1e-2);
+        assert!(deep.paint.contains_rect(tab()));
+    }
+
+    #[test]
+    fn a_pan_never_resizes_what_is_seen() {
+        let size = |view: &View| {
+            let plan = plan(view, 1.0);
+            (plan.visible.2, plan.visible.3)
+        };
+        let first = size(&at(1.0, [0.4, 0.6]));
+        for centre in [[0.40001, 0.6], [0.4173, 0.5519], [0.0, 0.0], [1.0, 1.0]] {
+            assert_eq!(size(&at(1.0, centre)), first, "{centre:?}");
+        }
+    }
+
+    #[test]
+    fn the_padded_window_holds_what_is_seen_with_half_a_tab_around_it() {
+        let plan = plan(&at(1.0, [0.5, 0.5]), 1.0);
+        assert_eq!(plan.pad, (450, 350));
+        assert_eq!(plan.grid, WINDOW_GRID);
+        let window = plan.window(None);
+        assert!(holds(window, plan.visible));
+        let (x, y, w, h) = plan.visible;
+        assert!(window.0 + 450 <= x && window.1 + 350 <= y);
+        assert!(window.0 + window.2 >= x + w + 450 && window.1 + window.3 >= y + h + 350);
+        // Under 100 percent the pad and the grid shrink with the render.
+        let half = self::plan(&at(0.5, [0.5, 0.5]), 1.0);
+        assert_eq!((half.pad, half.grid), ((450, 350), 32));
+    }
+
+    #[test]
+    fn the_padded_window_is_snapped_to_the_grid() {
+        let window = padded_window((6000, 4000), (2551, 1651, 901, 701), (450, 350), 64);
+        assert_eq!(window, (2048, 1280, 1856, 1472));
+        for edge in [window.0, window.1, window.0 + window.2, window.1 + window.3] {
+            assert_eq!(edge % 64, 0);
+        }
+    }
+
+    #[test]
+    fn the_padded_window_never_leaves_the_photo() {
+        let corner = padded_window((6000, 4000), (5099, 3299, 901, 701), (450, 350), 64);
+        assert_eq!(corner, (4608, 2944, 1392, 1056));
+        assert!(holds((0, 0, 6000, 4000), corner));
+        let origin = padded_window((6000, 4000), (0, 0, 901, 701), (450, 350), 64);
+        assert_eq!((origin.0, origin.1), (0, 0));
+        // A picture smaller than the pad is its own window.
+        assert_eq!(
+            padded_window((300, 200), (0, 0, 300, 200), (450, 350), 64),
+            (0, 0, 300, 200)
+        );
+    }
+
+    #[test]
+    fn a_pan_inside_the_window_reuses_it_and_leaving_it_replaces_it() {
+        let view = at(1.0, [0.5, 0.5]);
+        let first = plan(&view, 1.0);
+        let window = first.window(None);
+        let rendered = Some((first.full, window));
+        // 300 points is inside the pad of 450.
+        let near = view.panned(tab(), SOURCE, 1.0, Vec2::new(-300.0, 200.0));
+        let near = plan(&near, 1.0);
+        assert_ne!(near.visible, first.visible);
+        assert_eq!(near.window(rendered), window);
+        // 700 points is past it: a new window around the new place.
+        let far = view.panned(tab(), SOURCE, 1.0, Vec2::new(-700.0, 0.0));
+        let far = plan(&far, 1.0);
+        let replaced = far.window(rendered);
+        assert_ne!(replaced, window);
+        assert!(holds(replaced, far.visible));
+    }
+
+    #[test]
+    fn a_change_of_zoom_replaces_the_window_until_the_source_is_reached() {
+        let first = plan(&at(0.5, [0.5, 0.5]), 1.0);
+        let rendered = Some((first.full, first.window(None)));
+        let closer = plan(&at(0.625, [0.5, 0.5]), 1.0);
+        assert_ne!(closer.full, first.full);
+        assert_eq!(closer.window(rendered), closer.window(None));
+        // From 100 percent up the render is the source either way: zooming
+        // further in sees less of the same window and renders nothing new.
+        let actual = plan(&at(1.0, [0.5, 0.5]), 1.0);
+        let rendered = Some((actual.full, actual.window(None)));
+        let deep = plan(&at(4.0, [0.5, 0.5]), 1.0);
+        assert_eq!(deep.window(rendered), actual.window(None));
+        // Coming back out sees more than a window made at 400 percent holds.
+        let small = Some((deep.full, deep.window(None)));
+        assert_ne!(actual.window(small), deep.window(None));
     }
 }
