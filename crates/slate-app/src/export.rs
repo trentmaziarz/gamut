@@ -7,17 +7,17 @@ use slate_core::{Crop, CropRect, ExportPreset};
 use slate_gpu::Develop;
 use slate_media::export::write_jpeg;
 
-use crate::headless::{HeadlessError, Prepared};
+use crate::headless::{EditSource, HeadlessError, Prepared};
 
 /// Opens `photo`, applies its sidecar (or the one at `edit`), and writes
 /// the crop as a JPEG of the preset's size to `out`.
 pub fn write(
     photo: &Path,
-    edit: Option<&Path>,
+    source: EditSource,
     preset: ExportPreset,
     out: &Path,
 ) -> Result<(), HeadlessError> {
-    let prepared = Prepared::open(photo, edit)?;
+    let prepared = Prepared::open(photo, source)?;
     let crop = crop_for_preset(
         prepared.crop(),
         preset,

@@ -199,6 +199,10 @@ pub struct Session {
     pub project: Option<OpenProject>,
     pub edit: PhotoEdit,
     pub crop: Crop,
+    /// The named versions of the open photo and the one the working state
+    /// came from.
+    pub versions: Vec<slate_core::NamedVersion>,
+    pub active_version: Option<String>,
     /// What the Adjust tab remembers that is not part of the edit.
     pub adjust: crate::adjust::AdjustState,
     pub grid_guide: bool,
@@ -240,13 +244,38 @@ impl Session {
         path.file_name().map(|n| n.to_string_lossy().into_owned())
     }
 
+    /// The open photo's state as its sidecar holds it.
+    pub fn sidecar(&self) -> Sidecar {
+        Sidecar {
+            versions: self.versions.clone(),
+            active_version: self.active_version.clone(),
+            ..Sidecar::new(self.edit.clone(), self.crop)
+        }
+    }
+
+    /// Runs a version operation of [`Sidecar`] on the session's state and
+    /// takes the result back. On success the picture and the file are stale.
+    pub fn with_versions<E>(
+        &mut self,
+        operation: impl FnOnce(&mut Sidecar) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut sidecar = self.sidecar();
+        operation(&mut sidecar)?;
+        self.edit = sidecar.edit;
+        self.crop = sidecar.crop;
+        self.versions = sidecar.versions;
+        self.active_version = sidecar.active_version;
+        self.mark_edited();
+        Ok(())
+    }
+
     /// Writes the sidecar or the project file when a change is pending.
     fn save(&mut self) {
         if self.changed_at.take().is_none() {
             return;
         }
         let result = if let Some(photo) = &self.photo {
-            sidecar::save(&photo.path, &Sidecar::new(self.edit.clone(), self.crop)).map(|_| ())
+            sidecar::save(&photo.path, &self.sidecar()).map(|_| ())
         } else if let Some(project) = &self.project {
             project_file::save(&project.path, &project.snapshot(&self.edit, self.crop))
         } else {
@@ -317,19 +346,21 @@ impl SlateApp {
         let photo = open_photo(&path).map_err(|error| error.to_string())?;
         self.viewer.set_photo(&photo);
         let saved = sidecar::load(&path);
-        let (edit, crop) = match saved {
-            Some(sidecar) => {
-                let crop = crop_for(&sidecar, photo.width, photo.height);
-                (sidecar.edit, crop)
-            }
-            None => (
+        let sidecar = match saved {
+            Some(sidecar) => Sidecar {
+                crop: crop_for(&sidecar, photo.width, photo.height),
+                ..sidecar
+            },
+            None => Sidecar::new(
                 PhotoEdit::default(),
                 Crop::fitted(self.session.crop.aspect, photo.width, photo.height),
             ),
         };
         self.session.project = None;
-        self.session.edit = edit;
-        self.session.crop = crop;
+        self.session.edit = sidecar.edit;
+        self.session.crop = sidecar.crop;
+        self.session.versions = sidecar.versions;
+        self.session.active_version = sidecar.active_version;
         self.session.photo = Some(OpenPhoto {
             path,
             width: photo.width,
@@ -355,6 +386,8 @@ impl SlateApp {
             loaded.project.crop
         };
         self.session.photo = None;
+        self.session.versions.clear();
+        self.session.active_version = None;
         self.session.edit = loaded.project.edit.clone();
         self.session.crop = crop;
         self.session.project = Some(OpenProject {

@@ -10,6 +10,7 @@ use slate_gpu::Headless;
 use slate_media::export::ExportError;
 use slate_media::{Photo, PhotoError, VideoError, open_photo};
 
+use crate::presets;
 use crate::sidecar;
 
 /// Why a headless render could not be written.
@@ -54,6 +55,17 @@ impl Error for HeadlessError {
     }
 }
 
+/// Where a headless render takes its edit from, in the order applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EditSource<'a> {
+    /// A sidecar file; without one, the sidecar next to the photo.
+    pub edit: Option<&'a Path>,
+    /// A named version of that sidecar in place of its working state.
+    pub version: Option<&'a str>,
+    /// A look preset applied over the edit.
+    pub look: Option<&'a Path>,
+}
+
 /// A device, a photo and the edit to apply to it.
 pub struct Prepared {
     pub gpu: Headless,
@@ -62,16 +74,31 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    /// Opens the device and `photo`, then reads the sidecar at `edit`, or
-    /// the one next to the photo, or the neutral edit.
-    pub fn open(photo: &Path, edit: Option<&Path>) -> Result<Self, HeadlessError> {
-        let gpu = Headless::new().ok_or(HeadlessError::NoAdapter)?;
-        log::info!("adapter: {}", gpu.describe());
-        let picture = open_photo(photo).map_err(HeadlessError::Photo)?;
-        let sidecar = match edit {
+    /// Opens the device and `photo`, then reads the sidecar the source
+    /// names, or the one next to the photo, or the neutral edit; takes the
+    /// named version out of it when one is asked for; and applies the look
+    /// preset over the result.
+    pub fn open(photo: &Path, source: EditSource) -> Result<Self, HeadlessError> {
+        let mut sidecar = match source.edit {
             Some(path) => sidecar::load_from(path).map_err(HeadlessError::Edit)?,
             None => sidecar::load(photo).unwrap_or_default(),
         };
+        if let Some(name) = source.version {
+            let version = sidecar
+                .version(name)
+                .map_err(|error| HeadlessError::Edit(error.to_string()))?
+                .clone();
+            sidecar.edit = version.edit;
+            sidecar.crop = version.crop;
+        }
+        if let Some(path) = source.look {
+            presets::load(path)
+                .map_err(HeadlessError::Edit)?
+                .apply(&mut sidecar.edit);
+        }
+        let gpu = Headless::new().ok_or(HeadlessError::NoAdapter)?;
+        log::info!("adapter: {}", gpu.describe());
+        let picture = open_photo(photo).map_err(HeadlessError::Photo)?;
         Ok(Prepared {
             gpu,
             photo: picture,

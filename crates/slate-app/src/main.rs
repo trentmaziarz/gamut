@@ -1,14 +1,17 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use slate_app::headless::EditSource;
 use slate_app::{SlateApp, WINDOW_TITLE, export, native_options, reel, screenshot};
 use slate_core::ExportPreset;
 
 const USAGE: &str = "usage: slate-app [<photo, video or project.slate>]
-       slate-app [--open <photo>] --screenshot <out.png> [--edit <sidecar.json>]
+       slate-app [--open <photo>] --screenshot <out.png> [look]
        slate-app --open <video or project.slate> --screenshot <out.png> --at <seconds>
-       slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [--edit <sidecar.json>]
-       slate-app --export-reel <video or project.slate> <out.mp4>";
+       slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [look]
+       slate-app --export-reel <video or project.slate> <out.mp4>
+look:  [--edit <sidecar.json>] [--version-name <name>] [--preset <look.json>]
+       the named version of the sidecar, then the look preset over it";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -18,6 +21,8 @@ enum Command {
     Screenshot {
         photo: Option<PathBuf>,
         edit: Option<PathBuf>,
+        version: Option<String>,
+        look: Option<PathBuf>,
         out: PathBuf,
         at: Option<f64>,
     },
@@ -28,6 +33,8 @@ enum Command {
     Export {
         photo: PathBuf,
         edit: Option<PathBuf>,
+        version: Option<String>,
+        look: Option<PathBuf>,
         preset: ExportPreset,
         out: PathBuf,
     },
@@ -41,6 +48,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     let mut export = None;
     let mut at = None;
     let mut reel = None;
+    let mut look = None;
+    let mut version = None;
     while let Some(arg) = args.next() {
         let mut value = |slot: &mut Option<PathBuf>| match args.next() {
             Some(path) if slot.is_none() => {
@@ -53,6 +62,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             "--open" => value(&mut photo)?,
             "--screenshot" => value(&mut screenshot)?,
             "--edit" => value(&mut edit)?,
+            "--preset" => value(&mut look)?,
+            "--version-name" => match (args.next(), &version) {
+                (Some(name), None) if !name.trim().is_empty() => version = Some(name),
+                _ => return Err(USAGE),
+            },
             "--at" => {
                 let seconds = args.next().and_then(|s| s.parse::<f64>().ok());
                 match (seconds, &at) {
@@ -81,33 +95,45 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
         }
     }
     if let Some((input, out)) = reel {
-        return match (photo, screenshot, export, edit, at) {
-            (None, None, None, None, None) => Ok(Command::ExportReel { input, out }),
-            _ => Err(USAGE),
+        let plain = photo.is_none() && screenshot.is_none() && export.is_none();
+        let no_look = edit.is_none() && look.is_none() && version.is_none();
+        return if plain && no_look && at.is_none() {
+            Ok(Command::ExportReel { input, out })
+        } else {
+            Err(USAGE)
         };
     }
-    match (screenshot, export, edit) {
-        (Some(out), None, edit) => {
-            if at.is_some() && (photo.is_none() || edit.is_some()) {
+    // A look needs a photo to land on, and a video frame takes none.
+    let has_look = edit.is_some() || look.is_some() || version.is_some();
+    if (look.is_some() || version.is_some()) && photo.is_none() {
+        return Err(USAGE);
+    }
+    match (screenshot, export) {
+        (Some(out), None) => {
+            if at.is_some() && (photo.is_none() || has_look) {
                 return Err(USAGE);
             }
             Ok(Command::Screenshot {
                 photo,
                 edit,
+                version,
+                look,
                 out,
                 at,
             })
         }
-        (None, Some((preset, out)), edit) if at.is_none() => match photo {
+        (None, Some((preset, out))) if at.is_none() => match photo {
             Some(photo) => Ok(Command::Export {
                 photo,
                 edit,
+                version,
+                look,
                 preset,
                 out,
             }),
             None => Err(USAGE),
         },
-        (None, None, None) if at.is_none() => Ok(Command::Window { photo }),
+        (None, None) if at.is_none() && !has_look => Ok(Command::Window { photo }),
         _ => Err(USAGE),
     }
 }
@@ -131,10 +157,18 @@ fn main() -> ExitCode {
         Command::Screenshot {
             photo: Some(photo),
             edit,
+            version,
+            look,
             out,
             at: None,
-        } => screenshot::write_developed(&photo, edit.as_deref(), &out)
-            .map_err(|error| error.to_string()),
+        } => {
+            let source = EditSource {
+                edit: edit.as_deref(),
+                version: version.as_deref(),
+                look: look.as_deref(),
+            };
+            screenshot::write_developed(&photo, source, &out).map_err(|error| error.to_string())
+        }
         Command::Screenshot {
             photo: None, out, ..
         } => screenshot::write(&out).map_err(|error| error.to_string()),
@@ -144,10 +178,17 @@ fn main() -> ExitCode {
         Command::Export {
             photo,
             edit,
+            version,
+            look,
             preset,
             out,
         } => {
-            export::write(&photo, edit.as_deref(), preset, &out).map_err(|error| error.to_string())
+            let source = EditSource {
+                edit: edit.as_deref(),
+                version: version.as_deref(),
+                look: look.as_deref(),
+            };
+            export::write(&photo, source, preset, &out).map_err(|error| error.to_string())
         }
         Command::Window { photo } => eframe::run_native(
             WINDOW_TITLE,
@@ -204,6 +245,8 @@ mod tests {
             Ok(Command::Screenshot {
                 photo: Some(PathBuf::from("a.jpg")),
                 edit: Some(PathBuf::from("e.json")),
+                version: None,
+                look: None,
                 out: PathBuf::from("o.png"),
                 at: None,
             })
@@ -213,10 +256,100 @@ mod tests {
             Ok(Command::Screenshot {
                 photo: None,
                 edit: None,
+                version: None,
+                look: None,
                 out: PathBuf::from("o.png"),
                 at: None,
             })
         );
+    }
+
+    #[test]
+    fn a_preset_and_a_version_name_ride_with_a_screenshot_or_an_export() {
+        assert_eq!(
+            parsed(&[
+                "--open",
+                "a.jpg",
+                "--edit",
+                "e.json",
+                "--version-name",
+                "Warm one",
+                "--preset",
+                "look.json",
+                "--screenshot",
+                "o.png",
+            ]),
+            Ok(Command::Screenshot {
+                photo: Some(PathBuf::from("a.jpg")),
+                edit: Some(PathBuf::from("e.json")),
+                version: Some("Warm one".to_string()),
+                look: Some(PathBuf::from("look.json")),
+                out: PathBuf::from("o.png"),
+                at: None,
+            })
+        );
+        assert_eq!(
+            parsed(&[
+                "--open", "a.jpg", "--preset", "l.json", "--export", "4x5", "o.jpg"
+            ]),
+            Ok(Command::Export {
+                photo: PathBuf::from("a.jpg"),
+                edit: None,
+                version: None,
+                look: Some(PathBuf::from("l.json")),
+                preset: ExportPreset::Feed4x5,
+                out: PathBuf::from("o.jpg"),
+            })
+        );
+    }
+
+    #[test]
+    fn a_preset_or_a_version_name_is_refused_where_it_cannot_apply() {
+        // Not with a Reel export.
+        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--preset", "l.json"]).is_err());
+        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--version-name", "a"]).is_err());
+        // Not on a video frame, not without a photo, not for the window.
+        assert!(
+            parsed(&[
+                "--open",
+                "a.mp4",
+                "--screenshot",
+                "o.png",
+                "--at",
+                "1",
+                "--preset",
+                "l.json"
+            ])
+            .is_err()
+        );
+        assert!(parsed(&["--screenshot", "o.png", "--preset", "l.json"]).is_err());
+        assert!(parsed(&["a.jpg", "--preset", "l.json"]).is_err());
+        // Not twice, not empty, not without a value.
+        assert!(
+            parsed(&[
+                "--open",
+                "a.jpg",
+                "--screenshot",
+                "o.png",
+                "--preset",
+                "a",
+                "--preset",
+                "b"
+            ])
+            .is_err()
+        );
+        assert!(
+            parsed(&[
+                "--open",
+                "a.jpg",
+                "--screenshot",
+                "o.png",
+                "--version-name",
+                " "
+            ])
+            .is_err()
+        );
+        assert!(parsed(&["--open", "a.jpg", "--screenshot", "o.png", "--version-name"]).is_err());
     }
 
     #[test]
@@ -226,6 +359,8 @@ mod tests {
             Ok(Command::Screenshot {
                 photo: Some(PathBuf::from("a.mp4")),
                 edit: None,
+                version: None,
+                look: None,
                 out: PathBuf::from("o.png"),
                 at: Some(3.0),
             })
@@ -255,6 +390,8 @@ mod tests {
             Ok(Command::Export {
                 photo: PathBuf::from("a.heic"),
                 edit: None,
+                version: None,
+                look: None,
                 preset: ExportPreset::Story9x16,
                 out: PathBuf::from("o.jpg"),
             })

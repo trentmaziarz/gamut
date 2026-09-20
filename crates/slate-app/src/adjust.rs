@@ -3,12 +3,16 @@
 //! versions, then the crop controls. Every control is bound to the session
 //! and every change goes through `Session::mark_edited`.
 
+use std::path::PathBuf;
+
 use egui::{CollapsingHeader, Color32};
 use slate_core::look::HSL_NAMES;
-use slate_core::{Crop, CropAspect, PhotoEdit};
+use slate_core::preset::Groups;
+use slate_core::{Crop, CropAspect, LookPreset, NamedVersion, PhotoEdit};
 
 use crate::app::Session;
 use crate::curve_editor::{self, CurveEditorState};
+use crate::presets;
 use crate::wheel;
 
 /// The range of the exposure slider in stops.
@@ -52,6 +56,25 @@ pub struct AdjustState {
     pub curve_channel: CurveChannel,
     pub curve_editor: CurveEditorState,
     pub mixer_row: MixerRow,
+    /// The name and the groups of the preset about to be saved.
+    pub preset_name: String,
+    pub preset_groups: Groups,
+    /// The presets folder as last read; `None` until the section first
+    /// shows and after a save or a delete.
+    pub presets: Option<Vec<(PathBuf, LookPreset)>>,
+    /// The name of the version about to be saved.
+    pub version_name: String,
+    /// The version being renamed and its new name so far.
+    pub renaming: Option<(String, String)>,
+}
+
+/// What a button of the Versions section asked for. It runs after the
+/// sections are drawn, when the session is free to change.
+enum VersionAction {
+    Save(String),
+    SwitchTo(String),
+    Rename(String, String),
+    Delete(String),
 }
 
 pub fn ui(ui: &mut egui::Ui, session: &mut Session) {
@@ -66,7 +89,16 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
         session.edit = PhotoEdit::default();
         changed = true;
     }
-    let Session { edit, adjust, .. } = session;
+    let mut message = None;
+    let mut version_action = None;
+    let Session {
+        edit,
+        adjust,
+        versions,
+        active_version,
+        photo,
+        ..
+    } = session;
 
     CollapsingHeader::new("Basic")
         .default_open(true)
@@ -148,16 +180,41 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
         });
     });
 
-    CollapsingHeader::new("Presets").show(ui, |ui| {
-        ui.weak("No presets yet.");
+    CollapsingHeader::new("Presets").show(ui, |ui| match presets_section(ui, edit, adjust) {
+        Ok(applied) => changed |= applied,
+        Err(error) => message = Some(error),
     });
 
     CollapsingHeader::new("Versions").show(ui, |ui| {
-        ui.weak("No versions yet.");
+        if photo.is_none() {
+            ui.weak("Versions belong to a photo.");
+            return;
+        }
+        version_action = versions_section(ui, versions, active_version.as_deref(), adjust);
     });
 
     if changed {
         session.mark_edited();
+    }
+    if let Some(action) = version_action {
+        let result = session.with_versions(|sidecar| match &action {
+            VersionAction::Save(name) => sidecar.save_version(name),
+            VersionAction::SwitchTo(name) => sidecar.switch_to(name),
+            VersionAction::Rename(name, new_name) => sidecar.rename_version(name, new_name),
+            VersionAction::Delete(name) => sidecar.delete_version(name),
+        });
+        match result {
+            Ok(()) => {
+                if matches!(action, VersionAction::Save(_)) {
+                    session.adjust.version_name.clear();
+                }
+                session.adjust.renaming = None;
+            }
+            Err(error) => message = Some(error.to_string()),
+        }
+    }
+    if message.is_some() {
+        session.status = message;
     }
 
     ui.separator();
@@ -195,6 +252,135 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
     if let Some(status) = &session.status {
         ui.colored_label(ui.visuals().warn_fg_color, status);
     }
+}
+
+/// The Presets section: the save row with one checkbox per group, then the
+/// presets of the folder. Returns whether a preset was applied to `edit`.
+fn presets_section(
+    ui: &mut egui::Ui,
+    edit: &mut PhotoEdit,
+    adjust: &mut AdjustState,
+) -> Result<bool, String> {
+    let Some(folder) = presets::folder() else {
+        ui.weak("The environment names no config folder to keep presets in.");
+        return Ok(false);
+    };
+    let mut applied = false;
+    let mut result = Ok(());
+
+    ui.add(egui::TextEdit::singleline(&mut adjust.preset_name).hint_text("Preset name"));
+    ui.horizontal_wrapped(|ui| {
+        let groups = &mut adjust.preset_groups;
+        ui.checkbox(&mut groups.basic, "Basic");
+        ui.checkbox(&mut groups.presence, "Presence");
+        ui.checkbox(&mut groups.curve, "Curve");
+        ui.checkbox(&mut groups.mixer, "Mixer");
+        ui.checkbox(&mut groups.grading, "Grading");
+    });
+    let ready = !adjust.preset_name.trim().is_empty() && adjust.preset_groups.any();
+    if ui
+        .add_enabled(ready, egui::Button::new("Save preset"))
+        .clicked()
+    {
+        let preset = LookPreset::from_edit(&adjust.preset_name, edit, adjust.preset_groups);
+        match presets::save(&folder, &preset) {
+            Ok(_) => {
+                adjust.preset_name.clear();
+                adjust.presets = None;
+            }
+            Err(error) => result = Err(format!("Could not save the preset: {error}")),
+        }
+    }
+
+    ui.separator();
+    let list = adjust.presets.get_or_insert_with(|| presets::list(&folder));
+    if list.is_empty() {
+        ui.weak("No presets yet.");
+    }
+    let mut deleted = false;
+    for (path, preset) in list.iter() {
+        ui.horizontal(|ui| {
+            if ui.small_button("Apply").clicked() {
+                preset.apply(edit);
+                applied = true;
+            }
+            if ui.small_button("Delete").clicked() {
+                match std::fs::remove_file(path) {
+                    Ok(()) => deleted = true,
+                    Err(error) => result = Err(format!("Could not delete the preset: {error}")),
+                }
+            }
+            ui.label(&preset.name);
+        });
+    }
+    if deleted {
+        adjust.presets = None;
+    }
+    result.map(|()| applied)
+}
+
+/// The Versions section: the save row, then one row per version. Returns
+/// what a button asked for.
+fn versions_section(
+    ui: &mut egui::Ui,
+    versions: &[NamedVersion],
+    active: Option<&str>,
+    adjust: &mut AdjustState,
+) -> Option<VersionAction> {
+    let mut action = None;
+    match active {
+        Some(name) => ui.label(format!("Working from {name}")),
+        None => ui.weak("The working state is not a version."),
+    };
+    ui.add(egui::TextEdit::singleline(&mut adjust.version_name).hint_text("Version name"));
+    let ready = !adjust.version_name.trim().is_empty();
+    if ui
+        .add_enabled(ready, egui::Button::new("Save as version"))
+        .clicked()
+    {
+        action = Some(VersionAction::Save(adjust.version_name.clone()));
+    }
+
+    ui.separator();
+    if versions.is_empty() {
+        ui.weak("No versions yet.");
+    }
+    for version in versions {
+        let name = &version.name;
+        ui.horizontal(|ui| {
+            if ui.small_button("Switch to").clicked() {
+                action = Some(VersionAction::SwitchTo(name.clone()));
+            }
+            if ui.small_button("Rename").clicked() {
+                adjust.renaming = Some((name.clone(), name.clone()));
+            }
+            if ui.small_button("Delete").clicked() {
+                action = Some(VersionAction::Delete(name.clone()));
+            }
+            if active == Some(name.as_str()) {
+                ui.strong(name);
+            } else {
+                ui.label(name);
+            }
+        });
+        if let Some((renamed, new_name)) = &mut adjust.renaming
+            && renamed == name
+        {
+            let mut done = false;
+            let mut cancelled = false;
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(new_name).desired_width(140.0));
+                done = ui.small_button("OK").clicked();
+                cancelled = ui.small_button("Cancel").clicked();
+            });
+            if done {
+                action = Some(VersionAction::Rename(renamed.clone(), new_name.clone()));
+            } else if cancelled {
+                adjust.renaming = None;
+            }
+        }
+    }
+    action
 }
 
 fn slider(

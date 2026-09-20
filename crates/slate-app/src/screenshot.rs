@@ -11,7 +11,7 @@ use slate_gpu::develop::render_size_for_crop;
 use slate_gpu::{Develop, Headless, Readback, TestImage};
 use slate_media::VideoSource;
 
-use crate::headless::{HeadlessError, Prepared};
+use crate::headless::{EditSource, HeadlessError, Prepared};
 use crate::project;
 
 /// The video screenshot size: the 9:16 Reel.
@@ -34,8 +34,8 @@ pub fn write(path: &Path) -> Result<(), HeadlessError> {
 
 /// Opens `photo`, applies its sidecar (or the one at `edit`), renders the
 /// crop at [`SIZE`] and writes it to `out` as a PNG.
-pub fn write_developed(photo: &Path, edit: Option<&Path>, out: &Path) -> Result<(), HeadlessError> {
-    let prepared = Prepared::open(photo, edit)?;
+pub fn write_developed(photo: &Path, source: EditSource, out: &Path) -> Result<(), HeadlessError> {
+    let prepared = Prepared::open(photo, source)?;
     let crop = prepared.crop();
     let gpu = &prepared.gpu;
     let mut develop = Develop::new(&gpu.device, &gpu.queue);

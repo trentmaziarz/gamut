@@ -20,6 +20,7 @@ pub mod curve_editor;
 pub mod export;
 pub mod headless;
 pub mod player;
+pub mod presets;
 pub mod project;
 pub mod reel;
 pub mod screenshot;
