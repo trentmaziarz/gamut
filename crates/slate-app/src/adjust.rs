@@ -10,7 +10,7 @@ use slate_core::look::HSL_NAMES;
 use slate_core::preset::Groups;
 use slate_core::{Crop, CropAspect, LookPreset, NamedVersion, PhotoEdit};
 
-use crate::app::Session;
+use crate::app::{Session, SwitchAnswer};
 use crate::curve_editor::{self, CurveEditorState};
 use crate::presets;
 use crate::wheel;
@@ -66,6 +66,10 @@ pub struct AdjustState {
     pub version_name: String,
     /// The version being renamed and its new name so far.
     pub renaming: Option<(String, String)>,
+    /// The version a Switch to asked for while the working state held work
+    /// its active version does not; the Save, Discard, Cancel prompt is up
+    /// while this is set.
+    pub pending_switch: Option<String>,
 }
 
 /// What a button of the Versions section asked for. It runs after the
@@ -73,6 +77,7 @@ pub struct AdjustState {
 enum VersionAction {
     Save(String),
     SwitchTo(String),
+    Update(String),
     Rename(String, String),
     Delete(String),
 }
@@ -91,6 +96,7 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
     }
     let mut message = None;
     let mut version_action = None;
+    let version_dirty = session.version_is_dirty();
     let Session {
         edit,
         adjust,
@@ -190,19 +196,28 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
             ui.weak("Versions belong to a photo.");
             return;
         }
-        version_action = versions_section(ui, versions, active_version.as_deref(), adjust);
+        version_action = versions_section(
+            ui,
+            versions,
+            active_version.as_deref(),
+            version_dirty,
+            adjust,
+        );
     });
 
     if changed {
         session.mark_edited();
     }
     if let Some(action) = version_action {
-        let result = session.with_versions(|sidecar| match &action {
-            VersionAction::Save(name) => sidecar.save_version(name),
-            VersionAction::SwitchTo(name) => sidecar.switch_to(name),
-            VersionAction::Rename(name, new_name) => sidecar.rename_version(name, new_name),
-            VersionAction::Delete(name) => sidecar.delete_version(name),
-        });
+        let result = match &action {
+            VersionAction::Save(name) => session.with_versions(|s| s.save_version(name)),
+            VersionAction::SwitchTo(name) => session.request_switch(name),
+            VersionAction::Update(name) => session.update_version(name),
+            VersionAction::Rename(name, new_name) => {
+                session.with_versions(|s| s.rename_version(name, new_name))
+            }
+            VersionAction::Delete(name) => session.with_versions(|s| s.delete_version(name)),
+        };
         match result {
             Ok(()) => {
                 if matches!(action, VersionAction::Save(_)) {
@@ -212,6 +227,11 @@ fn sections(ui: &mut egui::Ui, session: &mut Session) {
             }
             Err(error) => message = Some(error.to_string()),
         }
+    }
+    if let Some(answer) = switch_prompt(ui.ctx(), session)
+        && let Err(error) = session.answer_switch(answer)
+    {
+        message = Some(error.to_string());
     }
     if message.is_some() {
         session.status = message;
@@ -319,18 +339,51 @@ fn presets_section(
     result.map(|()| applied)
 }
 
+/// The prompt a Switch to raises over unsaved work: Save into the active
+/// version, Discard, or Cancel. Closing it any other way cancels.
+fn switch_prompt(ctx: &egui::Context, session: &Session) -> Option<SwitchAnswer> {
+    let target = session.adjust.pending_switch.as_deref()?;
+    let active = session.active_version.as_deref().unwrap_or_default();
+    let mut answer = None;
+    let modal = egui::Modal::new(egui::Id::new("version switch prompt")).show(ctx, |ui| {
+        ui.set_max_width(360.0);
+        ui.heading(format!("Switch to {target}"));
+        ui.label(format!(
+            "The working state has changes that are not saved into {active}."
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(format!("Save into {active}")).clicked() {
+                answer = Some(SwitchAnswer::Save);
+            }
+            if ui.button("Discard").clicked() {
+                answer = Some(SwitchAnswer::Discard);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(SwitchAnswer::Cancel);
+            }
+        });
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(SwitchAnswer::Cancel);
+    }
+    answer
+}
+
 /// The Versions section: the save row, then one row per version. Returns
 /// what a button asked for.
 fn versions_section(
     ui: &mut egui::Ui,
     versions: &[NamedVersion],
     active: Option<&str>,
+    dirty: bool,
     adjust: &mut AdjustState,
 ) -> Option<VersionAction> {
     let mut action = None;
-    match active {
-        Some(name) => ui.label(format!("Working from {name}")),
-        None => ui.weak("The working state is not a version."),
+    match (active, dirty) {
+        (Some(name), true) => ui.label(format!("Working from {name}, with changes not in it")),
+        (Some(name), false) => ui.label(format!("Working from {name}")),
+        (None, _) => ui.weak("The working state is not a version."),
     };
     ui.add(egui::TextEdit::singleline(&mut adjust.version_name).hint_text("Version name"));
     let ready = !adjust.version_name.trim().is_empty();
@@ -350,6 +403,13 @@ fn versions_section(
         ui.horizontal(|ui| {
             if ui.small_button("Switch to").clicked() {
                 action = Some(VersionAction::SwitchTo(name.clone()));
+            }
+            if ui
+                .small_button("Update")
+                .on_hover_text("Write the working state into this version")
+                .clicked()
+            {
+                action = Some(VersionAction::Update(name.clone()));
             }
             if ui.small_button("Rename").clicked() {
                 adjust.renaming = Some((name.clone(), name.clone()));

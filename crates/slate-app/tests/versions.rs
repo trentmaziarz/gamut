@@ -1,7 +1,12 @@
 //! Saves two named versions next to a copy of a fixture, reads the sidecar
 //! back and renders each version by its name, as `--version-name` does. The
 //! renders skip, and say so, when the machine has no adapter.
+//!
+//! The other tests walk the session through what a person does at the
+//! Versions section: save, change, switch away and back, answer the prompt,
+//! update, close and reload.
 
+use slate_app::app::{Session, SwitchAnswer};
 use slate_app::headless::{EditSource, HeadlessError};
 use slate_app::screenshot::write_developed;
 use slate_app::sidecar::{load, save};
@@ -67,4 +72,143 @@ fn two_versions_survive_a_reload_and_render_by_name() {
         error.to_string(),
         "no version named Nope: the versions are Teal, Dark"
     );
+}
+
+/// A session with two versions, Sunset (exposure 1) and Normal (exposure 0),
+/// working from Normal.
+fn sunset_and_normal() -> Session {
+    let mut session = Session::default();
+    session.edit.exposure = 1.0;
+    session
+        .with_versions(|sidecar| sidecar.save_version("Sunset"))
+        .expect("save");
+    session.edit = Default::default();
+    session
+        .with_versions(|sidecar| sidecar.save_version("Normal"))
+        .expect("save");
+    session
+}
+
+/// The session a reload of the sidecar gives.
+fn reloaded(session: &Session) -> Session {
+    let sidecar = Sidecar::from_json(&session.sidecar().to_json()).expect("parse");
+    let mut fresh = Session::default();
+    fresh.take_sidecar(sidecar);
+    fresh
+}
+
+#[test]
+fn a_switch_on_a_clean_state_needs_no_prompt() {
+    let mut session = sunset_and_normal();
+    assert!(!session.version_is_dirty());
+    session.request_switch("Sunset").expect("switch");
+    assert_eq!(session.adjust.pending_switch, None);
+    assert_eq!(session.edit.exposure, 1.0);
+    assert_eq!(session.active_version.as_deref(), Some("Sunset"));
+    assert_eq!(session.status.as_deref(), Some("Switched to Sunset."));
+    assert!(session.develop_dirty && session.changed_at.is_some());
+}
+
+#[test]
+fn a_switch_over_unsaved_work_waits_for_an_answer() {
+    let mut session = sunset_and_normal();
+    session.edit.contrast = 30.0;
+    assert!(session.version_is_dirty());
+    session
+        .request_switch("Sunset")
+        .expect("the prompt goes up");
+    assert_eq!(session.adjust.pending_switch.as_deref(), Some("Sunset"));
+    assert_eq!(session.edit.contrast, 30.0, "nothing moved yet");
+    assert_eq!(session.active_version.as_deref(), Some("Normal"));
+
+    // Cancel stays on the working state and keeps the work.
+    session.answer_switch(SwitchAnswer::Cancel).expect("cancel");
+    assert_eq!(session.adjust.pending_switch, None);
+    assert_eq!(session.edit.contrast, 30.0);
+    assert_eq!(session.active_version.as_deref(), Some("Normal"));
+    assert_eq!(session.versions[1].edit.contrast, 0.0);
+}
+
+#[test]
+fn discard_switches_and_leaves_every_version_as_saved() {
+    let mut session = sunset_and_normal();
+    let saved = session.versions.clone();
+    session.edit.contrast = 30.0;
+    session.request_switch("Sunset").expect("prompt");
+    session
+        .answer_switch(SwitchAnswer::Discard)
+        .expect("discard");
+    assert_eq!(session.edit.exposure, 1.0);
+    assert_eq!(session.edit.contrast, 0.0);
+    assert_eq!(session.versions, saved);
+    assert_eq!(
+        session.status.as_deref(),
+        Some("Discarded the changes, switched to Sunset.")
+    );
+
+    // Back on Normal, the work is gone: it was never saved.
+    session.request_switch("Normal").expect("clean switch");
+    assert_eq!(session.edit.contrast, 0.0);
+    assert_eq!(reloaded(&session).versions, saved);
+}
+
+#[test]
+fn save_keeps_the_work_in_the_active_version_then_switches() {
+    let mut session = sunset_and_normal();
+    session.edit.contrast = 30.0;
+    session.request_switch("Sunset").expect("prompt");
+    session.answer_switch(SwitchAnswer::Save).expect("save");
+    assert_eq!(session.active_version.as_deref(), Some("Sunset"));
+    assert_eq!(session.edit.exposure, 1.0);
+    assert_eq!(
+        session.versions[1].edit.contrast, 30.0,
+        "Normal took the work"
+    );
+    assert_eq!(session.versions[0].edit.contrast, 0.0, "Sunset did not");
+    assert_eq!(
+        session.status.as_deref(),
+        Some("Saved into Normal, switched to Sunset.")
+    );
+
+    session.request_switch("Normal").expect("clean switch");
+    assert_eq!(session.edit.contrast, 30.0);
+}
+
+#[test]
+fn update_writes_a_version_and_survives_a_reload() {
+    let mut session = sunset_and_normal();
+    session.edit.clarity = 25.0;
+    session.crop.rect.width = 0.5;
+    session.update_version("Normal").expect("update");
+    assert!(!session.version_is_dirty());
+    assert_eq!(session.status.as_deref(), Some("Updated Normal."));
+
+    // Close and reload: the versions, the active one and the work are there.
+    let fresh = reloaded(&session);
+    assert_eq!(fresh.versions, session.versions);
+    assert_eq!(fresh.active_version.as_deref(), Some("Normal"));
+    assert_eq!(fresh.versions[1].edit.clarity, 25.0);
+    assert_eq!(fresh.versions[1].crop.rect.width, 0.5);
+    assert_eq!(fresh.versions[0].edit.clarity, 0.0);
+    assert!(!fresh.version_is_dirty());
+
+    // Unsaved work survives a reload as unsaved work.
+    session.edit.clarity = 60.0;
+    let fresh = reloaded(&session);
+    assert!(fresh.version_is_dirty());
+    assert_eq!(fresh.edit.clarity, 60.0);
+    assert_eq!(fresh.versions[1].edit.clarity, 25.0);
+}
+
+#[test]
+fn a_switch_to_an_unknown_version_raises_no_prompt() {
+    let mut session = sunset_and_normal();
+    session.edit.contrast = 30.0;
+    let error = session.request_switch("Nope").expect_err("unknown");
+    assert_eq!(
+        error.to_string(),
+        "no version named Nope: the versions are Sunset, Normal"
+    );
+    assert_eq!(session.adjust.pending_switch, None);
+    assert_eq!(session.edit.contrast, 30.0);
 }

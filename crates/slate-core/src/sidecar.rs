@@ -347,7 +347,10 @@ mod tests {
         sidecar.edit.contrast = 45.0;
         sidecar.update_version("Bright").expect("update");
         assert_eq!(sidecar.active_version.as_deref(), Some("Bright"));
-        assert_eq!(sidecar.version("Bright").expect("found").edit.contrast, 45.0);
+        assert_eq!(
+            sidecar.version("Bright").expect("found").edit.contrast,
+            45.0
+        );
         assert_eq!(sidecar.version("Dark").expect("found").edit.contrast, 30.0);
         assert!(!sidecar.is_dirty());
 
@@ -362,7 +365,10 @@ mod tests {
     fn is_dirty_follows_the_edit_and_the_crop() {
         let mut sidecar = Sidecar::default();
         sidecar.edit.exposure = 0.5;
-        assert!(!sidecar.is_dirty(), "no active version, nothing to be behind");
+        assert!(
+            !sidecar.is_dirty(),
+            "no active version, nothing to be behind"
+        );
         sidecar.save_version("One").expect("save");
         assert!(!sidecar.is_dirty());
 
@@ -407,7 +413,10 @@ mod tests {
         sidecar.edit.contrast = 30.0;
         let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
         assert_eq!(back, sidecar);
-        assert!(back.is_dirty(), "the unsaved work survives a reload as unsaved");
+        assert!(
+            back.is_dirty(),
+            "the unsaved work survives a reload as unsaved"
+        );
         assert_eq!(back.active_version.as_deref(), Some("Dark"));
     }
 

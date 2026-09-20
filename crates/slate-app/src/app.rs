@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use eframe::CreationContext;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
-use slate_core::{Crop, CropAspect, ExportPreset, PhotoEdit, Project, Sidecar, Track};
+use slate_core::{
+    Crop, CropAspect, ExportPreset, PhotoEdit, Project, Sidecar, Track, VersionError,
+};
 use slate_media::export::write_jpeg;
 use slate_media::open_photo;
 use slate_media::video::is_video_path;
@@ -191,6 +193,17 @@ impl OpenProject {
     }
 }
 
+/// What the person answered when a switch met unsaved work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchAnswer {
+    /// Save the work into the active version, then switch.
+    Save,
+    /// Switch and let the work go.
+    Discard,
+    /// Stay on the working state.
+    Cancel,
+}
+
 /// The editing state the tabs share: the open photo or project, its edit
 /// and crop, and what needs doing about them.
 #[derive(Default)]
@@ -266,6 +279,69 @@ impl Session {
         self.versions = sidecar.versions;
         self.active_version = sidecar.active_version;
         self.mark_edited();
+        Ok(())
+    }
+
+    /// Takes the state a sidecar holds: the working edit and crop, the
+    /// versions and the active one.
+    pub fn take_sidecar(&mut self, sidecar: Sidecar) {
+        self.edit = sidecar.edit;
+        self.crop = sidecar.crop;
+        self.versions = sidecar.versions;
+        self.active_version = sidecar.active_version;
+    }
+
+    /// Whether the working state holds work its active version does not.
+    pub fn version_is_dirty(&self) -> bool {
+        self.sidecar().is_dirty()
+    }
+
+    /// The Switch to button. On a clean working state the version comes in
+    /// at once. On a dirty one nothing changes yet: the switch waits in
+    /// `adjust.pending_switch` for [`Session::answer_switch`].
+    pub fn request_switch(&mut self, name: &str) -> Result<(), VersionError> {
+        if self.version_is_dirty() {
+            self.sidecar().version(name)?;
+            self.adjust.pending_switch = Some(name.to_string());
+            return Ok(());
+        }
+        self.with_versions(|sidecar| sidecar.switch_to(name))?;
+        self.status = Some(format!("Switched to {name}."));
+        Ok(())
+    }
+
+    /// The answer to the prompt a dirty switch raised. Save keeps the work
+    /// in the active version first, Discard lets it go, Cancel stays put.
+    pub fn answer_switch(&mut self, answer: SwitchAnswer) -> Result<(), VersionError> {
+        let Some(target) = self.adjust.pending_switch.take() else {
+            return Ok(());
+        };
+        let active = self.active_version.clone();
+        match answer {
+            SwitchAnswer::Cancel => {}
+            SwitchAnswer::Save => {
+                self.with_versions(|sidecar| {
+                    if let Some(active) = &active {
+                        sidecar.update_version(active)?;
+                    }
+                    sidecar.switch_to(&target)
+                })?;
+                let kept = active.unwrap_or_default();
+                self.status = Some(format!("Saved into {kept}, switched to {target}."));
+            }
+            SwitchAnswer::Discard => {
+                self.with_versions(|sidecar| sidecar.switch_to(&target))?;
+                self.status = Some(format!("Discarded the changes, switched to {target}."));
+            }
+        }
+        Ok(())
+    }
+
+    /// The Update button of a version row: the working state goes into that
+    /// version.
+    pub fn update_version(&mut self, name: &str) -> Result<(), VersionError> {
+        self.with_versions(|sidecar| sidecar.update_version(name))?;
+        self.status = Some(format!("Updated {name}."));
         Ok(())
     }
 
@@ -357,10 +433,8 @@ impl SlateApp {
             ),
         };
         self.session.project = None;
-        self.session.edit = sidecar.edit;
-        self.session.crop = sidecar.crop;
-        self.session.versions = sidecar.versions;
-        self.session.active_version = sidecar.active_version;
+        self.session.take_sidecar(sidecar);
+        self.session.adjust.pending_switch = None;
         self.session.photo = Some(OpenPhoto {
             path,
             width: photo.width,
