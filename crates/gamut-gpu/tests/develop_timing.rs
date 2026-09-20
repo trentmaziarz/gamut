@@ -16,9 +16,18 @@
 //! padded window, which develops what came into view and runs no head pass;
 //! the same slider step at 400 percent; and, for the record, what replacing
 //! the padded window costs and how often a steady pan pays it.
+//!
+//! The brush is measured last, over all of the above: a fifth mask that is a
+//! brush of 500 strokes of 50 points carrying exposure, clarity and a curve.
+//! A slider step with the five masks at the viewer size and at 100 percent,
+//! and painting at 100 and at 400 percent, one appended point a frame for
+//! 100 frames, are held to the gate. What stamping the whole layer over the
+//! padded window costs, and what replacing the window costs with the brush
+//! in it, are printed for the record.
 
 use std::time::Instant;
 
+use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::look::{Curve, Wheel};
 use gamut_core::mask::{ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient};
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
@@ -227,6 +236,112 @@ fn everything_on_with_four_masks() -> PhotoEdit {
     edit
 }
 
+/// How many strokes the timed brush holds, and how many points each.
+const BRUSH_STROKES: usize = 500;
+const STROKE_POINTS: usize = 50;
+
+/// A number from 0 to 1 that is the same on every run.
+fn next(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*seed >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// `base` with a fifth mask: a brush of [`BRUSH_STROKES`] strokes of
+/// [`STROKE_POINTS`] points wandering over the whole photo, every tenth an
+/// erase, with brushes from small and hard to large and soft, carrying
+/// exposure, clarity and a curve.
+fn with_brush_mask(base: &PhotoEdit) -> PhotoEdit {
+    let mut seed = 20_260_920;
+    let strokes = (0..BRUSH_STROKES)
+        .map(|k| {
+            let size = 0.004 + 0.03 * next(&mut seed);
+            let mut at = [next(&mut seed), next(&mut seed)];
+            let mut heading = next(&mut seed) * std::f32::consts::TAU;
+            let points = (0..STROKE_POINTS)
+                .map(|_| {
+                    // A point every quarter radius, as the window adds them.
+                    heading += (next(&mut seed) - 0.5) * 0.8;
+                    at[0] = (at[0] + heading.cos() * size * 0.25).clamp(0.0, 1.0);
+                    at[1] = (at[1] + heading.sin() * size * 0.375).clamp(0.0, 1.0);
+                    at
+                })
+                .collect();
+            SharedStroke::new(&Stroke {
+                points,
+                size,
+                feather: 100.0 * next(&mut seed),
+                flow: 20.0 + 80.0 * next(&mut seed),
+                erase: k % 10 == 9,
+            })
+        })
+        .collect();
+    let mut mask = Mask::new("Brush", MaskSource::Brush(Brush { strokes }));
+    mask.adjust.exposure = 0.6;
+    mask.adjust.clarity = 25.0;
+    mask.adjust.look.curves.master = Curve {
+        points: vec![[0.0, 0.0], [0.3, 0.26], [0.7, 0.76], [1.0, 1.0]],
+    };
+    let mut edit = base.clone();
+    edit.masks.push(mask);
+    edit
+}
+
+/// The brush of the fifth mask.
+fn timed_brush(edit: &mut PhotoEdit) -> &mut Brush {
+    match &mut edit.masks[4].components[0].source {
+        MaskSource::Brush(brush) => brush,
+        _ => panic!("the fifth mask is the brush"),
+    }
+}
+
+/// `RENDERS` frames of painting inside what `view` shows: a press in the
+/// middle, then one appended point a frame, a quarter radius on, along a
+/// path that turns back before it leaves what is seen.
+fn painted_view(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: &ViewWindow,
+) -> (f64, f64, f64) {
+    let (full_w, full_h) = (view.full.0 as f32, view.full.1 as f32);
+    let (x, y, w, h) = view.visible;
+    let centre = [
+        (x as f32 + w as f32 / 2.0) / full_w,
+        (y as f32 + h as f32 / 2.0) / full_h,
+    ];
+    // A brush a twelfth of what is seen across, and a loop that stays in it.
+    let longer = full_w.max(full_h);
+    let size = w.min(h) as f32 / 12.0 / longer;
+    let orbit = [w as f32 * 0.3 / full_w, h as f32 * 0.3 / full_h];
+    let mut edit = base.clone();
+    timed_brush(&mut edit)
+        .strokes
+        .push(SharedStroke::new(&Stroke {
+            points: vec![[centre[0] + orbit[0], centre[1]]],
+            size,
+            feather: 50.0,
+            flow: 60.0,
+            erase: false,
+        }));
+    timed_view(gpu, develop, &edit, view);
+    // A quarter radius of arc a frame.
+    let step = size * 0.25 * longer / (w as f32 * 0.3);
+    percentiles(
+        (1..=RENDERS)
+            .map(|i| {
+                let angle = step * i as f32;
+                let at = [
+                    centre[0] + orbit[0] * angle.cos(),
+                    centre[1] + orbit[1] * angle.sin(),
+                ];
+                let stroke = timed_brush(&mut edit).strokes.last_mut().expect("pressed");
+                assert!(stroke.push(at));
+                timed_view(gpu, develop, &edit, view)
+            })
+            .collect(),
+    )
+}
+
 /// The median, the 95th percentile and the maximum of `RENDERS` renders of
 /// `base` with the exposure slider stepping from -1 to 1.
 fn stepped(gpu: &Headless, develop: &mut Develop, base: &PhotoEdit) -> (f64, f64, f64) {
@@ -425,7 +540,112 @@ fn develop_at_viewer_size_is_fast_enough() {
         println!("full-resolution render at {full:?}: {time:.2} ms");
     }
 
+    // The brush, over every operator and the four masks: a fifth mask of
+    // 500 strokes. Its layer is stamped once at each size and kept.
+    let painted = with_brush_mask(&masked);
+    let layers = develop.brush_layer_builds();
+    let brush_on = timed_render(&gpu, &mut develop, &painted, VIEWER_SIZE);
+    println!(
+        "first render with the brush mask on ({BRUSH_STROKES} strokes of {STROKE_POINTS} points stamped at {VIEWER_SIZE:?}): {brush_on:.2} ms"
+    );
+    let (five_p50, five_p95, five_max) = stepped(&gpu, &mut develop, &painted);
+    println!(
+        "slider step with the five masks at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {five_p50:.2} ms, p95 {five_p95:.2} ms, max {five_max:.2} ms"
+    );
+    assert_eq!(
+        develop.brush_layer_builds() - layers,
+        1,
+        "a slider stamped the brush layer again"
+    );
+    let mut brush_p95 = None;
+    if info.device_type == wgpu::DeviceType::Cpu {
+        println!("zoomed brush lines skipped on a CPU adapter");
+    } else {
+        let full = (photo.width, photo.height);
+        let (actual, pad) = zoomed_view(full, 1);
+        let first = timed_view(&gpu, &mut develop, &painted, &actual);
+        println!(
+            "first render of the padded window at 100 percent with the five masks: {first:.2} ms"
+        );
+        let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &painted, &actual);
+        println!(
+            "slider step at 100 percent with the five masks, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+        );
+        let (layers, appends) = (develop.brush_layer_builds(), develop.brush_layer_appends());
+        let (paint_p50, paint_p95, paint_max) = painted_view(&gpu, &mut develop, &painted, &actual);
+        println!(
+            "painting at 100 percent, one appended point a frame, {RENDERS} frames: p50 {paint_p50:.2} ms, p95 {paint_p95:.2} ms, max {paint_max:.2} ms"
+        );
+        assert_eq!(
+            (
+                develop.brush_layer_builds() - layers,
+                develop.brush_layer_appends() - appends
+            ),
+            (0, RENDERS as u64 + 1),
+            "painting stamped the whole layer again"
+        );
+
+        // For the record: the whole layer stamped again over the padded
+        // window, which an undo or a changed earlier stroke asks for, and the
+        // window replaced with the brush in it.
+        timed_view(&gpu, &mut develop, &painted, &actual);
+        let mut undone = painted.clone();
+        timed_brush(&mut undone).strokes.pop();
+        let whole = timed_view(&gpu, &mut develop, &undone, &actual);
+        println!(
+            "the brush layer stamped whole over the padded window {:?}, its alpha and what is seen developed: {whole:.2} ms",
+            (actual.window.2, actual.window.3)
+        );
+        let mut replaced = Vec::new();
+        for k in 1..=5u32 {
+            let (x, y, w, h) = actual.visible;
+            let visible = (x + k * (pad.0 + PAN_STEP), y, w, h);
+            if visible.0 + w > full.0 {
+                break;
+            }
+            let view = ViewWindow {
+                full,
+                window: padded_window(full, visible, pad, WINDOW_GRID),
+                visible,
+            };
+            replaced.push(timed_view(&gpu, &mut develop, &painted, &view));
+        }
+        replaced.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        println!(
+            "replacing the padded window with the five masks, {} times: least {:.2} ms, most {:.2} ms",
+            replaced.len(),
+            replaced.first().copied().unwrap_or(0.0),
+            replaced.last().copied().unwrap_or(0.0)
+        );
+
+        let (deep, _) = zoomed_view(full, 4);
+        timed_view(&gpu, &mut develop, &painted, &deep);
+        let (deep_p50, deep_p95, deep_max) = painted_view(&gpu, &mut develop, &painted, &deep);
+        println!(
+            "painting at 400 percent, one appended point a frame, {RENDERS} frames: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
+        );
+        brush_p95 = Some((step_p95, paint_p95, deep_p95));
+    }
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            five_p95 < GATE_MS,
+            "p95 of a slider step with the five masks, {five_p95:.2} ms, is not under {GATE_MS} ms"
+        );
+        if let Some((step_p95, paint_p95, deep_p95)) = brush_p95 {
+            assert!(
+                step_p95 < GATE_MS,
+                "p95 of a slider step at 100 percent with the five masks, {step_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                paint_p95 < GATE_MS,
+                "p95 of painting at 100 percent, {paint_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                deep_p95 < GATE_MS,
+                "p95 of painting at 400 percent, {deep_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
         assert!(p95 < GATE_MS, "p95 {p95:.2} ms is not under {GATE_MS} ms");
         assert!(
             all_p95 < GATE_MS,

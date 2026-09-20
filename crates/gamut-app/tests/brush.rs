@@ -595,3 +595,73 @@ fn a_project_paints_and_undoes() {
     assert_eq!(brush(&session).strokes.len(), 2);
     assert_eq!(session.adjust.brush.armed, Some(0));
 }
+
+/// Strokes are shared, never deep-copied: a history frame over a large brush
+/// walks pointers, and 500 undo steps hold every stroke once. The time is
+/// asserted in a release build, where it means something, and printed in a
+/// debug one.
+#[test]
+fn a_history_frame_over_a_large_brush_is_cheap_and_the_steps_share_its_strokes() {
+    let mut session = armed();
+    let strokes: Vec<SharedStroke> = (0..MAX_STROKES)
+        .map(|k| {
+            let y = k as f32 / MAX_STROKES as f32;
+            SharedStroke::new(&Stroke {
+                points: (0..100).map(|i| [i as f32 / 100.0, y]).collect(),
+                ..Stroke::default()
+            })
+        })
+        .collect();
+    let first = MAX_STROKES - 500;
+    let MaskSource::Brush(painted) = &mut session.edit.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    painted.strokes = strokes[..first].to_vec();
+    session.mark_edited();
+    settle(&mut session);
+    // 500 steps of one added stroke each.
+    for stroke in &strokes[first..] {
+        let MaskSource::Brush(painted) = &mut session.edit.masks[0].components[0].source else {
+            panic!("a brush");
+        };
+        painted.strokes.push(stroke.clone());
+        session.mark_edited();
+        settle(&mut session);
+    }
+    assert_eq!(undo_steps(&session), 500, "the history is full of them");
+    assert_eq!(brush(&session).strokes.len(), MAX_STROKES);
+
+    // A frame with nothing changed: the snapshot is cloned and compared.
+    let frames = 200;
+    let start = Instant::now();
+    for _ in 0..frames {
+        settle(&mut session);
+    }
+    let frame_ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!("a history frame over {MAX_STROKES} strokes of 100 points: {frame_ms:.3} ms");
+    if !cfg!(debug_assertions) {
+        assert!(frame_ms < 1.0, "{frame_ms:.3} ms a frame");
+    }
+    assert_eq!(undo_steps(&session), 500, "and it was no step");
+
+    // Every state the history gives back holds the strokes that were
+    // pushed, by pointer: no step made a copy of one.
+    for _ in 0..250 {
+        assert!(session.undo());
+    }
+    let held = &brush(&session).strokes;
+    assert_eq!(held.len(), MAX_STROKES - 250);
+    assert!(
+        held.iter()
+            .zip(&strokes)
+            .all(|(held, pushed)| held.shares_with(pushed))
+    );
+    while session.redo() {}
+    let held = &brush(&session).strokes;
+    assert_eq!(held.len(), MAX_STROKES);
+    assert!(
+        held.iter()
+            .zip(&strokes)
+            .all(|(held, pushed)| held.shares_with(pushed))
+    );
+}
