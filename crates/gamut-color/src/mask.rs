@@ -208,7 +208,19 @@ impl<'a> StampedMask<'a> {
 
 /// An alpha as the r8unorm texture of the GPU holds it.
 pub fn stored_alpha(alpha: f32) -> f32 {
-    (alpha.clamp(0.0, 1.0) * 255.0).round() / 255.0
+    stored_alpha_stepping(alpha, 0.0)
+}
+
+/// How far from the half code a GPU may step from one unorm code to the
+/// next: Direct3D and Vulkan give the conversion from a float 0.6 of a code,
+/// so an alpha of 4.45 codes may be stored as 5 and one of 4.55 as 4.
+pub const UNORM_STEP_TOLERANCE: f32 = 0.1;
+
+/// [`stored_alpha`] on a GPU whose step between two codes lies `bias` of a
+/// code under the half, inside [`UNORM_STEP_TOLERANCE`]. A reference that
+/// shows the alpha itself, as the overlay does, accepts the whole tolerance.
+pub fn stored_alpha_stepping(alpha: f32, bias: f32) -> f32 {
+    ((alpha.clamp(0.0, 1.0) * 255.0 + bias).round() / 255.0).clamp(0.0, 1.0)
 }
 
 /// The alpha of a mask over every pixel of a render, as the GPU stores it.
@@ -223,6 +235,20 @@ pub fn alpha_image_with(
     geometry: &Geometry,
     layer_store: &dyn Fn(f32) -> f32,
 ) -> Vec<f32> {
+    alpha_image_before_the_store(mask, pixels, geometry, layer_store)
+        .into_iter()
+        .map(stored_alpha)
+        .collect()
+}
+
+/// The alpha of a mask over every pixel of a render before the r8unorm
+/// store rounds it.
+pub fn alpha_image_before_the_store(
+    mask: &Mask,
+    pixels: &[[f32; 3]],
+    geometry: &Geometry,
+    layer_store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
     let mask = mask.sanitised();
     let stamped = StampedMask::new(&mask, geometry.aspect());
     let width = geometry.size.0;
@@ -231,7 +257,7 @@ pub fn alpha_image_with(
         .enumerate()
         .map(|(i, px)| {
             let at = geometry.position(i as u32 % width, i as u32 / width);
-            stored_alpha(stamped.alpha(at, *px, layer_store))
+            stamped.alpha(at, *px, layer_store)
         })
         .collect()
 }
@@ -339,6 +365,18 @@ pub fn develop_image(
     atmosphere: [f32; 3],
     store: &dyn Fn(f32) -> f32,
 ) -> Vec<[f32; 3]> {
+    develop_image_with(image, edit, atmosphere, store, &|layer| layer)
+}
+
+/// [`develop_image`] with the rounding of the layer a brush is stamped into,
+/// applied after every dab.
+pub fn develop_image_with(
+    image: &Image,
+    edit: &PhotoEdit,
+    atmosphere: [f32; 3],
+    store: &dyn Fn(f32) -> f32,
+    layer_store: &dyn Fn(f32) -> f32,
+) -> Vec<[f32; 3]> {
     let around = |i: usize| Neighbourhood {
         base_luma: image.base[i],
         texture_luma: image.texture[i],
@@ -352,7 +390,7 @@ pub fn develop_image(
         .map(|(i, px)| basic::develop_pixel_with(*px, &around(i), edit, &prepared).map(store))
         .collect();
     for (_, mask) in active_masks(edit) {
-        let alphas = alpha_image(&mask, image.pixels, &image.geometry);
+        let alphas = alpha_image_with(&mask, image.pixels, &image.geometry, layer_store);
         let effective = PhotoEdit::from(effective_adjustments(&edit.adjust, &mask.adjust));
         let prepared = Prepared::composed(&edit.adjust, &mask.adjust, atmosphere);
         for (i, px) in image.pixels.iter().enumerate() {
