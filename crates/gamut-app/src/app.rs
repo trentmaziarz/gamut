@@ -237,6 +237,9 @@ pub struct Session {
     pub adjust: crate::adjust::AdjustState,
     /// A small copy of the open photo that a range mask is picked from.
     pub pick: Option<crate::mask_handles::PickImage>,
+    /// How far the Viewer is zoomed into what is open and where. It belongs
+    /// to the window: no file holds it.
+    pub view: crate::view::View,
     pub grid_guide: bool,
     /// The Viewer must run the develop graph again.
     pub develop_dirty: bool,
@@ -456,6 +459,7 @@ impl GamutApp {
             ),
         };
         self.session.project = None;
+        self.session.view = Default::default();
         self.session.take_sidecar(sidecar);
         self.session.adjust.pending_switch = None;
         self.session.photo = Some(OpenPhoto {
@@ -483,6 +487,7 @@ impl GamutApp {
             loaded.project.crop
         };
         self.session.photo = None;
+        self.session.view = Default::default();
         self.session.pick = None;
         self.session.adjust.select_mask(None);
         self.session.versions.clear();

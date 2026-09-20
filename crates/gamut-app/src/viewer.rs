@@ -5,7 +5,7 @@
 //! as a photo, so the Basic sliders and the crop apply to it.
 
 use egui::load::SizedTexture;
-use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind};
+use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_wgpu::RenderState;
 use egui_wgpu::wgpu;
 use gamut_core::{CropAspect, CropRect, ExportPreset, PhotoEdit};
@@ -87,16 +87,29 @@ impl Viewer {
         self.develop.render_export(edit, crop, preset)
     }
 
-    /// Draws the picture at the largest size of its aspect that fits the
-    /// tab, then the crop and the frame over it. The develop graph runs
-    /// only when the session is dirty or the pixel size changed.
+    /// Draws the picture where the view of the open file puts it (fitted
+    /// to the tab until it is zoomed), then the crop and the frame over it.
+    /// The develop graph runs only when the session is dirty or the pixel
+    /// size changed.
     pub fn ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
-        let aspect = match session.source_size() {
-            Some((width, height)) => [width as f32, height as f32],
-            None => VIEWER_ASPECT,
-        };
-        let points = fit_aspect(ui.available_size(), aspect);
         let scale = ui.pixels_per_point();
+        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+        // With nothing open the test image is fitted and never zooms.
+        let placed = match session.source_size() {
+            Some(source) => {
+                let placed = session.view.place(area, source, scale);
+                session.view = placed.view;
+                Some(placed)
+            }
+            None => None,
+        };
+        let points = fit_aspect(
+            area.size(),
+            match session.source_size() {
+                Some((width, height)) => [width as f32, height as f32],
+                None => VIEWER_ASPECT,
+            },
+        );
         let wanted = (
             (points.x * scale).round().max(1.0) as u32,
             (points.y * scale).round().max(1.0) as u32,
@@ -120,14 +133,19 @@ impl Viewer {
             self.show_placeholder(wanted);
         }
 
-        let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-        let image = Rect::from_center_size(area.center(), points);
-        egui::Image::from_texture(SizedTexture::new(self.texture_id, points)).paint_at(ui, image);
-        if has_picture {
-            draw_crop(ui, image, session);
+        let image = placed.map_or_else(
+            || Rect::from_center_size(area.center(), points),
+            |placed| placed.image,
+        );
+        egui::Image::from_texture(SizedTexture::new(self.texture_id, image.size()))
+            .paint_at(ui, image);
+        if let Some(placed) = placed.filter(|_| has_picture) {
+            // The one place that knows where the photo is on the screen.
+            let map = PictureMap::new(&placed, area);
+            draw_crop(ui, &map, session);
             // The handles of the selected mask go over the crop and take the
-            // pointer first; they know the picture only through this map.
-            mask_handles::show(ui, &PictureMap { image }, session);
+            // pointer first.
+            mask_handles::show(ui, &map, session);
         }
     }
 
@@ -202,31 +220,31 @@ impl Viewer {
     }
 }
 
-/// The crop rectangle in screen points, given the image rectangle.
-fn crop_on_screen(image: Rect, crop: CropRect) -> Rect {
-    Rect::from_min_size(
-        Pos2::new(
-            image.min.x + crop.x * image.width(),
-            image.min.y + crop.y * image.height(),
-        ),
-        egui::vec2(crop.width * image.width(), crop.height * image.height()),
-    )
+/// The crop after a drag of `delta` points across the screen: it moves by
+/// that distance on the photo, whatever the zoom.
+pub fn dragged_crop(map: &PictureMap, crop: CropRect, delta: Vec2) -> CropRect {
+    let [dx, dy] = map.delta_to_picture(delta);
+    crop.moved(dx, dy)
 }
 
 /// The crop rectangle, draggable, under the phone frame and its guides.
-fn draw_crop(ui: &mut egui::Ui, image: Rect, session: &mut Session) {
-    let crop = crop_on_screen(image, session.crop.rect);
-    let response = ui.interact(crop, ui.id().with("crop drag"), Sense::drag());
-    if response.dragged() {
-        let delta = response.drag_delta();
-        session.crop.rect = session
-            .crop
-            .rect
-            .moved(delta.x / image.width(), delta.y / image.height());
-        session.mark_edited();
+fn draw_crop(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
+    let id = ui.id().with("crop drag");
+    // Only the part of the crop inside the tab takes the pointer; a drag
+    // under way keeps going when the pointer leaves it.
+    let grab = map
+        .touchable(map.rect_to_screen(session.crop.rect))
+        .or_else(|| ui.ctx().is_being_dragged(id).then_some(map.visible));
+    if let Some(grab) = grab {
+        let response = ui.interact(grab, id, Sense::drag());
+        if response.dragged() {
+            session.crop.rect = dragged_crop(map, session.crop.rect, response.drag_delta());
+            session.mark_edited();
+        }
     }
-    let crop = crop_on_screen(image, session.crop.rect);
-    let painter = ui.painter().with_clip_rect(image.expand(12.0));
+    let image = map.image;
+    let crop = map.rect_to_screen(session.crop.rect);
+    let painter = ui.painter().with_clip_rect(map.clip(12.0));
 
     // Everything outside the crop is dimmed.
     let shade = Color32::from_black_alpha(130);
@@ -326,8 +344,10 @@ pub fn fit_aspect(available: egui::Vec2, aspect: [f32; 2]) -> egui::Vec2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{VIEWER_ASPECT, crop_on_screen, fit_aspect};
-    use egui::{Pos2, Rect};
+    use super::{VIEWER_ASPECT, dragged_crop, fit_aspect};
+    use crate::mask_handles::PictureMap;
+    use crate::view::{View, Zoom};
+    use egui::{Pos2, Rect, Vec2};
     use gamut_core::CropRect;
 
     #[test]
@@ -351,8 +371,36 @@ mod tests {
             width: 0.5,
             height: 1.0,
         };
-        let on_screen = crop_on_screen(image, crop);
+        let on_screen = PictureMap::whole(image).rect_to_screen(crop);
         assert_eq!(on_screen.min, Pos2::new(150.0, 50.0));
         assert_eq!(on_screen.max, Pos2::new(250.0, 250.0));
+    }
+
+    #[test]
+    fn a_crop_drag_moves_the_crop_by_the_dragged_distance_on_the_photo() {
+        let tab = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0));
+        let crop = CropRect {
+            x: 0.2,
+            y: 0.3,
+            width: 0.3,
+            height: 0.4,
+        };
+        for scale in [1.0, 4.0] {
+            let view = View {
+                zoom: Zoom::Scale(scale),
+                centre: [0.31, 0.64],
+            };
+            let map = PictureMap::new(&view.place(tab, (6000, 4000), 1.0), tab);
+            let before = map.rect_to_screen(crop);
+            let drag = Vec2::new(60.0, -24.0);
+            let moved = dragged_crop(&map, crop, drag);
+            // On the screen the crop went where the pointer went.
+            let after = map.rect_to_screen(moved);
+            assert!((after.min - before.min - drag).length() < 1e-2);
+            // On the photo that is fewer source pixels the deeper the zoom.
+            assert!((moved.x - crop.x - 60.0 / (6000.0 * scale)).abs() < 1e-6);
+            assert!((moved.y - crop.y + 24.0 / (4000.0 * scale)).abs() < 1e-6);
+            assert_eq!((moved.width, moved.height), (crop.width, crop.height));
+        }
     }
 }

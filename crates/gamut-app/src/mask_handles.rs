@@ -3,8 +3,9 @@
 //!
 //! Everything here goes between the picture and the screen through
 //! [`PictureMap`], the one place that knows where the photo is drawn. The
-//! viewer fits the photo to the tab today; a viewer that zooms and pans
-//! builds a different map and the handles follow it.
+//! viewer builds it from the view of the open file, so the handles follow
+//! the zoom and the pan, and nothing is drawn or grabbed outside the part
+//! of the tab the picture is seen in.
 //!
 //! A linear gradient shows its start and its end with the line between
 //! them. A radial gradient shows its centre, a handle on each radius and a
@@ -16,12 +17,14 @@
 use egui::{Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use gamut_color::mask::CHROMA_RAMP;
 use gamut_color::{SourceSpace, acescct, basic, hue, wheels};
+use gamut_core::CropRect;
 use gamut_core::mask::{
     ColourRange, LinearGradient, LuminanceRange, MAX_RADIUS, MIN_RADIUS, MaskSource, RadialGradient,
 };
 use gamut_media::Photo;
 
 use crate::app::Session;
+use crate::view::Placement;
 
 /// The radius of a handle in points, and of the area that grabs it.
 const HANDLE_RADIUS: f32 = 6.0;
@@ -46,11 +49,60 @@ const PICK_LUMINANCE_WIDTH: f32 = 0.1;
 /// normalised to the uncropped photo, as a mask stores them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PictureMap {
-    /// The rectangle the whole photo is drawn in, in points.
+    /// The rectangle the whole photo occupies, in points. Zoomed in, it is
+    /// far larger than the tab.
     pub image: Rect,
+    /// The rectangle of the tab: what of the photo can be seen and touched.
+    pub visible: Rect,
 }
 
 impl PictureMap {
+    /// The map of a placed view in a tab.
+    pub fn new(placement: &Placement, tab: Rect) -> Self {
+        PictureMap {
+            image: placement.image,
+            visible: tab,
+        }
+    }
+
+    /// The map of a photo that is seen whole in `image`.
+    pub fn whole(image: Rect) -> Self {
+        PictureMap {
+            image,
+            visible: image,
+        }
+    }
+
+    /// A rectangle of the photo, such as the crop, in points.
+    pub fn rect_to_screen(&self, rect: CropRect) -> Rect {
+        Rect::from_min_max(
+            self.to_screen([rect.x, rect.y]),
+            self.to_screen([rect.x + rect.width, rect.y + rect.height]),
+        )
+    }
+
+    /// A movement on the screen as a movement on the photo.
+    pub fn delta_to_picture(&self, delta: Vec2) -> [f32; 2] {
+        [
+            delta.x / self.image.width().max(1e-6),
+            delta.y / self.image.height().max(1e-6),
+        ]
+    }
+
+    /// What a painter of the picture clips to: the photo with `margin`
+    /// around it, no further than the same margin around the tab.
+    pub fn clip(&self, margin: f32) -> Rect {
+        self.image
+            .expand(margin)
+            .intersect(self.visible.expand(margin))
+    }
+
+    /// The part of `area` that can be touched, when any of it can.
+    pub fn touchable(&self, area: Rect) -> Option<Rect> {
+        let seen = area.intersect(self.visible);
+        (seen.width() > 0.0 && seen.height() > 0.0).then_some(seen)
+    }
+
     /// The picture-to-screen mapping: a normalised position in points.
     pub fn to_screen(&self, at: [f32; 2]) -> Pos2 {
         Pos2::new(
@@ -231,10 +283,17 @@ pub fn picked(source: &MaskSource, px: [f32; 3]) -> MaskSource {
     }
 }
 
-fn handle(ui: &egui::Ui, at: Pos2, id: egui::Id) -> egui::Response {
+/// The grab area of a handle. A handle scrolled out of the tab cannot be
+/// grabbed, but one already in the hand keeps following the pointer there.
+fn handle(ui: &egui::Ui, map: &PictureMap, at: Pos2, id: egui::Id) -> Option<egui::Response> {
+    if !map.visible.contains(at) && !ui.ctx().is_being_dragged(id) {
+        return None;
+    }
     let area = Rect::from_center_size(at, Vec2::splat(GRAB_RADIUS * 2.0));
-    ui.interact(area, id, Sense::drag())
-        .on_hover_cursor(CursorIcon::Grab)
+    Some(
+        ui.interact(area, id, Sense::drag())
+            .on_hover_cursor(CursorIcon::Grab),
+    )
 }
 
 fn paint_handle(painter: &egui::Painter, at: Pos2, filled: bool, hot: bool) {
@@ -270,7 +329,9 @@ fn linear_handles(
     let mut changed = false;
     let mut hot = [false; 2];
     for (k, point) in [&mut moved.start, &mut moved.end].into_iter().enumerate() {
-        let response = handle(ui, map.to_screen(*point), id.with(k));
+        let Some(response) = handle(ui, map, map.to_screen(*point), id.with(k)) else {
+            continue;
+        };
         hot[k] = response.hovered() || response.dragged();
         if response.dragged()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -279,7 +340,7 @@ fn linear_handles(
             changed = true;
         }
     }
-    let painter = ui.painter().with_clip_rect(map.image.expand(40.0));
+    let painter = ui.painter().with_clip_rect(map.clip(40.0));
     let (start, end) = (map.to_screen(moved.start), map.to_screen(moved.end));
     paint_line(&painter, [start, end]);
     let along = end - start;
@@ -307,7 +368,9 @@ fn radial_gradient_handles(
     let places = [at.centre, at.radius_x, at.radius_y, at.rotation];
     let mut hot = [false; 4];
     for (k, place) in places.into_iter().enumerate() {
-        let response = handle(ui, place, id.with(k));
+        let Some(response) = handle(ui, map, place, id.with(k)) else {
+            continue;
+        };
         hot[k] = response.hovered() || response.dragged();
         let Some(pointer) = response
             .interact_pointer_pos()
@@ -323,7 +386,7 @@ fn radial_gradient_handles(
         }
         changed = true;
     }
-    let painter = ui.painter().with_clip_rect(map.image.expand(40.0));
+    let painter = ui.painter().with_clip_rect(map.clip(40.0));
     let outline = radial_outline(map, &moved);
     painter.add(egui::Shape::line(
         outline.clone(),
@@ -368,8 +431,12 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
         session.adjust.picking = None;
     }
     if let Some(component) = armed {
+        // The click lands only on the part of the photo that is seen.
+        let Some(area) = map.touchable(map.image) else {
+            return;
+        };
         let response = ui
-            .interact(map.image, base.with("pick"), Sense::click())
+            .interact(area, base.with("pick"), Sense::click())
             .on_hover_cursor(CursorIcon::Crosshair);
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -417,11 +484,85 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::{View, Zoom};
 
     fn map() -> PictureMap {
-        PictureMap {
-            image: Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(400.0, 200.0)),
+        PictureMap::whole(Rect::from_min_size(
+            Pos2::new(100.0, 50.0),
+            Vec2::new(400.0, 200.0),
+        ))
+    }
+
+    /// A 6000 by 4000 photo in a 900 by 700 tab at a scale, with a point of
+    /// the photo off its middle in the middle of the tab.
+    fn zoomed(scale: f32) -> PictureMap {
+        let tab = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0));
+        let view = View {
+            zoom: Zoom::Scale(scale),
+            centre: [0.31, 0.64],
+        };
+        PictureMap::new(&view.place(tab, (6000, 4000), 1.0), tab)
+    }
+
+    #[test]
+    fn the_map_of_a_fit_view_is_the_image_rectangle_of_before() {
+        let tab = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0));
+        let map = PictureMap::new(&View::default().place(tab, (6000, 4000), 1.0), tab);
+        let before = Rect::from_center_size(
+            tab.center(),
+            crate::viewer::fit_aspect(tab.size(), [6000.0, 4000.0]),
+        );
+        assert_eq!(map.image, before);
+        assert_eq!(map.visible, tab);
+        // Nothing the old painters reached is cut: their clip is unchanged.
+        assert_eq!(map.clip(12.0), before.expand(12.0));
+        assert_eq!(map.clip(40.0), before.expand(40.0));
+    }
+
+    #[test]
+    fn the_picture_round_trips_at_100_and_400_percent_off_centre() {
+        for scale in [1.0, 4.0] {
+            let map = zoomed(scale);
+            assert_eq!(map.image.size(), Vec2::new(6000.0, 4000.0) * scale);
+            // The point of the view is in the middle of the tab.
+            assert!(near(map.to_screen([0.31, 0.64]), map.visible.center()));
+            for at in [[0.0, 0.0], [0.31, 0.64], [0.3, 0.7], [1.0, 1.0]] {
+                let back = map.to_picture(map.to_screen(at));
+                assert!((back[0] - at[0]).abs() < 1e-5 && (back[1] - at[1]).abs() < 1e-5);
+            }
+            let pointer = map.visible.center() + Vec2::new(133.0, -77.0);
+            assert!(near(map.to_screen(map.to_picture(pointer)), pointer));
         }
+    }
+
+    #[test]
+    fn the_visible_rectangle_is_the_tab() {
+        let map = zoomed(4.0);
+        assert_eq!(
+            map.visible,
+            Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(900.0, 700.0))
+        );
+        // Painters stop a margin past the tab, however large the photo is.
+        assert_eq!(map.clip(40.0), map.visible.expand(40.0));
+        // Only what is inside the tab can be touched.
+        assert_eq!(map.touchable(map.image), Some(map.visible));
+        let off = Rect::from_center_size(map.to_screen([0.9, 0.1]), Vec2::splat(22.0));
+        assert_eq!(map.touchable(off), None);
+    }
+
+    #[test]
+    fn a_rectangle_and_a_movement_of_the_photo_follow_the_map() {
+        let map = map();
+        let crop = CropRect {
+            x: 0.25,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        let on_screen = map.rect_to_screen(crop);
+        assert_eq!(on_screen.min, Pos2::new(200.0, 50.0));
+        assert_eq!(on_screen.max, Pos2::new(400.0, 250.0));
+        assert_eq!(map.delta_to_picture(Vec2::new(40.0, -20.0)), [0.1, -0.1]);
     }
 
     fn near(a: Pos2, b: Pos2) -> bool {
