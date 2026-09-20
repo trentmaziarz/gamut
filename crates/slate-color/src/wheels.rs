@@ -7,19 +7,31 @@
 //! point becomes a per-channel tint on the hue basis of [`crate::hue`], with
 //! zero mean across channels, so moving a wheel never changes the overall
 //! brightness; the luminance slider moves all three channels together.
+//!
+//! Each wheel is weighted per pixel by the luminance of the ACEScct pixel on
+//! the normalised axis, so the shadows wheel tints the shadows and leaves the
+//! highlights alone: the offset fades out by [`SHADOWS_END`], the slope fades
+//! in from [`HIGHLIGHTS_START`], and the power follows a bell around the
+//! middle of the axis.
 
 use slate_core::look::{Wheel, Wheels};
 
-use crate::hue;
+use crate::{acescct, basic, hue};
 
 /// The offset at full deflection.
-pub const OFFSET_RANGE: f32 = 0.1;
+pub const OFFSET_RANGE: f32 = 0.033;
 
 /// The slope runs from 1 minus this to 1 plus this.
-pub const SLOPE_RANGE: f32 = 0.5;
+pub const SLOPE_RANGE: f32 = 0.17;
 
 /// The power runs from 2 to the minus this to 2 to the plus this.
-pub const POWER_STOPS: f32 = 1.0;
+pub const POWER_STOPS: f32 = 0.33;
+
+/// The shadows weight is 1 at black and 0 from here on the normalised axis.
+pub const SHADOWS_END: f32 = 0.66;
+
+/// The highlights weight is 0 up to here and 1 at diffuse white.
+pub const HIGHLIGHTS_START: f32 = 0.33;
 
 /// Scales the basis so a disc point at the rim toward red tints by
 /// (1, -0.5, -0.5): the square root of 3 over 2.
@@ -67,12 +79,36 @@ pub fn deflection(wheel: &Wheel) -> [f32; 3] {
     tint(wheel.x, wheel.y).map(|t| (t + luminance).clamp(-1.0, 1.0))
 }
 
-/// The CDL on one ACEScct pixel. The base of the power is clamped at 0.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The position of an ACEScct pixel on the normalised axis by its luminance:
+/// 0 at black, 1 at diffuse white, clamped.
+pub fn tone(v: [f32; 3]) -> f32 {
+    acescct::normalise(basic::luma(v)).clamp(0.0, 1.0)
+}
+
+/// The weights of the shadows, midtones and highlights wheels at `n` on the
+/// normalised axis, in that order.
+pub fn weights(n: f32) -> [f32; 3] {
+    [
+        1.0 - smoothstep(0.0, SHADOWS_END, n),
+        smoothstep(0.0, 1.0, 1.0 - (2.0 * n - 1.0).abs()),
+        smoothstep(HIGHLIGHTS_START, 1.0, n),
+    ]
+}
+
+/// The CDL on one ACEScct pixel, each parameter weighted by the tone of the
+/// pixel. The base of the power is clamped at 0.
 pub fn apply(v: [f32; 3], cdl: &Cdl) -> [f32; 3] {
+    let [shadows, midtones, highlights] = weights(tone(v));
     [0, 1, 2].map(|c| {
-        (v[c] * cdl.slope[c] + cdl.offset[c])
-            .max(0.0)
-            .powf(cdl.power[c])
+        let slope = 1.0 + highlights * (cdl.slope[c] - 1.0);
+        let offset = shadows * cdl.offset[c];
+        let power = 1.0 + midtones * (cdl.power[c] - 1.0);
+        (v[c] * slope + offset).max(0.0).powf(power)
     })
 }
 
@@ -125,8 +161,11 @@ mod tests {
         for v in PIXELS {
             let out = apply(v, &cdl);
             assert!((mean(out) - mean(v)).abs() < 1e-6, "{v:?} to {out:?}");
-            assert_ne!(out, v);
+            if tone(v) < SHADOWS_END {
+                assert_ne!(out, v);
+            }
         }
+        assert!(PIXELS.iter().any(|v| tone(*v) < SHADOWS_END));
     }
 
     #[test]
@@ -154,7 +193,7 @@ mod tests {
             },
             ..Wheels::default()
         });
-        assert_eq!(lift.offset, [0.05; 3]);
+        assert_eq!(lift.offset, [OFFSET_RANGE * 0.5; 3]);
         let gamma = Cdl::new(&Wheels {
             midtones: Wheel {
                 luminance: 100.0,
@@ -162,8 +201,81 @@ mod tests {
             },
             ..Wheels::default()
         });
-        assert_eq!(gamma.power, [0.5; 3]);
+        assert_eq!(gamma.power, [2f32.powf(-POWER_STOPS); 3]);
         let out = apply([0.4; 3], &gamma);
         assert!(out[0] > 0.4);
+    }
+
+    #[test]
+    fn the_ranges_are_a_third_of_the_pure_cdl_ranges() {
+        assert_eq!(OFFSET_RANGE, 0.033);
+        assert_eq!(SLOPE_RANGE, 0.17);
+        assert_eq!(POWER_STOPS, 0.33);
+        assert_eq!(SHADOWS_END, 0.66);
+        assert_eq!(HIGHLIGHTS_START, 0.33);
+    }
+
+    #[test]
+    fn the_three_weights_stay_within_0_and_1() {
+        for step in 0..=1000 {
+            let n = step as f32 / 1000.0;
+            for w in weights(n) {
+                assert!((0.0..=1.0).contains(&w), "weight {w} at {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_shadows_weight_is_1_at_black_and_0_from_its_end() {
+        assert_eq!(weights(0.0)[0], 1.0);
+        for n in [SHADOWS_END, 0.7, 0.9, 1.0] {
+            assert_eq!(weights(n)[0], 0.0, "at {n}");
+        }
+        assert!(weights(0.3)[0] > 0.0 && weights(0.3)[0] < 1.0);
+    }
+
+    #[test]
+    fn the_highlights_weight_is_0_up_to_its_start_and_1_at_white() {
+        for n in [0.0, 0.2, HIGHLIGHTS_START] {
+            assert_eq!(weights(n)[2], 0.0, "at {n}");
+        }
+        assert_eq!(weights(1.0)[2], 1.0);
+    }
+
+    #[test]
+    fn the_midtones_weight_is_a_bell_around_the_middle() {
+        assert_eq!(weights(0.5)[1], 1.0);
+        assert_eq!(weights(0.0)[1], 0.0);
+        assert_eq!(weights(1.0)[1], 0.0);
+        assert!((weights(0.25)[1] - weights(0.75)[1]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_tone_of_a_pixel_is_clamped_to_the_axis() {
+        assert_eq!(tone([0.0; 3]), 0.0);
+        assert_eq!(tone([2.0; 3]), 1.0);
+        let middle = acescct::denormalise(0.5);
+        assert!((tone([middle; 3]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_deflected_shadows_wheel_leaves_a_highlight_pixel_unchanged() {
+        let cdl = Cdl::new(&Wheels {
+            shadows: Wheel {
+                x: -0.5,
+                y: -0.3,
+                luminance: 40.0,
+            },
+            ..Wheels::default()
+        });
+        let level = acescct::denormalise(0.9);
+        let v = [level + 0.02, level, level - 0.02];
+        assert!((tone(v) - 0.9).abs() < 0.01);
+        let out = apply(v, &cdl);
+        for c in 0..3 {
+            assert!((out[c] - v[c]).abs() < 1e-6, "{v:?} to {out:?}");
+        }
+        let dark = [acescct::denormalise(0.1); 3];
+        assert_ne!(apply(dark, &cdl), dark);
     }
 }

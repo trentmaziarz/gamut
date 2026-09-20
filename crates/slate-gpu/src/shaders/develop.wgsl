@@ -107,6 +107,10 @@ const HUE_CENTRES: array<f32, 8> = array<f32, 8>(0.40264693, 0.726648, 1.0599453
 const CHROMA_FLOOR: f32 = 0.01;
 const CHROMA_FULL: f32 = 0.012;
 
+// wheels.rs
+const SHADOWS_END: f32 = 0.66;
+const HIGHLIGHTS_START: f32 = 0.33;
+
 fn luma(px: vec3<f32>) -> f32 {
     return dot(px, LUMA);
 }
@@ -241,7 +245,14 @@ fn hsl(v: vec3<f32>) -> vec3<f32> {
 }
 
 fn wheels(v: vec3<f32>) -> vec3<f32> {
-    return pow(max(v * u.cdl_slope.rgb + u.cdl_offset.rgb, vec3<f32>(0.0)), u.cdl_power.rgb);
+    let n = clamp((luma(v) - ACES_BLACK) / (ACES_WHITE - ACES_BLACK), 0.0, 1.0);
+    let shadows = 1.0 - smoothstep(0.0, SHADOWS_END, n);
+    let midtones = smoothstep(0.0, 1.0, 1.0 - abs(2.0 * n - 1.0));
+    let highlights = smoothstep(HIGHLIGHTS_START, 1.0, n);
+    let slope = vec3<f32>(1.0) + highlights * (u.cdl_slope.rgb - vec3<f32>(1.0));
+    let offset = shadows * u.cdl_offset.rgb;
+    let power = vec3<f32>(1.0) + midtones * (u.cdl_power.rgb - vec3<f32>(1.0));
+    return pow(max(v * slope + offset, vec3<f32>(0.0)), power);
 }
 
 fn vibrance_saturation(px: vec3<f32>, vibrance: f32, saturation: f32) -> vec3<f32> {

@@ -1498,7 +1498,7 @@ mod tests {
             let to = rest.find(';').expect("a semicolon");
             rest[from..to].trim().parse().expect("a number")
         };
-        use slate_color::{acescct, dehaze, hsl, local};
+        use slate_color::{acescct, dehaze, hsl, local, wheels};
         assert_eq!(value("ACES_LINEAR_CUT"), acescct::LINEAR_CUT);
         assert_eq!(value("ACES_ENCODED_CUT"), acescct::ENCODED_CUT);
         assert_eq!(value("ACES_SLOPE"), acescct::SLOPE);
@@ -1511,6 +1511,8 @@ mod tests {
         assert_eq!(value("RECOVERY_FLOOR"), dehaze::RECOVERY_FLOOR);
         assert_eq!(value("CHROMA_FLOOR"), hsl::CHROMA_FLOOR);
         assert_eq!(value("CHROMA_FULL"), hsl::CHROMA_FULL);
+        assert_eq!(value("SHADOWS_END"), wheels::SHADOWS_END);
+        assert_eq!(value("HIGHLIGHTS_START"), wheels::HIGHLIGHTS_START);
     }
 
     #[test]
