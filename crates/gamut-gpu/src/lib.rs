@@ -17,7 +17,7 @@ pub mod readback;
 pub mod test_image;
 pub mod video;
 
-pub use develop::Develop;
+pub use develop::{Develop, ViewWindow};
 pub use headless::Headless;
 pub use readback::{PendingReadback, Readback};
 pub use test_image::TestImage;

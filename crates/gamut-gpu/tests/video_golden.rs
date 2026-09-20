@@ -11,7 +11,7 @@ use gamut_color::basic;
 use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
 use gamut_core::{Adjustments, CropRect, PhotoEdit};
 use gamut_gpu::video::P010_FEATURE;
-use gamut_gpu::{Develop, Headless, Readback};
+use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
 use gamut_media::VideoFrame;
 use half::f16;
 
@@ -312,6 +312,72 @@ fn a_windowed_render_matches_the_full_render() {
         .unwrap_or(0);
     println!("windowed render against the full render: max difference {max}");
     assert!(max <= 1, "max difference {max}");
+}
+
+/// A zoomed viewer on a video frame: the padded window with the visible
+/// part taken out of it shows what the full render shows there, at 100 and
+/// at 200 percent of a fitted size of 32.
+#[test]
+fn a_zoomed_window_of_a_frame_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let frame = synthetic_frame(PlaneFormat::Nv12);
+    let edit = PhotoEdit::from(Adjustments {
+        highlights: -60.0,
+        shadows: 40.0,
+        clarity: 40.0,
+        texture: 30.0,
+        dehaze: 25.0,
+        ..Adjustments::default()
+    });
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_video_frame(&frame, SDR, 0);
+    let views = [
+        ViewWindow {
+            full: (32, 32),
+            window: (8, 6, 18, 20),
+            visible: (11, 9, 10, 12),
+        },
+        ViewWindow {
+            full: (SIZE, SIZE),
+            window: (12, 10, 40, 40),
+            visible: (20, 18, 24, 20),
+        },
+    ];
+    for view in views {
+        let (x, y, w, h) = view.visible;
+        let (fw, fh) = (view.full.0 as f32, view.full.1 as f32);
+        let crop = CropRect {
+            x: x as f32 / fw,
+            y: y as f32 / fh,
+            width: w as f32 / fw,
+            height: h as f32 / fh,
+        };
+        let full = develop
+            .render(&edit, crop, view.full, (w, h))
+            .expect("a source is set");
+        let full = readback.read(&gpu.device, &gpu.queue, full, w, h);
+        let zoomed = develop.render_view(&edit, &view).expect("a source is set");
+        let zoomed = readback.read(&gpu.device, &gpu.queue, zoomed, w, h);
+        let max = full
+            .iter()
+            .zip(&zoomed)
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .max()
+            .unwrap_or(0);
+        println!(
+            "zoomed window of a frame at {:?} against the full render: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+    }
 }
 
 #[test]

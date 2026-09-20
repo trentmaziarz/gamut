@@ -791,6 +791,7 @@ impl Develop {
             output_size,
             CropRect::FULL,
             render_size,
+            crop,
         )
     }
 
@@ -825,12 +826,62 @@ impl Develop {
             height: crop.height / window.height,
         };
         let window_size = ((x1 - x0).round() as u32, (y1 - y0).round() as u32);
-        self.render_window(edit, inner, window_size, output_size, window, full)
+        self.render_window(edit, inner, window_size, output_size, window, full, inner)
+    }
+
+    /// Renders what a zoomed viewer shows. The head-pass products and the
+    /// develop pass cover the whole of `view.window`, a padded rectangle
+    /// around what is seen, and the output takes `view.visible` out of it
+    /// one to one. A pan that stays inside the window therefore redraws the
+    /// output pass only, and a slider step the develop pass over the window.
+    /// The frame holds the window plus the reach of the widest head pass on
+    /// every side, so the picture is the one [`render`](Self::render) gives
+    /// at `view.full`.
+    ///
+    /// `view.full` must not pass the size of the source: above one source
+    /// pixel per output pixel the blur radius meets its cap and the look
+    /// would change with the zoom. A viewer magnifies the 100 percent render
+    /// instead.
+    pub fn render_view(
+        &mut self,
+        edit: &PhotoEdit,
+        view: &ViewWindow,
+    ) -> Option<&wgpu::TextureView> {
+        let full = (view.full.0.max(1), view.full.1.max(1));
+        let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
+        let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
+        let reach = head_pass_reach(full);
+        let (x0, y0) = (wx.saturating_sub(reach), wy.saturating_sub(reach));
+        let (x1, y1) = ((wx + ww + reach).min(full.0), (wy + wh + reach).min(full.1));
+        let frame = ((x1 - x0) as f32, (y1 - y0) as f32);
+        let window = CropRect {
+            x: x0 as f32 / full.0 as f32,
+            y: y0 as f32 / full.1 as f32,
+            width: frame.0 / full.0 as f32,
+            height: frame.1 / full.1 as f32,
+        };
+        let within = |(x, y, w, h): (u32, u32, u32, u32)| CropRect {
+            x: (x - x0) as f32 / frame.0,
+            y: (y - y0) as f32 / frame.1,
+            width: w as f32 / frame.0,
+            height: h as f32 / frame.1,
+        };
+        self.render_window(
+            edit,
+            within((vx, vy, vw, vh)),
+            (x1 - x0, y1 - y0),
+            (vw, vh),
+            window,
+            full,
+            within((wx, wy, ww, wh)),
+        )
     }
 
     /// The shared body: renders `window` of the source at `render_size`
-    /// with the blur sigma of `sigma_size`, then crops `crop` of that
-    /// render into the output.
+    /// with the blur sigma of `sigma_size`, draws the head-pass products and
+    /// the develop pass over `products` of that render, then crops `crop`
+    /// of it into the output. `crop` lies inside `products`.
+    #[allow(clippy::too_many_arguments)]
     fn render_window(
         &mut self,
         edit: &PhotoEdit,
@@ -839,6 +890,7 @@ impl Develop {
         output_size: (u32, u32),
         window: CropRect,
         sigma_size: (u32, u32),
+        products: CropRect,
     ) -> Option<&wgpu::TextureView> {
         let source = self.source.as_ref()?;
         let (width, height) = (render_size.0.max(1), render_size.1.max(1));
@@ -905,11 +957,11 @@ impl Develop {
                 &frame.working.view,
                 None,
             );
-            // Only the columns under the crop are read by the vertical
-            // pass, and only the crop by the develop pass, so the blur and
-            // develop passes are scissored to the crop plus a margin.
-            let columns = scissor_for(crop, (width, height), true);
-            let region = scissor_for(crop, (width, height), false);
+            // Only the columns under the products region are read by the
+            // vertical pass, and only that region by the develop pass, so
+            // the blur and develop passes are scissored to it plus a margin.
+            let columns = scissor_for(products, (width, height), true);
+            let region = scissor_for(products, (width, height), false);
             draw(
                 &mut encoder,
                 "blur h",
@@ -931,8 +983,8 @@ impl Develop {
         // leaves 0 and again only after the head passes ran or the scissor
         // moved, never on a plain slider change.
         let frame = self.frame.as_mut().expect("frame built above");
-        let columns = scissor_for(crop, (width, height), true);
-        let region = scissor_for(crop, (width, height), false);
+        let columns = scissor_for(products, (width, height), true);
+        let region = scissor_for(products, (width, height), false);
         if rerun || frame.products_region != Some(region) {
             frame.texture_ready = false;
             frame.transmission_ready = false;
@@ -1559,6 +1611,39 @@ fn write_table_row(queue: &wgpu::Queue, table: &wgpu::Texture, row: u32, tables:
             depth_or_array_layers: 1,
         },
     );
+}
+
+/// What a zoomed viewer shows, in pixels of the whole picture rendered at
+/// `full`. Rectangles are x, y, width, height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewWindow {
+    /// The size the whole picture would have at this zoom, never above the
+    /// size of the source.
+    pub full: (u32, u32),
+    /// The padded rectangle the products and the develop pass cover.
+    pub window: (u32, u32, u32, u32),
+    /// The part of `window` the output shows, one to one.
+    pub visible: (u32, u32, u32, u32),
+}
+
+/// How far the widest head pass reads around a pixel at a render of `full`:
+/// the base blur, the texture blur, or the dark channel patch plus its
+/// smoothing.
+pub fn head_pass_reach(full: (u32, u32)) -> u32 {
+    let base = basic::blur_radius(basic::base_sigma(full.0, full.1));
+    let texture = basic::blur_radius(local::texture_sigma(full.0, full.1));
+    let haze = dehaze::patch_radius(full.0, full.1)
+        + basic::blur_radius(dehaze::smoothing_sigma(full.0, full.1));
+    base.max(texture).max(haze).max(0) as u32
+}
+
+/// `rect` moved and shrunk until it lies inside `bounds`, never empty.
+fn clamp_rect(rect: (u32, u32, u32, u32), bounds: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (bx, by, bw, bh) = (bounds.0, bounds.1, bounds.2.max(1), bounds.3.max(1));
+    let (w, h) = (rect.2.clamp(1, bw), rect.3.clamp(1, bh));
+    let x = rect.0.clamp(bx, bx + bw - w);
+    let y = rect.1.clamp(by, by + bh - h);
+    (x, y, w, h)
 }
 
 /// The pixels the blur must reach: the crop with a margin of two pixels

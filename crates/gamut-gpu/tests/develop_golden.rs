@@ -14,7 +14,7 @@ use gamut_core::mask::{
     ColourRange, Component, LinearGradient, LuminanceRange, MaskOp, MaskSource, RadialGradient,
 };
 use gamut_core::{Adjustments, CropRect, ExportPreset, Mask, PhotoEdit};
-use gamut_gpu::{Develop, Headless, Readback};
+use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
 use gamut_media::Photo;
 use half::f16;
 
@@ -1013,6 +1013,199 @@ fn masks_under_a_crop_window_match_the_full_render() {
     println!("masked windowed render against the full render: max difference {max}");
     assert!(max <= 1, "max difference {max}");
     assert_ne!(windowed, plain, "the masks show inside the window");
+}
+
+/// The edit the zoomed window tests develop: everything on in the global
+/// edit, a positional mask and a range mask over it.
+fn zoomed_edit() -> PhotoEdit {
+    let mut edit = everything_global();
+    let mut radial = exposure_mask("Radial", radial_source());
+    radial.adjust.clarity = 30.0;
+    let mut range = exposure_mask("Luminance", luminance_source());
+    range.adjust.saturation = -50.0;
+    edit.masks = vec![radial, range];
+    edit
+}
+
+/// The whole picture at 100 and at 200 percent of a fitted size of 32, with
+/// the padded window and the visible part a zoomed viewer would ask for.
+fn zoomed_views() -> [ViewWindow; 2] {
+    [
+        ViewWindow {
+            full: (32, 32),
+            window: (8, 6, 18, 20),
+            visible: (11, 9, 10, 12),
+        },
+        ViewWindow {
+            full: (SIZE, SIZE),
+            window: (12, 10, 40, 40),
+            visible: (20, 18, 24, 20),
+        },
+    ]
+}
+
+/// The part of the full render at `view.full` that `view.visible` names.
+fn full_render_of(
+    develop: &mut Develop,
+    gpu: &Headless,
+    readback: &Readback,
+    edit: &PhotoEdit,
+    view: &ViewWindow,
+) -> Vec<u8> {
+    let (x, y, w, h) = view.visible;
+    let (fw, fh) = (view.full.0 as f32, view.full.1 as f32);
+    let crop = CropRect {
+        x: x as f32 / fw,
+        y: y as f32 / fh,
+        width: w as f32 / fw,
+        height: h as f32 / fh,
+    };
+    let full = develop
+        .render(edit, crop, view.full, (w, h))
+        .expect("a source is set");
+    readback.read(&gpu.device, &gpu.queue, full, w, h)
+}
+
+fn view_render_of(
+    develop: &mut Develop,
+    gpu: &Headless,
+    readback: &Readback,
+    edit: &PhotoEdit,
+    view: &ViewWindow,
+) -> Vec<u8> {
+    let zoomed = develop.render_view(edit, view).expect("a source is set");
+    readback.read(
+        &gpu.device,
+        &gpu.queue,
+        zoomed,
+        view.visible.2,
+        view.visible.3,
+    )
+}
+
+fn max_difference(a: &[u8], b: &[u8]) -> i32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// What a zoomed viewer renders, a padded window of the source with the
+/// visible part taken out of it, is the same picture the full render shows
+/// there: the sigmas come from the full size and the masks lie on the photo.
+#[test]
+fn a_zoomed_window_matches_the_full_render_at_100_and_200_percent_of_the_fit() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let edit = zoomed_edit();
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    for view in zoomed_views() {
+        let full = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let plain = view_render_of(&mut develop, &gpu, &readback, &PhotoEdit::default(), &view);
+        let max = max_difference(&full, &zoomed);
+        println!(
+            "zoomed window at {:?} against the full render: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+        assert_ne!(zoomed, plain, "the edit shows inside the window");
+    }
+}
+
+/// A pan that stays inside the padded window moves the output crop and
+/// nothing else: no mask alpha is drawn again, and the picture is still the
+/// full render's. A window somewhere else draws them again.
+#[test]
+fn a_pan_inside_the_zoomed_window_redraws_no_product_and_matches() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let edit = zoomed_edit();
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let [_, first] = zoomed_views();
+    view_render_of(&mut develop, &gpu, &readback, &edit, &first);
+    let builds = develop.mask_alpha_builds();
+    assert_eq!(builds, 2, "one alpha per mask");
+    for visible in [(12, 10, 24, 20), (28, 30, 24, 20), (21, 19, 24, 20)] {
+        let panned = ViewWindow { visible, ..first };
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &panned);
+        assert_eq!(
+            develop.mask_alpha_builds(),
+            builds,
+            "a pan to {visible:?} inside the window"
+        );
+        // The reference replaces the frame, so it is drawn on its own graph.
+        let mut other = Develop::new(&gpu.device, &gpu.queue);
+        other.set_source(&photo);
+        let full = full_render_of(&mut other, &gpu, &readback, &edit, &panned);
+        let max = max_difference(&full, &zoomed);
+        println!("panned to {visible:?} against the full render: max difference {max}");
+        assert!(max <= 1, "max difference {max} at {visible:?}");
+    }
+    let moved = ViewWindow {
+        window: (20, 20, 40, 40),
+        visible: (30, 30, 24, 20),
+        ..first
+    };
+    view_render_of(&mut develop, &gpu, &readback, &edit, &moved);
+    assert_eq!(
+        develop.mask_alpha_builds(),
+        builds + 2,
+        "a window somewhere else draws both alphas again"
+    );
+}
+
+/// The red overlay of a mask under a zoomed window is the overlay the full
+/// render shows there.
+#[test]
+fn the_overlay_under_a_zoomed_window_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let edit = zoomed_edit();
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    for view in zoomed_views() {
+        develop.set_overlay(None);
+        let bare = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        develop.set_overlay(Some(0));
+        let full = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let max = max_difference(&full, &zoomed);
+        println!(
+            "overlay under a zoomed window at {:?}: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+        assert_ne!(zoomed, bare, "the overlay shows inside the window");
+    }
 }
 
 /// The alpha of a mask is a head-pass product: a slider of the mask, its
