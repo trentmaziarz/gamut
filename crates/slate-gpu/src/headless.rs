@@ -18,8 +18,12 @@ impl Headless {
     pub fn new() -> Option<Self> {
         let instance =
             Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter =
-            request_adapter(&instance, false).or_else(|| request_adapter(&instance, true))?;
+        // SLATE_FALLBACK_ADAPTER=1 takes the fallback adapter even when
+        // hardware exists, so a golden test that is red on a runner can be
+        // run on the same software adapter on a development machine.
+        let fallback_first = std::env::var_os("SLATE_FALLBACK_ADAPTER").is_some_and(|v| v == "1");
+        let adapter = request_adapter(&instance, fallback_first)
+            .or_else(|| request_adapter(&instance, !fallback_first))?;
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("slate headless device"),
             required_features: crate::video::wanted_features(&adapter),
