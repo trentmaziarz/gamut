@@ -54,11 +54,13 @@ use gamut_color::mask::{self as mask_twin, Geometry};
 use gamut_color::matrices;
 use gamut_color::video::VideoColour;
 use gamut_color::wheels::Cdl;
+use gamut_core::brush::Brush;
 use gamut_core::look::ToneCurves;
 use gamut_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource};
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
+use crate::brush_layer::{BrushPass, Drawn, Layers};
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
@@ -240,7 +242,9 @@ impl MaskUniform {
     /// rotation, the inner share of a feather, the floored falloffs.
     fn new(mask: &Mask, geometry: &Geometry) -> Self {
         let mut components = [MaskComponentUniform::zeroed(); MAX_COMPONENTS];
+        let mut layer = 0;
         for (slot, component) in components.iter_mut().zip(&mask.components) {
+            let mut spare = 0;
             let (kind, a, b) = match &component.source {
                 MaskSource::Linear(g) => {
                     (0, [g.start[0], g.start[1], g.end[0], g.end[1]], [0.0; 4])
@@ -274,7 +278,12 @@ impl MaskUniform {
                     ],
                     [0.0; 4],
                 ),
-                MaskSource::Brush(_) => (4, [0.0; 4], [0.0; 4]),
+                MaskSource::Brush(_) => {
+                    // Its layer of the mask's array, in component order.
+                    spare = layer;
+                    layer += 1;
+                    (4, [0.0; 4], [0.0; 4])
+                }
             };
             let op = match component.op {
                 MaskOp::Add => 0,
@@ -282,7 +291,7 @@ impl MaskUniform {
                 MaskOp::Intersect => 2,
             };
             *slot = MaskComponentUniform {
-                header: [kind, op, u32::from(component.invert), 0],
+                header: [kind, op, u32::from(component.invert), spare],
                 a,
                 b,
             };
@@ -399,6 +408,8 @@ struct FrameMask {
     /// head passes reran or the scissor moved. A slider of the mask's
     /// adjustments is no part of the shape, so it never redraws the alpha.
     shape: Option<MaskShape>,
+    /// The layers of the mask's brush components, which `raster_bind` holds.
+    layers: Layers,
     raster_bind: wgpu::BindGroup,
     develop_bind: wgpu::BindGroup,
 }
@@ -423,6 +434,8 @@ pub struct Develop {
     develop: Pass,
     /// `mask.wgsl`: draws the alpha of one mask.
     mask: Pass,
+    /// `brush.wgsl`: stamps the dabs of a painted source into its layer.
+    brush: BrushPass,
     /// `develop.wgsl` through `fs_masked` with alpha blending: develops one
     /// mask over the developed texture.
     masked: Pass,
@@ -450,6 +463,10 @@ pub struct Develop {
     mask_curves_uploaded: [Option<(ToneCurves, ToneCurves)>; MAX_MASKS],
     /// How many mask alphas have been drawn, for the cache test.
     alpha_builds: u64,
+    /// How many brush layers have been drawn whole, and how many times new
+    /// dabs were stamped onto a layer, for the cache test.
+    layer_builds: u64,
+    layer_appends: u64,
     output_uniform: wgpu::Buffer,
     /// The mask of the list shown as a red overlay, when one is.
     overlay: Option<usize>,
@@ -520,7 +537,7 @@ impl Develop {
             "mask",
             include_str!("shaders/mask.wgsl"),
             ALPHA_FORMAT,
-            &[uniform_entry(0), texture_entry(1)],
+            &[uniform_entry(0), texture_entry(1), layers_entry(2)],
         );
         let masked = make_pass_with(
             device,
@@ -592,6 +609,7 @@ impl Develop {
             minimum,
             develop,
             mask,
+            brush: BrushPass::new(device),
             masked,
             output,
             input_uniform: uniform("input uniform", size_of::<InputUniform>() as u64),
@@ -616,6 +634,8 @@ impl Develop {
             curves_uploaded: None,
             mask_curves_uploaded: Default::default(),
             alpha_builds: 0,
+            layer_builds: 0,
+            layer_appends: 0,
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
             overlay: None,
             no_overlay: zero_texel(device, queue),
@@ -771,6 +791,17 @@ impl Develop {
     #[doc(hidden)]
     pub fn mask_alpha_builds(&self) -> u64 {
         self.alpha_builds
+    }
+
+    /// How many brush layers have been stamped whole since the graph was
+    /// built. A layer is kept until its strokes or the window change.
+    pub fn brush_layer_builds(&self) -> u64 {
+        self.layer_builds
+    }
+
+    /// How many times new dabs were stamped onto a layer that was kept.
+    pub fn brush_layer_appends(&self) -> u64 {
+        self.layer_appends
     }
 
     /// The size of the source photo, when one is set.
@@ -1123,16 +1154,29 @@ impl Develop {
             .map(|(index, mask)| (*index, mask, true))
             .chain(only_shown.map(|(index, mask)| (*index, mask, false)))
         {
-            let slot = frame.masks[index].get_or_insert_with(|| {
-                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
-                let raster_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let brushes: Vec<&Brush> = mask
+                .components
+                .iter()
+                .filter_map(|component| match &component.source {
+                    MaskSource::Brush(brush) => Some(brush),
+                    _ => None,
+                })
+                .collect();
+            let raster_bind = |layers: &Layers| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mask bind group"),
                     layout: &self.mask.layout,
                     entries: &[
                         buffer_binding(0, &self.mask_uniforms[index]),
                         texture_binding(1, &frame.working.view),
+                        texture_binding(2, &layers.array),
                     ],
-                });
+                })
+            };
+            let slot = frame.masks[index].get_or_insert_with(|| {
+                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
+                let layers = Layers::new(&self.device, brushes.len(), width, height);
+                let raster_bind = raster_bind(&layers);
                 let develop_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("masked develop bind group"),
                     layout: &self.masked.layout,
@@ -1149,10 +1193,35 @@ impl Develop {
                 FrameMask {
                     alpha,
                     shape: None,
+                    layers,
                     raster_bind,
                     develop_bind,
                 }
             });
+            // A layer for each brush of the mask. The layers are kept while
+            // the frame is; each is stamped again only when its strokes are
+            // not the ones it holds.
+            if slot.layers.len() != brushes.len() {
+                slot.layers = Layers::new(&self.device, brushes.len(), width, height);
+                slot.raster_bind = raster_bind(&slot.layers);
+                slot.shape = None;
+            }
+            for (layer, brush) in brushes.iter().enumerate() {
+                let drawn = slot.layers.update(
+                    layer,
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &mut self.brush,
+                    brush,
+                    &geometry,
+                );
+                match drawn {
+                    Drawn::Nothing => {}
+                    Drawn::Appended(_) => self.layer_appends += 1,
+                    Drawn::Whole => self.layer_builds += 1,
+                }
+            }
             let shape = mask.shape();
             if slot.shape.as_ref() != Some(&shape) {
                 self.queue.write_buffer(
@@ -1755,6 +1824,20 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// The brush layers of one mask: an array read with `textureLoad`.
+fn layers_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,

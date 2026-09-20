@@ -9,6 +9,7 @@ use gamut_color::SourceSpace;
 use gamut_color::basic;
 use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::{dehaze, local, matrices, transfer};
+use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::look::{Curve, HslRange, Wheel};
 use gamut_core::mask::{
     ColourRange, Component, LinearGradient, LuminanceRange, MaskOp, MaskSource, RadialGradient,
@@ -218,7 +219,8 @@ fn cpu_reference(
         transmission: &transmission,
         geometry: Geometry::full((width, height), (width, height)),
     };
-    mask_twin::develop_image(&image, edit, atmosphere, &store)
+    // A brush layer is a half float the dabs blend into: a store a dab.
+    mask_twin::develop_image_with(&image, edit, atmosphere, &store, &store)
         .into_iter()
         .map(basic::output_srgb8)
         .collect()
@@ -1281,6 +1283,12 @@ fn a_mask_slider_does_not_rebuild_its_alpha_and_a_component_does() {
 /// does, and an export never shows it.
 #[test]
 fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
+    check_overlay(Mask::new("Idle", radial_source()));
+}
+
+/// The overlay of `idle`, a mask that adjusts nothing and covers the middle
+/// of the photo but not its first pixel.
+fn check_overlay(idle: Mask) {
     let _turn = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1290,7 +1298,6 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
     };
     println!("adapter: {}", gpu.describe());
     let photo = synthetic_photo();
-    let idle = Mask::new("Idle", radial_source());
     let mut edit = PhotoEdit::from(Adjustments {
         exposure: 0.3,
         ..Adjustments::default()
@@ -1307,14 +1314,21 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
         .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
         .collect();
     let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
-    let reference = |rounding: Rounding| -> Vec<[u8; 3]> {
+    // The overlay shows the alpha itself, and near black one code of alpha
+    // is six of the output, so the reference takes the unorm store at every
+    // step the conversion is allowed.
+    let reference = |rounding: Rounding, step: f32| -> Vec<[u8; 3]> {
         let stored: Vec<[f32; 3]> = linear
             .iter()
             .map(|px| px.map(|c| half(c, rounding)))
             .collect();
-        let alphas = mask_twin::alpha_image(&idle, &stored, &geometry);
-        let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
         let store = |v: f32| half(v, rounding);
+        let alphas: Vec<f32> =
+            mask_twin::alpha_image_before_the_store(&idle, &stored, &geometry, &store)
+                .into_iter()
+                .map(|alpha| mask_twin::stored_alpha_stepping(alpha, step))
+                .collect();
+        let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
         let base = basic::gaussian_stored(&luma, SIZE, SIZE, basic::base_sigma(SIZE, SIZE), &store);
         let clear = vec![1.0; stored.len()];
         let image = Image {
@@ -1324,7 +1338,7 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
             transmission: &clear,
             geometry,
         };
-        mask_twin::develop_image(&image, &edit, [1.0; 3], &store)
+        mask_twin::develop_image_with(&image, &edit, [1.0; 3], &store, &store)
             .into_iter()
             .zip(alphas)
             .map(|(px, alpha)| {
@@ -1335,10 +1349,11 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
             })
             .collect()
     };
-    let references = [
-        reference(Rounding::Nearest),
-        reference(Rounding::TowardZero),
-    ];
+    let tolerance = mask_twin::UNORM_STEP_TOLERANCE;
+    let references: Vec<Vec<[u8; 3]>> = [Rounding::Nearest, Rounding::TowardZero]
+        .into_iter()
+        .flat_map(|rounding| [-tolerance, 0.0, tolerance].map(|step| reference(rounding, step)))
+        .collect();
 
     let readback = Readback::new(&gpu.device);
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
@@ -1366,7 +1381,7 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
                 .iter()
                 .map(|r| (i32::from(r[i][k]) - i32::from(g[k])).abs())
                 .min()
-                .expect("two references");
+                .expect("six references");
             max = max.max(d);
             sum += d as u64;
         }
@@ -1401,4 +1416,308 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
         .render_export(&edit, CropRect::FULL, ExportPreset::ALL[0])
         .expect("a source is set");
     assert_eq!(shown, hidden);
+}
+
+fn stroke(points: &[[f32; 2]], size: f32, feather: f32, flow: f32) -> Stroke {
+    Stroke {
+        points: points.to_vec(),
+        size,
+        feather,
+        flow,
+        erase: false,
+    }
+}
+
+fn brush_source(strokes: &[Stroke]) -> MaskSource {
+    MaskSource::Brush(Brush {
+        strokes: strokes.iter().map(SharedStroke::new).collect(),
+    })
+}
+
+/// Two crossing strokes of different brushes over the middle of the photo,
+/// one of them built up at a part flow.
+fn painted_strokes() -> Vec<Stroke> {
+    vec![
+        stroke(&[[0.2, 0.3], [0.5, 0.45], [0.8, 0.4]], 0.12, 60.0, 100.0),
+        stroke(&[[0.6, 0.15], [0.55, 0.5], [0.35, 0.85]], 0.08, 30.0, 45.0),
+    ]
+}
+
+fn painted_source() -> MaskSource {
+    brush_source(&painted_strokes())
+}
+
+#[test]
+fn a_brush_mask_matches() {
+    check_masks(
+        "brush mask",
+        &masked(vec![exposure_mask("Brush", painted_source())]),
+    );
+}
+
+#[test]
+fn a_brush_with_an_erase_stroke_matches() {
+    let mut strokes = painted_strokes();
+    strokes.push(Stroke {
+        erase: true,
+        ..stroke(&[[0.3, 0.2], [0.7, 0.7]], 0.07, 50.0, 80.0)
+    });
+    // Painted again after the erase: the order is part of the picture.
+    strokes.push(stroke(&[[0.5, 0.45]], 0.05, 80.0, 60.0));
+    let erased = masked(vec![exposure_mask("Erased", brush_source(&strokes))]);
+    let photo = synthetic_photo();
+    assert_ne!(
+        cpu_reference(&photo, &erased, Rounding::Nearest, 0),
+        cpu_reference(
+            &photo,
+            &masked(vec![exposure_mask("Brush", painted_source())]),
+            Rounding::Nearest,
+            0
+        ),
+        "the erase shows"
+    );
+    check_masks("brush with an erase stroke", &erased);
+}
+
+#[test]
+fn a_brush_at_feather_0_and_at_feather_100_matches() {
+    for feather in [0.0, 100.0] {
+        let strokes = [
+            stroke(&[[0.25, 0.3], [0.7, 0.6]], 0.13, feather, 100.0),
+            stroke(&[[0.3, 0.75]], 0.1, feather, 70.0),
+        ];
+        check_masks(
+            &format!("brush at feather {feather}"),
+            &masked(vec![exposure_mask("Brush", brush_source(&strokes))]),
+        );
+    }
+}
+
+/// A low flow built up by many passes has to keep building: the layer is a
+/// half float because a dab of 5 percent adds under half of an 8 bit code
+/// once the alpha passes 0.96.
+#[test]
+fn a_low_flow_built_up_by_many_strokes_matches() {
+    let pass = stroke(&[[0.3, 0.5], [0.7, 0.5]], 0.15, 40.0, 5.0);
+    let strokes = vec![pass; 20];
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    let mask = exposure_mask("Built up", brush_source(&strokes));
+    let middle = mask_twin::alpha(&mask, [0.5, 0.5], geometry.aspect(), [0.18; 3]);
+    assert!(middle > 0.99, "twenty passes of 5 percent reach {middle}");
+    check_masks("low flow built up", &masked(vec![mask]));
+}
+
+fn brush_and(other: MaskSource, op: MaskOp, brush_first: bool) -> PhotoEdit {
+    let (first, second) = if brush_first {
+        (painted_source(), other)
+    } else {
+        (other, painted_source())
+    };
+    let mut mask = exposure_mask("Both", first);
+    mask.components.push(Component {
+        op,
+        source: second,
+        invert: false,
+    });
+    masked(vec![mask])
+}
+
+#[test]
+fn a_brush_subtracted_from_a_linear_gradient_matches() {
+    let edit = brush_and(linear_source(), MaskOp::Subtract, false);
+    let photo = synthetic_photo();
+    assert_ne!(
+        cpu_reference(&photo, &edit, Rounding::Nearest, 0),
+        cpu_reference(
+            &photo,
+            &masked(vec![exposure_mask("Linear", linear_source())]),
+            Rounding::Nearest,
+            0
+        ),
+        "the brush takes something away"
+    );
+    check_masks("brush subtracted from a linear gradient", &edit);
+}
+
+#[test]
+fn a_brush_intersected_with_a_radial_gradient_matches() {
+    check_masks(
+        "brush intersected with a radial gradient",
+        &brush_and(radial_source(), MaskOp::Intersect, true),
+    );
+}
+
+#[test]
+fn two_brush_components_in_one_mask_match() {
+    let mut mask = exposure_mask("Two brushes", painted_source());
+    mask.components.push(Component::new(linear_source()));
+    mask.components.push(Component {
+        op: MaskOp::Subtract,
+        source: brush_source(&[stroke(&[[0.2, 0.2], [0.8, 0.8]], 0.1, 70.0, 90.0)]),
+        invert: false,
+    });
+    check_masks("two brush components in one mask", &masked(vec![mask]));
+}
+
+#[test]
+fn a_brush_mask_carrying_everything_over_a_global_edit_with_everything_matches() {
+    let mut edit = everything_global();
+    let mut mask = Mask::new("Everything", painted_source());
+    mask.adjust = everything_in_a_mask();
+    mask.opacity = 85.0;
+    edit.masks.push(mask);
+    check_masks("a brush mask carrying everything", &edit);
+}
+
+#[test]
+fn the_overlay_of_a_brush_mask_matches_and_stays_out_of_an_export() {
+    check_overlay(Mask::new("Idle", painted_source()));
+}
+
+/// A brush is laid out on the photo: under a crop window and under a zoomed
+/// window at 100 and at 200 percent of the fit it is where the full render
+/// has it.
+#[test]
+fn a_brush_under_a_crop_window_and_a_zoomed_window_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let mut brush = exposure_mask("Brush", painted_source());
+    brush.adjust.clarity = 30.0;
+    let masks = vec![brush, exposure_mask("Radial", radial_source())];
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+
+    let crop = CropRect {
+        x: 0.25,
+        y: 0.25,
+        width: 0.5,
+        height: 0.5,
+    };
+    let output = (32, 32);
+    // The crop window carries the masks alone, as the crop test of the other
+    // sources does: a crop render has no reach for the blurs of a global
+    // edit, which is what the zoomed window adds.
+    let masks_only = masked(masks.clone());
+    let full = develop
+        .render(&masks_only, crop, (SIZE, SIZE), output)
+        .expect("a source is set");
+    let full = readback.read(&gpu.device, &gpu.queue, full, output.0, output.1);
+    let windowed = develop
+        .render_crop(&masks_only, crop, output)
+        .expect("a source is set");
+    let windowed = readback.read(&gpu.device, &gpu.queue, windowed, output.0, output.1);
+    let max = max_difference(&full, &windowed);
+    println!("brush under a crop window against the full render: max difference {max}");
+    assert!(max <= 1, "max difference {max}");
+
+    let mut edit = everything_global();
+    edit.masks = masks;
+    let mut unpainted = edit.clone();
+    unpainted.masks.remove(0);
+    for view in zoomed_views() {
+        let full = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let without = view_render_of(&mut develop, &gpu, &readback, &unpainted, &view);
+        let max = max_difference(&full, &zoomed);
+        println!(
+            "brush under a zoomed window at {:?} against the full render: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+        assert_ne!(zoomed, without, "the brush shows inside the window");
+    }
+}
+
+/// A brush layer is stamped once and kept: no slider, no opacity and no pan
+/// inside the zoomed window stamps it again; its strokes do.
+#[test]
+fn a_brush_layer_is_kept_until_its_strokes_change() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let mut edit = masked(vec![
+        exposure_mask("Brush", painted_source()),
+        exposure_mask("Radial", radial_source()),
+    ]);
+    let [view, _] = zoomed_views();
+    let mut counts_after = |edit: &PhotoEdit, view: &ViewWindow| -> (u64, u64, u64) {
+        develop.render_view(edit, view).expect("a source is set");
+        (
+            develop.brush_layer_builds(),
+            develop.brush_layer_appends(),
+            develop.mask_alpha_builds(),
+        )
+    };
+    assert_eq!(
+        counts_after(&edit, &view),
+        (1, 0, 2),
+        "one layer, two alphas"
+    );
+    assert_eq!(counts_after(&edit, &view), (1, 0, 2), "the same edit again");
+
+    edit.masks[0].adjust.exposure = -0.4;
+    edit.masks[0].adjust.look.curves.master = s_curve();
+    assert_eq!(
+        counts_after(&edit, &view),
+        (1, 0, 2),
+        "a slider of the brush mask"
+    );
+    edit.masks[0].opacity = 40.0;
+    edit.exposure = 0.6;
+    assert_eq!(
+        counts_after(&edit, &view),
+        (1, 0, 2),
+        "its opacity, a global slider"
+    );
+
+    let panned = ViewWindow {
+        visible: (9, 7, 10, 12),
+        ..view
+    };
+    assert_eq!(
+        counts_after(&edit, &panned),
+        (1, 0, 2),
+        "a pan inside the window"
+    );
+
+    // A new stroke is stamped onto the layer that is there, and the alpha of
+    // that mask alone is drawn again.
+    let MaskSource::Brush(brush) = &mut edit.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    brush
+        .strokes
+        .push(SharedStroke::new(&stroke(&[[0.4, 0.4]], 0.05, 50.0, 100.0)));
+    assert_eq!(counts_after(&edit, &panned), (1, 1, 3), "a new stroke");
+
+    // An undo takes a stroke away: the layer starts again.
+    let MaskSource::Brush(brush) = &mut edit.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    brush.strokes.truncate(1);
+    assert_eq!(counts_after(&edit, &panned), (2, 1, 4), "a stroke removed");
+
+    // A window somewhere else is a new frame: everything is drawn again.
+    let elsewhere = ViewWindow {
+        window: (2, 2, 18, 20),
+        visible: (4, 4, 10, 12),
+        ..view
+    };
+    assert_eq!(counts_after(&edit, &elsewhere), (3, 1, 6), "another window");
 }

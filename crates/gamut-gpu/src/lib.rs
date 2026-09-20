@@ -11,6 +11,7 @@
 //! the [`video`] planes and the YUV pass that lets a decoded frame stand in
 //! for the photo at the head of the same graph.
 
+mod brush_layer;
 pub mod develop;
 pub mod headless;
 pub mod readback;

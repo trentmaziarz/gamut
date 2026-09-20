@@ -3,10 +3,13 @@
 // the golden tests hold the two together. A source is measured on where the
 // pixel is on the photo and on the source pixel of the working texture,
 // before any operator, so the alpha never depends on what the mask adjusts.
+// A painted source is read from its layer, which brush.wgsl stamped over the
+// same window.
 
 struct Component {
-    // The source (0 linear, 1 radial, 2 luminance, 3 colour), the operator
-    // (0 add, 1 subtract, 2 intersect), whether it is inverted, a spare.
+    // The source (0 linear, 1 radial, 2 luminance, 3 colour, 4 brush), the
+    // operator (0 add, 1 subtract, 2 intersect), whether it is inverted, and
+    // for a brush its layer.
     header: vec4<u32>,
     // Linear: the start and the end. Radial: the centre and the two radii.
     // Luminance: low, high, the floored falloff. Colour: the hue and half
@@ -30,6 +33,7 @@ struct Uniform {
 
 @group(0) @binding(0) var<uniform> u: Uniform;
 @group(0) @binding(1) var working: texture_2d<f32>;
+@group(0) @binding(2) var layers: texture_2d_array<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -140,6 +144,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
             case 2u: {
                 b = luminance_range(c, px);
+            }
+            case 4u: {
+                b = textureLoad(layers, vec2<i32>(in.position.xy), i32(c.header.w), 0).r;
             }
             default: {
                 b = colour_range(c, px);

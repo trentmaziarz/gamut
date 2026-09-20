@@ -8,8 +8,11 @@
 use std::sync::Mutex;
 
 use gamut_color::basic;
+use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
-use gamut_core::{Adjustments, CropRect, PhotoEdit};
+use gamut_core::brush::{Brush, SharedStroke, Stroke};
+use gamut_core::mask::MaskSource;
+use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use gamut_gpu::video::P010_FEATURE;
 use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
 use gamut_media::VideoFrame;
@@ -134,19 +137,38 @@ fn cpu_reference(
     colour: VideoColour,
     rotation: u32,
     rounding: Rounding,
+    edit: &PhotoEdit,
 ) -> Vec<[u8; 3]> {
     let linear: Vec<[f32; 3]> = (0..SIZE)
         .flat_map(|dy| (0..SIZE).map(move |dx| (dx, dy)))
         .map(|(dx, dy)| linear_at(frame, colour, rotation, dx, dy).map(|c| half(c, rounding)))
         .collect();
     let base = basic::base_layer(&linear, SIZE, SIZE);
-    let edit = PhotoEdit::default();
+    if !edit.masks.is_empty() {
+        // The masks of a frame blend as the masks of a photo do; the twin of
+        // that blend is gamut-color's develop_image.
+        let store = |v: f32| half(v, rounding);
+        let base: Vec<f32> = base.iter().map(|b| store(*b)).collect();
+        let luma: Vec<f32> = linear.iter().map(|px| basic::luma(*px)).collect();
+        let clear = vec![1.0; linear.len()];
+        let image = Image {
+            pixels: &linear,
+            base: &base,
+            texture: &luma,
+            transmission: &clear,
+            geometry: Geometry::full((SIZE, SIZE), (SIZE, SIZE)),
+        };
+        return mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
+            .into_iter()
+            .map(basic::output_srgb8)
+            .collect();
+    }
     linear
         .iter()
         .zip(&base)
         .map(|(px, b)| {
             let developed =
-                basic::develop_pixel(*px, half(*b, rounding), &edit).map(|c| half(c, rounding));
+                basic::develop_pixel(*px, half(*b, rounding), edit).map(|c| half(c, rounding));
             basic::output_srgb8(developed)
         })
         .collect()
@@ -157,16 +179,12 @@ fn gpu_render(
     frame: &VideoFrame,
     colour: VideoColour,
     rotation: u32,
+    edit: &PhotoEdit,
 ) -> Vec<[u8; 3]> {
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_video_frame(frame, colour, rotation);
     let view = develop
-        .render(
-            &PhotoEdit::default(),
-            CropRect::FULL,
-            (SIZE, SIZE),
-            (SIZE, SIZE),
-        )
+        .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
         .expect("a source is set");
     Readback::new(&gpu.device)
         .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
@@ -180,6 +198,16 @@ fn gpu_render(
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn check(name: &str, format: PlaneFormat, colour: VideoColour, rotation: u32) {
+    check_with(name, format, colour, rotation, &PhotoEdit::default());
+}
+
+fn check_with(
+    name: &str,
+    format: PlaneFormat,
+    colour: VideoColour,
+    rotation: u32,
+    edit: &PhotoEdit,
+) {
     let _turn = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -193,9 +221,9 @@ fn check(name: &str, format: PlaneFormat, colour: VideoColour, rotation: u32) {
         return;
     }
     let frame = synthetic_frame(format);
-    let nearest = cpu_reference(&frame, colour, rotation, Rounding::Nearest);
-    let toward_zero = cpu_reference(&frame, colour, rotation, Rounding::TowardZero);
-    let gpu_pixels = gpu_render(&gpu, &frame, colour, rotation);
+    let nearest = cpu_reference(&frame, colour, rotation, Rounding::Nearest, edit);
+    let toward_zero = cpu_reference(&frame, colour, rotation, Rounding::TowardZero, edit);
+    let gpu_pixels = gpu_render(&gpu, &frame, colour, rotation, edit);
     assert_eq!(nearest.len(), gpu_pixels.len());
     let mut max = 0;
     let mut sum = 0u64;
@@ -247,6 +275,61 @@ const HLG: VideoColour = VideoColour {
 #[test]
 fn an_nv12_bt709_frame_matches_the_twin() {
     check("nv12 bt709", PlaneFormat::Nv12, SDR, 0);
+}
+
+/// The brush of develop_golden's brush tests, painted on a frame: a mask is
+/// fixed on the frame and the same strokes give the same alpha there.
+#[test]
+fn a_brush_mask_on_a_frame_matches_the_twin() {
+    let stroke = |points: &[[f32; 2]], size: f32, feather: f32, flow: f32, erase: bool| {
+        SharedStroke::new(&Stroke {
+            points: points.to_vec(),
+            size,
+            feather,
+            flow,
+            erase,
+        })
+    };
+    let mut mask = Mask::new(
+        "Brush",
+        MaskSource::Brush(Brush {
+            strokes: vec![
+                stroke(
+                    &[[0.2, 0.3], [0.5, 0.45], [0.8, 0.4]],
+                    0.12,
+                    60.0,
+                    100.0,
+                    false,
+                ),
+                stroke(
+                    &[[0.6, 0.15], [0.55, 0.5], [0.35, 0.85]],
+                    0.08,
+                    30.0,
+                    45.0,
+                    false,
+                ),
+                stroke(&[[0.3, 0.2], [0.7, 0.7]], 0.05, 50.0, 80.0, true),
+            ],
+        }),
+    );
+    mask.adjust.exposure = 1.2;
+    let edit = PhotoEdit {
+        masks: vec![mask],
+        ..PhotoEdit::default()
+    };
+    let frame = synthetic_frame(PlaneFormat::Nv12);
+    assert_ne!(
+        cpu_reference(&frame, SDR, 0, Rounding::Nearest, &edit),
+        cpu_reference(&frame, SDR, 0, Rounding::Nearest, &PhotoEdit::default()),
+        "the brush shows on the frame"
+    );
+    check_with(
+        "brush mask on an nv12 frame",
+        PlaneFormat::Nv12,
+        SDR,
+        0,
+        &edit,
+    );
 }
 
 #[test]
