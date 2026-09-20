@@ -4,7 +4,7 @@
 //! the playhead, the Adjust tab holds the Basic sliders and the crop, the
 //! Timeline tab holds the one track, File > Export opens the export
 //! dialog, and the edit is saved half a second after the last change and
-//! on close: as a sidecar next to a photo, as the .slate file of a project.
+//! on close: as a sidecar next to a photo, as the .gamut file of a project.
 
 use std::error::Error;
 use std::fmt;
@@ -108,7 +108,7 @@ pub struct OpenPhoto {
 /// The project that is open: its file, its media, the track being edited
 /// and the player that plays it.
 pub struct OpenProject {
-    /// The .slate file.
+    /// The .gamut file.
     pub path: PathBuf,
     /// The folder the media paths are relative to.
     pub dir: PathBuf,
@@ -518,7 +518,7 @@ impl GamutApp {
         });
     }
 
-    /// Asks for a new .slate path and moves the project there.
+    /// Asks for a new .gamut path and moves the project there.
     fn save_as(&mut self) {
         let Some(project) = self.session.project.as_mut() else {
             return;

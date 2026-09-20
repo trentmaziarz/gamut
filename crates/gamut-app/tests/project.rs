@@ -18,7 +18,7 @@ fn a_cut_project_round_trips_next_to_a_copied_clip() {
 
     let mut loaded = for_video(&video, &info);
     assert_eq!(loaded.path, Project::path_for(&video));
-    assert_eq!(loaded.path.file_name().unwrap(), "sample-5s.mp4.slate");
+    assert_eq!(loaded.path.file_name().unwrap(), "sample-5s.mp4.gamut");
     assert_eq!(loaded.project.media[0].path, "sample-5s.mp4");
     assert_eq!(loaded.project.track.clips.len(), 1);
 

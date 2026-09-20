@@ -5,11 +5,11 @@ use gamut_app::headless::EditSource;
 use gamut_app::{GamutApp, WINDOW_TITLE, export, native_options, reel, screenshot};
 use gamut_core::ExportPreset;
 
-const USAGE: &str = "usage: gamut-app [<photo, video or project.slate>]
+const USAGE: &str = "usage: gamut-app [<photo, video or project.gamut>]
        gamut-app [--open <photo>] --screenshot <out.png> [look] [--show-mask <name>]
-       gamut-app --open <video or project.slate> --screenshot <out.png> --at <seconds>
+       gamut-app --open <video or project.gamut> --screenshot <out.png> --at <seconds>
        gamut-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [look]
-       gamut-app --export-reel <video or project.slate> <out.mp4>
+       gamut-app --export-reel <video or project.gamut> <out.mp4>
 look:  [--edit <sidecar.json>] [--version-name <name>] [--preset <look.json>]
        the named version of the sidecar, then the look preset over it
 --show-mask draws the named mask of the edit as a red overlay on a screenshot";
@@ -257,7 +257,7 @@ mod tests {
             parsed(&args)
         };
         assert!(with(&["--open", "a.jpg", "--export", "4x5", "o.jpg"]).is_err());
-        assert!(with(&["--export-reel", "p.slate", "o.mp4"]).is_err());
+        assert!(with(&["--export-reel", "p.gamut", "o.mp4"]).is_err());
         assert!(with(&["--open", "v.mp4", "--screenshot", "o.png", "--at", "1.5"]).is_err());
         assert!(with(&["--screenshot", "o.png"]).is_err(), "no photo");
         assert!(with(&["a.jpg"]).is_err(), "the window takes none");
@@ -379,8 +379,8 @@ mod tests {
     #[test]
     fn a_preset_or_a_version_name_is_refused_where_it_cannot_apply() {
         // Not with a Reel export.
-        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--preset", "l.json"]).is_err());
-        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--version-name", "a"]).is_err());
+        assert!(parsed(&["--export-reel", "p.gamut", "o.mp4", "--preset", "l.json"]).is_err());
+        assert!(parsed(&["--export-reel", "p.gamut", "o.mp4", "--version-name", "a"]).is_err());
         // Not on a video frame, not without a photo, not for the window.
         assert!(
             parsed(&[
@@ -447,14 +447,14 @@ mod tests {
     #[test]
     fn a_reel_export_takes_an_input_and_an_output() {
         assert_eq!(
-            parsed(&["--export-reel", "p.slate", "o.mp4"]),
+            parsed(&["--export-reel", "p.gamut", "o.mp4"]),
             Ok(Command::ExportReel {
-                input: PathBuf::from("p.slate"),
+                input: PathBuf::from("p.gamut"),
                 out: PathBuf::from("o.mp4"),
             })
         );
-        assert!(parsed(&["--export-reel", "p.slate"]).is_err());
-        assert!(parsed(&["--export-reel", "p.slate", "o.mp4", "--screenshot", "s.png"]).is_err());
+        assert!(parsed(&["--export-reel", "p.gamut"]).is_err());
+        assert!(parsed(&["--export-reel", "p.gamut", "o.mp4", "--screenshot", "s.png"]).is_err());
     }
 
     #[test]

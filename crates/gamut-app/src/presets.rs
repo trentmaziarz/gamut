@@ -1,8 +1,9 @@
 //! Look presets on disk: one JSON file per preset in a presets folder under
-//! the user's config directory. On Windows that is %APPDATA%\slate\presets;
-//! elsewhere $XDG_CONFIG_HOME/slate/presets or ~/.config/slate/presets. The
+//! the user's config directory. On Windows that is %APPDATA%\gamut\presets;
+//! elsewhere $XDG_CONFIG_HOME/gamut/presets or ~/.config/gamut/presets. The
 //! folder is read from the environment, so no crate is needed for it.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use gamut_core::LookPreset;
@@ -13,7 +14,13 @@ pub const FOLDER_VARIABLE: &str = "GAMUT_PRESETS_DIR";
 /// The presets folder, or `None` when the environment names no config
 /// directory.
 pub fn folder() -> Option<PathBuf> {
-    let variable = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    folder_from(|name| std::env::var_os(name))
+}
+
+/// [`folder`] over any source of variables, so a test never touches the
+/// process environment.
+fn folder_from(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let variable = |name: &str| lookup(name).filter(|v| !v.is_empty());
     if let Some(folder) = variable(FOLDER_VARIABLE) {
         return Some(PathBuf::from(folder));
     }
@@ -21,7 +28,7 @@ pub fn folder() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| variable("XDG_CONFIG_HOME").map(PathBuf::from))
         .or_else(|| variable("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("slate").join("presets"))
+    Some(config.join("gamut").join("presets"))
 }
 
 /// Reads one preset file.
@@ -69,9 +76,24 @@ pub fn save(folder: &Path, preset: &LookPreset) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{list, load, save};
+    use super::{FOLDER_VARIABLE, folder_from, list, load, save};
     use gamut_core::preset::Groups;
     use gamut_core::{Adjustments, LookPreset, PhotoEdit};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn the_presets_folder_is_gamut_under_the_config_directory() {
+        let appdata =
+            |name: &str| (name == "APPDATA").then(|| OsString::from("C:/Users/a/Roaming"));
+        assert_eq!(
+            folder_from(appdata).as_deref(),
+            Some(Path::new("C:/Users/a/Roaming/gamut/presets"))
+        );
+        let named = |name: &str| (name == FOLDER_VARIABLE).then(|| OsString::from("D:/looks"));
+        assert_eq!(folder_from(named).as_deref(), Some(Path::new("D:/looks")));
+        assert_eq!(folder_from(|_| None), None);
+    }
 
     #[test]
     fn presets_save_list_and_load_from_a_folder() {

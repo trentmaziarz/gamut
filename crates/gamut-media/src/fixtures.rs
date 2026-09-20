@@ -18,9 +18,9 @@ pub const RELEASE_M2: &str = "fixtures-m2";
 /// The fixtures that are in no release and are made on the machine.
 pub const LOCAL_ONLY: [&str; 2] = ["iphone_hevc_10s.mov", "timing_4k30_60s.mp4"];
 
-const DEFAULT_DIR: &str = "C:/slate/fixtures";
+const DEFAULT_DIR: &str = "C:/gamut/fixtures";
 
-/// The fixtures folder: `GAMUT_FIXTURES` when set, else `C:/slate/fixtures`
+/// The fixtures folder: `GAMUT_FIXTURES` when set, else `C:/gamut/fixtures`
 /// when it exists, else `./fixtures`.
 pub fn dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(ENV) {

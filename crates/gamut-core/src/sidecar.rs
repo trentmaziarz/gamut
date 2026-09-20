@@ -1,5 +1,5 @@
 //! The sidecar: the edit of one photo as JSON next to the original. For
-//! IMG_0001.HEIC the sidecar is IMG_0001.HEIC.slate.json.
+//! IMG_0001.HEIC the sidecar is IMG_0001.HEIC.gamut.json.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -18,7 +18,7 @@ use crate::{Crop, PhotoEdit};
 pub const VERSION: u32 = 3;
 
 /// What is appended to the photo's file name.
-pub const SUFFIX: &str = ".slate.json";
+pub const SUFFIX: &str = ".gamut.json";
 
 /// One named version of a photo: an edit and a crop kept under a name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -583,11 +583,11 @@ mod tests {
     #[test]
     fn the_sidecar_sits_next_to_the_photo_with_its_full_name() {
         let path = Sidecar::path_for(Path::new("C:/photos/IMG_0001.HEIC"));
-        assert_eq!(path, Path::new("C:/photos/IMG_0001.HEIC.slate.json"));
+        assert_eq!(path, Path::new("C:/photos/IMG_0001.HEIC.gamut.json"));
         assert!(path.to_string_lossy().ends_with(SUFFIX));
         assert_eq!(
             Sidecar::path_for(Path::new("Portrait_8.jpg")),
-            Path::new("Portrait_8.jpg.slate.json")
+            Path::new("Portrait_8.jpg.gamut.json")
         );
     }
 }

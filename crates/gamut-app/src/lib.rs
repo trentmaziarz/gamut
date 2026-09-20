@@ -9,7 +9,7 @@
 //! [`screenshot`] and [`export`] paths render the same picture without a
 //! window.
 //!
-//! In M2 a video or a .slate file opens a [`project`], the [`player`]
+//! In M2 a video or a .gamut file opens a [`project`], the [`player`]
 //! decodes and clocks it, the [`timeline_tab`] cuts the one track, the
 //! Viewer draws the frame under the playhead, and [`reel`] writes the
 //! 1080x1920 Reel.

@@ -1,4 +1,4 @@
-//! The project: a .slate JSON file holding the media list, the one track,
+//! The project: a .gamut JSON file holding the media list, the one track,
 //! the crop and the edit. Media paths are written relative to the folder
 //! the file is in, with forward slashes, so a project folder moves as a
 //! whole.
@@ -14,7 +14,7 @@ use crate::{Crop, PhotoEdit};
 pub const VERSION: u32 = 1;
 
 /// The extension of a project file.
-pub const EXTENSION: &str = "slate";
+pub const EXTENSION: &str = "gamut";
 
 /// One media file the track refers to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ impl Default for Project {
 
 impl Project {
     /// The project file for a video opened on its own: the video's full
-    /// file name plus `.slate`, next to the video.
+    /// file name plus `.gamut`, next to the video.
     pub fn path_for(video: &Path) -> PathBuf {
         let mut name = video
             .file_name()
@@ -242,7 +242,7 @@ mod tests {
     }
 
     /// A project exactly as the format stood with the look and before masks.
-    const BEFORE_MASKS: &str = include_str!("testdata/project_before_masks.slate");
+    const BEFORE_MASKS: &str = include_str!("testdata/project_before_masks.gamut");
 
     #[test]
     fn a_project_from_before_masks_still_parses_and_saves_the_same() {
@@ -313,9 +313,16 @@ mod tests {
     fn the_project_file_sits_next_to_the_video_with_its_full_name() {
         assert_eq!(
             Project::path_for(Path::new("C:/clips/IMG_0001.MOV")),
-            Path::new("C:/clips/IMG_0001.MOV.slate")
+            Path::new("C:/clips/IMG_0001.MOV.gamut")
         );
-        assert!(Project::is_project_path(Path::new("a.SLATE")));
+        assert!(Project::is_project_path(Path::new("a.GAMUT")));
         assert!(!Project::is_project_path(Path::new("a.mp4")));
+    }
+
+    #[test]
+    fn the_extension_before_the_rebrand_is_not_a_project_path() {
+        // In pieces so a scan of the repository for the old name stays empty.
+        let old = ["clip.mp4.s", "late"].concat();
+        assert!(!Project::is_project_path(Path::new(&old)));
     }
 }

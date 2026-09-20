@@ -3,7 +3,7 @@
 //! tracks, clips, in and out points, speed curves, keyframes, transitions and
 //! overlays. Presets and undo history live here too. It is plain data with
 //! serde, no GPU and no I/O. A photo edit is stored as a sidecar JSON next to
-//! the original, a video project is a .slate JSON file with media paths
+//! the original, a video project is a .gamut JSON file with media paths
 //! relative to it, and presets are JSON subsets of the photo parameters. All
 //! three are text, so they diff in git.
 

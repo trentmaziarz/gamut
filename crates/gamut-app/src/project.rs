@@ -1,4 +1,4 @@
-//! Reading and writing the .slate project file, and opening its media.
+//! Reading and writing the .gamut project file, and opening its media.
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +45,7 @@ pub fn dir_of(path: &Path) -> PathBuf {
 }
 
 /// A new project for one video: the whole clip on the track, saved next to
-/// the video as `<name>.slate`.
+/// the video as `<name>.gamut`.
 pub fn for_video(video: &Path, info: &MediaInfo) -> LoadedProject {
     let video = std::path::absolute(video).unwrap_or_else(|_| video.to_path_buf());
     let path = Project::path_for(&video);
