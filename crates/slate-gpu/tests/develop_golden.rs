@@ -9,6 +9,7 @@ use half::f16;
 use slate_color::SourceSpace;
 use slate_color::basic::{self, Neighbourhood, Prepared};
 use slate_color::{dehaze, local};
+use slate_core::look::{Curve, HslRange, Wheel};
 use slate_core::{CropRect, PhotoEdit};
 use slate_gpu::{Develop, Headless, Readback};
 use slate_media::Photo;
@@ -68,6 +69,50 @@ fn synthetic_photo() -> Photo {
     }
 }
 
+/// A second photo for the look: the eight centre colours of the HSL mixer in
+/// columns with fine detail over them, under a haze that thickens toward the
+/// top, below a band of bright sky.
+fn hazy_photo() -> Photo {
+    const CENTRES: [[f32; 3]; 8] = [
+        [1.0, 0.0, 0.0],
+        [1.0, 0.5, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.5, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+    ];
+    const HAZE: [f32; 3] = [0.82, 0.86, 0.9];
+    let mut rgba8 = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let fy = y as f32 / (SIZE - 1) as f32;
+            let rgb = if y < 8 {
+                HAZE
+            } else {
+                let colour = CENTRES[(x / 8) as usize];
+                let detail = if (x / 2 + y / 2) % 2 == 0 { 1.0 } else { 0.6 };
+                let level = (0.25 + 0.6 * fy) * detail;
+                let clear = 0.35 + 0.65 * fy;
+                [0, 1, 2].map(|c| colour[c] * level * clear + HAZE[c] * (1.0 - clear))
+            };
+            for c in rgb {
+                rgba8.push((c * 255.0).round() as u8);
+            }
+            rgba8.push(255);
+        }
+    }
+    Photo {
+        width: SIZE,
+        height: SIZE,
+        rgba8,
+        source: SourceSpace::Srgb,
+        bit_depth: 8,
+        has_alpha: false,
+    }
+}
+
 /// How a GPU rounds when it stores a half float. Vulkan and D3D allow
 /// either mode for render target writes; this machine's driver truncates,
 /// WARP may not, so the reference is built both ways and the GPU has to
@@ -107,36 +152,34 @@ fn cpu_reference(photo: &Photo, edit: &PhotoEdit, rounding: Rounding) -> Vec<[u8
         })
         .collect();
     let (width, height) = (photo.width, photo.height);
-    let base = basic::base_layer(&linear, width, height);
-    let texture = local::texture_layer(&linear, width, height);
-    // The atmospheric light is read from the decoded photo on the CPU, before
-    // any half float store, exactly as Develop::set_source reads it.
-    let decoded: Vec<[f32; 3]> = photo
-        .rgba8
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
-        .collect();
-    let atmosphere = dehaze::atmosphere(&decoded, width, height);
-    let raw: Vec<f32> = dehaze::raw_transmission(
-        &linear,
+    // Every blurred layer passes through two half float textures.
+    let store = |v: f32| half(v, rounding);
+    let luma: Vec<f32> = linear.iter().map(|px| basic::luma(*px)).collect();
+    let base = basic::gaussian_stored(
+        &luma,
         width,
         height,
-        atmosphere,
-        dehaze::patch_radius(width, height),
-    )
-    .into_iter()
-    .map(|t| half(t, rounding))
-    .collect();
-    let transmission = basic::gaussian(&raw, width, height, dehaze::smoothing_sigma(width, height));
+        basic::base_sigma(width, height),
+        &store,
+    );
+    let texture = basic::gaussian_stored(
+        &luma,
+        width,
+        height,
+        local::texture_sigma(width, height),
+        &store,
+    );
+    // The atmospheric light is read from the photo's bytes on the CPU, before
+    // any half float store, exactly as Develop::set_source reads it.
+    let atmosphere = dehaze::atmosphere_rgba8(&photo.rgba8, width, height, photo.source);
+    let transmission = dehaze::transmission_stored(&linear, width, height, atmosphere, &store);
     let prepared = Prepared::new(edit, atmosphere);
     (0..linear.len())
         .map(|i| {
             let around = Neighbourhood {
-                base_luma: half(base[i], rounding),
-                texture_luma: half(texture[i], rounding),
-                transmission: half(transmission[i], rounding),
+                base_luma: base[i],
+                texture_luma: texture[i],
+                transmission: transmission[i],
             };
             let developed = basic::develop_pixel_with(linear[i], &around, edit, &prepared)
                 .map(|c| half(c, rounding));
@@ -165,6 +208,11 @@ fn gpu_render(gpu: &Headless, photo: &Photo, edit: &PhotoEdit) -> Vec<[u8; 3]> {
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn check(name: &str, edit: &PhotoEdit) {
+    check_on(name, &synthetic_photo(), edit);
+    check_on(&format!("{name}, hazy photo"), &hazy_photo(), edit);
+}
+
+fn check_on(name: &str, photo: &Photo, edit: &PhotoEdit) {
     let _turn = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -173,10 +221,9 @@ fn check(name: &str, edit: &PhotoEdit) {
         return;
     };
     println!("adapter: {}", gpu.describe());
-    let photo = synthetic_photo();
-    let nearest = cpu_reference(&photo, edit, Rounding::Nearest);
-    let toward_zero = cpu_reference(&photo, edit, Rounding::TowardZero);
-    let gpu_pixels = gpu_render(&gpu, &photo, edit);
+    let nearest = cpu_reference(photo, edit, Rounding::Nearest);
+    let toward_zero = cpu_reference(photo, edit, Rounding::TowardZero);
+    let gpu_pixels = gpu_render(&gpu, photo, edit);
     assert_eq!(nearest.len(), gpu_pixels.len());
     let mut max = 0;
     let mut sum = 0u64;
@@ -336,4 +383,259 @@ fn every_slider_together_matches_develop_pixel() {
             ..PhotoEdit::default()
         },
     );
+}
+
+fn curve(points: &[[f32; 2]]) -> Curve {
+    Curve {
+        points: points.to_vec(),
+    }
+}
+
+fn s_curve() -> Curve {
+    curve(&[[0.0, 0.0], [0.25, 0.17], [0.75, 0.85], [1.0, 1.0]])
+}
+
+fn with_hsl(index: usize, range: HslRange) -> PhotoEdit {
+    let mut edit = PhotoEdit::default();
+    edit.look.hsl[index] = range;
+    edit
+}
+
+/// A diagonal curve with a third point is not the default, so the pixel
+/// goes through ACEScct, the table and back, and must land where it began.
+#[test]
+fn the_acescct_round_trip_matches_and_changes_nothing() {
+    let mut edit = PhotoEdit::default();
+    edit.look.curves.master = curve(&[[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]);
+    assert!(!edit.look.curves.is_identity());
+    check("acescct round trip", &edit);
+    for photo in [synthetic_photo(), hazy_photo()] {
+        let through = cpu_reference(&photo, &edit, Rounding::Nearest);
+        let plain = cpu_reference(&photo, &PhotoEdit::default(), Rounding::Nearest);
+        for (a, b) in through.iter().zip(&plain) {
+            for k in 0..3 {
+                assert!(
+                    (i32::from(a[k]) - i32::from(b[k])).abs() <= 1,
+                    "{a:?} and {b:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_master_s_curve_matches() {
+    let mut edit = PhotoEdit::default();
+    edit.look.curves.master = s_curve();
+    check("master s-curve", &edit);
+}
+
+#[test]
+fn a_red_channel_curve_matches() {
+    let mut edit = PhotoEdit::default();
+    edit.look.curves.red = curve(&[[0.0, 0.05], [0.4, 0.55], [1.0, 0.95]]);
+    check("red curve", &edit);
+}
+
+#[test]
+fn an_hsl_hue_shift_matches() {
+    check(
+        "hsl hue",
+        &with_hsl(
+            3,
+            HslRange {
+                hue: 80.0,
+                ..HslRange::default()
+            },
+        ),
+    );
+}
+
+#[test]
+fn an_hsl_saturation_change_matches() {
+    check(
+        "hsl saturation",
+        &with_hsl(
+            1,
+            HslRange {
+                saturation: -60.0,
+                ..HslRange::default()
+            },
+        ),
+    );
+}
+
+#[test]
+fn an_hsl_luminance_change_matches() {
+    check(
+        "hsl luminance",
+        &with_hsl(
+            5,
+            HslRange {
+                luminance: 70.0,
+                ..HslRange::default()
+            },
+        ),
+    );
+}
+
+#[test]
+fn the_shadows_wheel_matches() {
+    let mut edit = PhotoEdit::default();
+    edit.look.wheels.shadows = Wheel {
+        x: -0.5,
+        y: -0.3,
+        luminance: -20.0,
+    };
+    check("shadows wheel", &edit);
+}
+
+#[test]
+fn the_midtones_wheel_matches() {
+    let mut edit = PhotoEdit::default();
+    edit.look.wheels.midtones = Wheel {
+        x: 0.3,
+        y: 0.5,
+        luminance: 25.0,
+    };
+    check("midtones wheel", &edit);
+}
+
+#[test]
+fn the_highlights_wheel_matches() {
+    let mut edit = PhotoEdit::default();
+    edit.look.wheels.highlights = Wheel {
+        x: 0.6,
+        y: 0.2,
+        luminance: -15.0,
+    };
+    check("highlights wheel", &edit);
+}
+
+#[test]
+fn texture_matches() {
+    for texture in [70.0, -70.0] {
+        check(
+            "texture",
+            &PhotoEdit {
+                texture,
+                ..PhotoEdit::default()
+            },
+        );
+    }
+}
+
+#[test]
+fn clarity_matches() {
+    for clarity in [60.0, -60.0] {
+        check(
+            "clarity",
+            &PhotoEdit {
+                clarity,
+                ..PhotoEdit::default()
+            },
+        );
+    }
+}
+
+#[test]
+fn positive_dehaze_matches() {
+    check(
+        "dehaze +",
+        &PhotoEdit {
+            dehaze: 70.0,
+            ..PhotoEdit::default()
+        },
+    );
+}
+
+#[test]
+fn negative_dehaze_matches() {
+    check(
+        "dehaze -",
+        &PhotoEdit {
+            dehaze: -50.0,
+            ..PhotoEdit::default()
+        },
+    );
+}
+
+#[test]
+fn every_operator_together_matches_develop_pixel() {
+    let mut edit = PhotoEdit {
+        white_balance_temperature: -20.0,
+        white_balance_tint: 10.0,
+        exposure: 0.4,
+        contrast: 25.0,
+        highlights: -40.0,
+        shadows: 30.0,
+        whites: 15.0,
+        blacks: -10.0,
+        vibrance: 20.0,
+        saturation: 8.0,
+        texture: 40.0,
+        clarity: 35.0,
+        dehaze: 30.0,
+        ..PhotoEdit::default()
+    };
+    edit.look.curves.master = s_curve();
+    edit.look.curves.blue = curve(&[[0.0, 0.03], [0.5, 0.46], [1.0, 1.0]]);
+    edit.look.hsl[1].saturation = -40.0;
+    edit.look.hsl[4].hue = 50.0;
+    edit.look.hsl[5].luminance = -30.0;
+    edit.look.wheels.shadows = Wheel {
+        x: -0.4,
+        y: -0.3,
+        luminance: 0.0,
+    };
+    edit.look.wheels.midtones = Wheel {
+        x: 0.1,
+        y: 0.2,
+        luminance: 10.0,
+    };
+    edit.look.wheels.highlights = Wheel {
+        x: 0.4,
+        y: 0.15,
+        luminance: 0.0,
+    };
+    check("every operator", &edit);
+}
+
+/// Texture and dehaze switched on after a first render draw their head-pass
+/// products then, and switching them off again returns the first picture.
+#[test]
+fn a_product_switched_on_later_matches_a_fresh_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = hazy_photo();
+    let on = PhotoEdit {
+        texture: 50.0,
+        dehaze: 60.0,
+        ..PhotoEdit::default()
+    };
+    let fresh = gpu_render(&gpu, &photo, &on);
+
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let mut render = |edit: &PhotoEdit| -> Vec<u8> {
+        let view = develop
+            .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        Readback::new(&gpu.device).read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+    };
+    let first = render(&PhotoEdit::default());
+    let later: Vec<[u8; 3]> = render(&on)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| [px[0], px[1], px[2]])
+        .collect();
+    assert_eq!(later, fresh);
+    assert_eq!(render(&PhotoEdit::default()), first);
 }

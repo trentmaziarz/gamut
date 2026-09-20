@@ -10,14 +10,31 @@
 //!    writes linear Rec.2020 into the working texture.
 //! 3. `blur.wgsl` twice: the luminance of the working texture under a
 //!    gaussian, the base layer that highlights and shadows split on.
-//! 4. `develop.wgsl`: the six Basic operators, from a uniform that mirrors
-//!    `PhotoEdit`, into the developed texture.
+//! 4. `develop.wgsl`: the whole develop chain of slate-color's
+//!    `develop_pixel_with`, from a uniform that mirrors `PhotoEdit`, into
+//!    the developed texture.
 //! 5. `output.wgsl`: the crop out of the developed texture, Rec.2020 to
 //!    sRGB, clipped, into an 8-bit sRGB texture that egui draws and
 //!    `Readback` reads.
 //!
 //! Passes 2 and 3 depend only on the source and the render size, so they
 //! run again only when one of those changes. A slider change runs 4 and 5.
+//!
+//! M3 adds three products the develop pass reads, each skipped while its
+//! operator is at rest, so an edit that does not use them costs nothing:
+//!
+//! - The texture layer: `blur.wgsl` twice more at the finer sigma, into its
+//!   own R16Float texture. A head-pass product: it runs once when texture
+//!   leaves 0 and again only when pass 2 runs again.
+//! - The transmission map of dehaze: `minimum.wgsl` twice (the dark channel
+//!   over the atmospheric light under a square minimum filter), then
+//!   `blur.wgsl` twice to smooth it, into its own R16Float texture. Also a
+//!   head-pass product, run once when dehaze leaves 0. The atmospheric light
+//!   is read from the photo on the CPU in `set_source`; a video frame takes
+//!   white.
+//! - The tone curve table: 1024 by 1 in Rgba32Float, baked by slate-color
+//!   and uploaded only when a curve changes. It is read with `textureLoad`,
+//!   two loads and a mix, so it needs no filtering.
 //!
 //! M2 lets a decoded video frame stand in for the photo: the source is
 //! then the two plane textures of [`crate::video::VideoSource`] and pass 2
@@ -29,8 +46,14 @@
 use bytemuck::{Pod, Zeroable};
 use slate_color::SourceSpace;
 use slate_color::basic;
+use slate_color::curve::{self, TABLE_SIZE};
+use slate_color::dehaze;
+use slate_color::hsl::HslParams;
+use slate_color::local;
 use slate_color::matrices;
 use slate_color::video::VideoColour;
+use slate_color::wheels::Cdl;
+use slate_core::look::ToneCurves;
 use slate_core::{CropRect, ExportPreset, PhotoEdit};
 use slate_media::{FramePlanes, Photo};
 
@@ -46,8 +69,16 @@ pub const BASE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 /// The output format: 8-bit sRGB, encoded by the hardware on write.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// The tone curve table format: full floats, read with `textureLoad`.
+pub const TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
 /// The most samples per axis the input transform averages per output pixel.
 pub const MAX_TAPS: u32 = 8;
+
+/// The `flags` bits of the develop uniform.
+const FLAG_CURVES: u32 = 1;
+const FLAG_HSL: u32 = 2;
+const FLAG_WHEELS: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -69,7 +100,18 @@ struct BlurUniform {
     _pad: [f32; 3],
 }
 
-/// Mirrors `PhotoEdit` field for field after the white balance matrix.
+/// The uniform of `minimum.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MinimumUniform {
+    direction: [i32; 2],
+    radius: i32,
+    stage: u32,
+    atmosphere: [f32; 4],
+}
+
+/// Mirrors the `Uniform` of `develop.wgsl` member for member; a test holds
+/// the two layouts equal.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DevelopUniform {
@@ -84,13 +126,39 @@ struct DevelopUniform {
     blacks: f32,
     vibrance: f32,
     saturation: f32,
+    texture: f32,
+    clarity: f32,
+    dehaze: f32,
+    flags: u32,
     _pad: [f32; 2],
+    atmosphere: [f32; 4],
+    cdl_slope: [f32; 4],
+    cdl_offset: [f32; 4],
+    cdl_power: [f32; 4],
+    hsl: [[f32; 4]; 8],
 }
 
 impl DevelopUniform {
-    fn new(edit: &PhotoEdit) -> Self {
+    /// `atmosphere` is the atmospheric light of the source.
+    fn new(edit: &PhotoEdit, atmosphere: [f32; 3]) -> Self {
         let wb =
             basic::white_balance_matrix(edit.white_balance_temperature, edit.white_balance_tint);
+        let look = &edit.look;
+        let mut flags = 0;
+        if !look.curves.is_identity() {
+            flags |= FLAG_CURVES;
+        }
+        let mut hsl = [[0.0; 4]; 8];
+        if !look.hsl_is_identity() {
+            flags |= FLAG_HSL;
+            hsl = HslParams::new(&look.hsl).ranges;
+        }
+        let mut cdl = Cdl::IDENTITY;
+        if !look.wheels.is_identity() {
+            flags |= FLAG_WHEELS;
+            cdl = Cdl::new(&look.wheels);
+        }
+        let wide = |v: [f32; 3]| [v[0], v[1], v[2], 1.0];
         Self {
             white_balance: wb.to_wgsl_columns(),
             white_balance_temperature: edit.white_balance_temperature,
@@ -103,7 +171,16 @@ impl DevelopUniform {
             blacks: edit.blacks,
             vibrance: edit.vibrance,
             saturation: edit.saturation,
+            texture: edit.texture,
+            clarity: edit.clarity,
+            dehaze: edit.dehaze,
+            flags,
             _pad: [0.0; 2],
+            atmosphere: wide(basic::exposed_atmosphere(&wb, atmosphere, edit.exposure)),
+            cdl_slope: wide(cdl.slope),
+            cdl_offset: wide(cdl.offset),
+            cdl_power: wide(cdl.power),
+            hsl,
         }
     }
 }
@@ -149,6 +226,8 @@ struct Source {
     generation: u64,
     /// Counts up when the content changes but the textures stay.
     content: u64,
+    /// The atmospheric light dehaze works against, in linear Rec.2020.
+    atmosphere: [f32; 3],
 }
 
 /// Everything that depends on the source and the render size.
@@ -165,10 +244,27 @@ struct Frame {
     working: Target,
     ping: Target,
     base: Target,
+    /// The texture layer; holds nothing until `texture_ready`.
+    texture_base: Target,
+    /// The transmission map; holds nothing until `transmission_ready`.
+    transmission: Target,
     developed: Target,
+    /// The texture layer matches the working texture and `products_region`.
+    texture_ready: bool,
+    /// The transmission map matches the working texture and
+    /// `products_region`.
+    transmission_ready: bool,
+    /// The scissor the two products above were last drawn under.
+    products_region: Option<(u32, u32, u32, u32)>,
     input_bind: wgpu::BindGroup,
     blur_h_bind: wgpu::BindGroup,
     blur_v_bind: wgpu::BindGroup,
+    texture_h_bind: wgpu::BindGroup,
+    texture_v_bind: wgpu::BindGroup,
+    minimum_h_bind: wgpu::BindGroup,
+    minimum_v_bind: wgpu::BindGroup,
+    smooth_h_bind: wgpu::BindGroup,
+    smooth_v_bind: wgpu::BindGroup,
     develop_bind: wgpu::BindGroup,
 }
 
@@ -186,13 +282,24 @@ pub struct Develop {
     input: Pass,
     video: Pass,
     blur: Pass,
+    minimum: Pass,
     develop: Pass,
     output: Pass,
     input_uniform: wgpu::Buffer,
     video_uniform: wgpu::Buffer,
     blur_h_uniform: wgpu::Buffer,
     blur_v_uniform: wgpu::Buffer,
+    texture_h_uniform: wgpu::Buffer,
+    texture_v_uniform: wgpu::Buffer,
+    minimum_h_uniform: wgpu::Buffer,
+    minimum_v_uniform: wgpu::Buffer,
+    smooth_h_uniform: wgpu::Buffer,
+    smooth_v_uniform: wgpu::Buffer,
     develop_uniform: wgpu::Buffer,
+    /// The tone curve table and the curves it was baked from.
+    curve_table: wgpu::Texture,
+    curve_table_view: wgpu::TextureView,
+    curves_uploaded: Option<ToneCurves>,
     output_uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
     readback: Readback,
@@ -233,13 +340,42 @@ impl Develop {
             BASE_FORMAT,
             &[uniform_entry(0), texture_entry(1), sampler_entry(2)],
         );
+        let minimum = make_pass(
+            device,
+            "minimum",
+            include_str!("shaders/minimum.wgsl"),
+            BASE_FORMAT,
+            &[uniform_entry(0), texture_entry(1)],
+        );
         let develop = make_pass(
             device,
             "develop",
             include_str!("shaders/develop.wgsl"),
             WORKING_FORMAT,
-            &[uniform_entry(0), texture_entry(1), texture_entry(2)],
+            &[
+                uniform_entry(0),
+                texture_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                texture_entry(4),
+                table_entry(5),
+            ],
         );
+        let curve_table = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tone curve table"),
+            size: wgpu::Extent3d {
+                width: TABLE_SIZE as u32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TABLE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let curve_table_view = curve_table.create_view(&wgpu::TextureViewDescriptor::default());
         let output = make_pass(
             device,
             "output",
@@ -270,13 +406,23 @@ impl Develop {
             input,
             video,
             blur,
+            minimum,
             develop,
             output,
             input_uniform: uniform("input uniform", size_of::<InputUniform>() as u64),
             video_uniform: uniform("video uniform", size_of::<VideoUniform>() as u64),
             blur_h_uniform: uniform("blur h uniform", size_of::<BlurUniform>() as u64),
             blur_v_uniform: uniform("blur v uniform", size_of::<BlurUniform>() as u64),
+            texture_h_uniform: uniform("texture h uniform", size_of::<BlurUniform>() as u64),
+            texture_v_uniform: uniform("texture v uniform", size_of::<BlurUniform>() as u64),
+            minimum_h_uniform: uniform("minimum h uniform", size_of::<MinimumUniform>() as u64),
+            minimum_v_uniform: uniform("minimum v uniform", size_of::<MinimumUniform>() as u64),
+            smooth_h_uniform: uniform("smooth h uniform", size_of::<BlurUniform>() as u64),
+            smooth_v_uniform: uniform("smooth v uniform", size_of::<BlurUniform>() as u64),
             develop_uniform: uniform("develop uniform", size_of::<DevelopUniform>() as u64),
+            curve_table,
+            curve_table_view,
+            curves_uploaded: None,
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
             sampler,
             readback: Readback::new(device),
@@ -337,6 +483,12 @@ impl Develop {
             height: photo.height,
             generation: self.generation,
             content: self.generation,
+            atmosphere: dehaze::atmosphere_rgba8(
+                &photo.rgba8,
+                photo.width,
+                photo.height,
+                photo.source,
+            ),
         });
         self.frame = None;
         log::info!(
@@ -375,6 +527,9 @@ impl Develop {
                 height,
                 generation: self.generation,
                 content: 0,
+                // A frame's own atmospheric light waits for per-clip
+                // analysis; until then haze is measured against white.
+                atmosphere: dehaze::WHITE_ATMOSPHERE,
             });
             self.frame = None;
             log::info!(
@@ -530,23 +685,8 @@ impl Develop {
                 }
             };
             let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
-            let radius = basic::blur_radius(sigma);
-            for (buffer, direction, luma) in [
-                (&self.blur_h_uniform, [1, 0], 1),
-                (&self.blur_v_uniform, [0, 1], 0),
-            ] {
-                self.queue.write_buffer(
-                    buffer,
-                    0,
-                    bytemuck::bytes_of(&BlurUniform {
-                        direction,
-                        radius,
-                        luma,
-                        sigma,
-                        _pad: [0.0; 3],
-                    }),
-                );
-            }
+            write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
+            write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
             draw(
                 &mut encoder,
                 head_label,
@@ -577,13 +717,124 @@ impl Develop {
                 Some(region),
             );
         }
-        let frame = self.frame.as_ref().expect("frame built above");
+        // The head-pass products of M3. Each is drawn once when its slider
+        // leaves 0 and again only after the head passes ran or the scissor
+        // moved, never on a plain slider change.
+        let frame = self.frame.as_mut().expect("frame built above");
+        let columns = scissor_for(crop, (width, height), true);
         let region = scissor_for(crop, (width, height), false);
+        if rerun || frame.products_region != Some(region) {
+            frame.texture_ready = false;
+            frame.transmission_ready = false;
+            frame.products_region = Some(region);
+        }
+        if edit.texture != 0.0 && !frame.texture_ready {
+            let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
+            write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
+            write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
+            draw(
+                &mut encoder,
+                "texture blur h",
+                &self.blur.pipeline,
+                &frame.texture_h_bind,
+                &frame.ping.view,
+                Some(columns),
+            );
+            draw(
+                &mut encoder,
+                "texture blur v",
+                &self.blur.pipeline,
+                &frame.texture_v_bind,
+                &frame.texture_base.view,
+                Some(region),
+            );
+            frame.texture_ready = true;
+        }
+        if edit.dehaze != 0.0 && !frame.transmission_ready {
+            let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
+            let a = source.atmosphere;
+            for (buffer, direction, stage) in [
+                (&self.minimum_h_uniform, [1, 0], 0),
+                (&self.minimum_v_uniform, [0, 1], 1),
+            ] {
+                self.queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::bytes_of(&MinimumUniform {
+                        direction,
+                        radius,
+                        stage,
+                        atmosphere: [a[0], a[1], a[2], 1.0],
+                    }),
+                );
+            }
+            let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
+            write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
+            write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
+            // The minimum runs over the whole render: the smoothing reads
+            // the map beyond the scissor on every side.
+            draw(
+                &mut encoder,
+                "minimum h",
+                &self.minimum.pipeline,
+                &frame.minimum_h_bind,
+                &frame.ping.view,
+                None,
+            );
+            draw(
+                &mut encoder,
+                "minimum v",
+                &self.minimum.pipeline,
+                &frame.minimum_v_bind,
+                &frame.transmission.view,
+                None,
+            );
+            draw(
+                &mut encoder,
+                "transmission blur h",
+                &self.blur.pipeline,
+                &frame.smooth_h_bind,
+                &frame.ping.view,
+                Some(columns),
+            );
+            draw(
+                &mut encoder,
+                "transmission blur v",
+                &self.blur.pipeline,
+                &frame.smooth_v_bind,
+                &frame.transmission.view,
+                Some(region),
+            );
+            frame.transmission_ready = true;
+        }
+        let curves = &edit.look.curves;
+        if !curves.is_identity() && self.curves_uploaded.as_ref() != Some(curves) {
+            let tables = curve::bake(curves);
+            let texels: Vec<[f32; 4]> = (0..TABLE_SIZE)
+                .map(|i| [tables.red[i], tables.green[i], tables.blue[i], 1.0])
+                .collect();
+            self.queue.write_texture(
+                self.curve_table.as_image_copy(),
+                bytemuck::cast_slice(&texels),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(TABLE_SIZE as u32 * 16),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: TABLE_SIZE as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.curves_uploaded = Some(curves.clone());
+        }
+        let frame = self.frame.as_ref().expect("frame built above");
 
         self.queue.write_buffer(
             &self.develop_uniform,
             0,
-            bytemuck::bytes_of(&DevelopUniform::new(edit)),
+            bytemuck::bytes_of(&DevelopUniform::new(edit, source.atmosphere)),
         );
         draw(
             &mut encoder,
@@ -773,6 +1024,8 @@ impl Develop {
         let working = create_target(device, "working", WORKING_FORMAT, width, height);
         let ping = create_target(device, "blur ping", BASE_FORMAT, width, height);
         let base = create_target(device, "base", BASE_FORMAT, width, height);
+        let texture_base = create_target(device, "texture base", BASE_FORMAT, width, height);
+        let transmission = create_target(device, "transmission", BASE_FORMAT, width, height);
         let developed = create_target(device, "developed", WORKING_FORMAT, width, height);
         let input_bind = match &source.kind {
             SourceKind::Photo { view, .. } => {
@@ -827,6 +1080,46 @@ impl Develop {
                 },
             ],
         });
+        let blur_bind = |label: &str, uniform: &wgpu::Buffer, view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.blur.layout,
+                entries: &[
+                    buffer_binding(0, uniform),
+                    texture_binding(1, view),
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            })
+        };
+        let texture_h_bind = blur_bind(
+            "texture h bind group",
+            &self.texture_h_uniform,
+            &working.view,
+        );
+        let texture_v_bind = blur_bind("texture v bind group", &self.texture_v_uniform, &ping.view);
+        let smooth_h_bind = blur_bind(
+            "smooth h bind group",
+            &self.smooth_h_uniform,
+            &transmission.view,
+        );
+        let smooth_v_bind = blur_bind("smooth v bind group", &self.smooth_v_uniform, &ping.view);
+        let minimum_bind = |label: &str, uniform: &wgpu::Buffer, view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.minimum.layout,
+                entries: &[buffer_binding(0, uniform), texture_binding(1, view)],
+            })
+        };
+        let minimum_h_bind = minimum_bind(
+            "minimum h bind group",
+            &self.minimum_h_uniform,
+            &working.view,
+        );
+        let minimum_v_bind =
+            minimum_bind("minimum v bind group", &self.minimum_v_uniform, &ping.view);
         let develop_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("develop bind group"),
             layout: &self.develop.layout,
@@ -834,6 +1127,9 @@ impl Develop {
                 buffer_binding(0, &self.develop_uniform),
                 texture_binding(1, &working.view),
                 texture_binding(2, &base.view),
+                texture_binding(3, &texture_base.view),
+                texture_binding(4, &transmission.view),
+                texture_binding(5, &self.curve_table_view),
             ],
         });
         Frame {
@@ -847,10 +1143,21 @@ impl Develop {
             working,
             ping,
             base,
+            texture_base,
+            transmission,
             developed,
+            texture_ready: false,
+            transmission_ready: false,
+            products_region: None,
             input_bind,
             blur_h_bind,
             blur_v_bind,
+            texture_h_bind,
+            texture_v_bind,
+            minimum_h_bind,
+            minimum_v_bind,
+            smooth_h_bind,
+            smooth_v_bind,
             develop_bind,
         }
     }
@@ -914,6 +1221,42 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
+}
+
+/// The tone curve table: full floats, which are not filterable without a
+/// device feature, read with `textureLoad` only.
+fn table_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// Writes the uniform of one blur pass.
+fn write_blur(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    direction: [i32; 2],
+    luma: u32,
+    sigma: f32,
+) {
+    queue.write_buffer(
+        buffer,
+        0,
+        bytemuck::bytes_of(&BlurUniform {
+            direction,
+            radius: basic::blur_radius(sigma),
+            luma,
+            sigma,
+            _pad: [0.0; 3],
+        }),
+    );
 }
 
 fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -1049,8 +1392,126 @@ fn draw(
 
 #[cfg(test)]
 mod tests {
-    use super::scissor_for;
+    use super::{DevelopUniform, MinimumUniform, scissor_for};
     use slate_core::CropRect;
+    use std::mem::offset_of;
+    use wgpu::naga;
+
+    /// The size of the struct named `Uniform` in a shader and the offset of
+    /// every member, as naga lays them out.
+    fn wgsl_uniform(source: &str) -> (u32, Vec<(String, u32)>) {
+        let module = naga::front::wgsl::parse_str(source).expect("the shader parses");
+        for (_, ty) in module.types.iter() {
+            if ty.name.as_deref() != Some("Uniform") {
+                continue;
+            }
+            if let naga::TypeInner::Struct { members, span } = &ty.inner {
+                let offsets = members
+                    .iter()
+                    .map(|m| (m.name.clone().unwrap_or_default(), m.offset))
+                    .collect();
+                return (*span, offsets);
+            }
+        }
+        panic!("the shader has no struct named Uniform");
+    }
+
+    #[test]
+    fn the_develop_uniform_matches_the_wgsl_struct() {
+        let (size, offsets) = wgsl_uniform(include_str!("shaders/develop.wgsl"));
+        assert_eq!(size as usize, size_of::<DevelopUniform>());
+        let offset = |name: &str| {
+            offsets
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("no member {name}"))
+                .1 as usize
+        };
+        assert_eq!(
+            offset("white_balance"),
+            offset_of!(DevelopUniform, white_balance)
+        );
+        assert_eq!(
+            offset("white_balance_temperature"),
+            offset_of!(DevelopUniform, white_balance_temperature)
+        );
+        assert_eq!(offset("saturation"), offset_of!(DevelopUniform, saturation));
+        assert_eq!(
+            offset("texture_amount"),
+            offset_of!(DevelopUniform, texture)
+        );
+        assert_eq!(offset("clarity"), offset_of!(DevelopUniform, clarity));
+        assert_eq!(offset("dehaze"), offset_of!(DevelopUniform, dehaze));
+        assert_eq!(offset("flags"), offset_of!(DevelopUniform, flags));
+        assert_eq!(offset("atmosphere"), offset_of!(DevelopUniform, atmosphere));
+        assert_eq!(offset("cdl_slope"), offset_of!(DevelopUniform, cdl_slope));
+        assert_eq!(offset("cdl_offset"), offset_of!(DevelopUniform, cdl_offset));
+        assert_eq!(offset("cdl_power"), offset_of!(DevelopUniform, cdl_power));
+        assert_eq!(offset("hsl"), offset_of!(DevelopUniform, hsl));
+        assert_eq!(offsets.len(), 20, "a member was added without a check here");
+    }
+
+    #[test]
+    fn the_minimum_uniform_matches_the_wgsl_struct() {
+        let (size, offsets) = wgsl_uniform(include_str!("shaders/minimum.wgsl"));
+        assert_eq!(size as usize, size_of::<MinimumUniform>());
+        assert_eq!(offsets[3], ("atmosphere".to_string(), 16));
+    }
+
+    /// The list after `name` in a shader, as numbers.
+    fn wgsl_list(source: &str, name: &str) -> Vec<f32> {
+        let start = source.find(name).expect("the constant is in the shader");
+        let rest = &source[start..];
+        let open = rest.find(">(").expect("a constructor follows") + 2;
+        let close = rest[open..].find(')').expect("the constructor closes") + open;
+        rest[open..close]
+            .split(',')
+            .map(|n| n.trim().parse().expect("a number"))
+            .collect()
+    }
+
+    #[test]
+    fn the_shader_hue_centres_equal_the_slate_color_list() {
+        let shader = wgsl_list(
+            include_str!("shaders/develop.wgsl"),
+            "const HUE_CENTRES: array<f32, 8> =",
+        );
+        let twin = slate_color::hue::range_centres();
+        assert_eq!(shader.len(), twin.len());
+        for (k, (s, t)) in shader.iter().zip(twin).enumerate() {
+            assert!(
+                (s - t).abs() < 1e-6,
+                "centre {k}: shader {s}, slate-color {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shader_constants_equal_the_slate_color_constants() {
+        let source = include_str!("shaders/develop.wgsl");
+        let value = |name: &str| -> f32 {
+            let start = source
+                .find(&format!("const {name}: f32 = "))
+                .unwrap_or_else(|| panic!("no constant {name}"));
+            let rest = &source[start..];
+            let from = rest.find("= ").expect("an equals sign") + 2;
+            let to = rest.find(';').expect("a semicolon");
+            rest[from..to].trim().parse().expect("a number")
+        };
+        use slate_color::{acescct, dehaze, hsl, local};
+        assert_eq!(value("ACES_LINEAR_CUT"), acescct::LINEAR_CUT);
+        assert_eq!(value("ACES_ENCODED_CUT"), acescct::ENCODED_CUT);
+        assert_eq!(value("ACES_SLOPE"), acescct::SLOPE);
+        assert_eq!(value("ACES_OFFSET"), acescct::OFFSET);
+        assert_eq!(value("ACES_LOG_SHIFT"), acescct::LOG_SHIFT);
+        assert_eq!(value("ACES_LOG_SCALE"), acescct::LOG_SCALE);
+        assert_eq!(value("LOCAL_STRENGTH"), local::STRENGTH);
+        assert_eq!(value("CLARITY_HALF_WIDTH"), local::CLARITY_HALF_WIDTH);
+        assert_eq!(value("TRANSMISSION_FLOOR"), dehaze::TRANSMISSION_FLOOR);
+        assert_eq!(value("RECOVERY_FLOOR"), dehaze::RECOVERY_FLOOR);
+        assert_eq!(value("CHROMA_FLOOR"), hsl::CHROMA_FLOOR);
+        assert_eq!(value("CHROMA_FULL"), hsl::CHROMA_FULL);
+    }
 
     #[test]
     fn the_scissor_covers_the_crop_and_a_margin_inside_the_render() {
