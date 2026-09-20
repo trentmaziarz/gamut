@@ -83,6 +83,20 @@ pub struct PhotoEdit {
     pub masks: Vec<Mask>,
 }
 
+impl PhotoEdit {
+    /// Whether the two edits differ in nothing but the strokes of their
+    /// brushes.
+    pub fn same_but_strokes(&self, other: &PhotoEdit) -> bool {
+        self.adjust == other.adjust
+            && self.masks.len() == other.masks.len()
+            && self
+                .masks
+                .iter()
+                .zip(&other.masks)
+                .all(|(a, b)| a.same_but_strokes(b))
+    }
+}
+
 impl Deref for PhotoEdit {
     type Target = Adjustments;
 

@@ -317,6 +317,37 @@ struct OutputUniform {
     overlay: [f32; 4],
 }
 
+/// What of the picture a render has to draw again because of the masks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Damage {
+    Nothing,
+    /// Only where new dabs of a growing brush reach.
+    Part(PixelRect),
+    Whole,
+}
+
+impl Damage {
+    fn with(self, rect: Option<PixelRect>) -> Damage {
+        match (self, rect) {
+            (Damage::Whole, _) => Damage::Whole,
+            (damage, None) => damage,
+            (Damage::Nothing, Some(rect)) => Damage::Part(rect),
+            (Damage::Part(a), Some(b)) => {
+                let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+                let (x1, y1) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+                Damage::Part((x0, y0, x1 - x0, y1 - y0))
+            }
+        }
+    }
+}
+
+/// The part of `a` inside `b`, when there is any.
+fn intersect(a: PixelRect, b: PixelRect) -> Option<PixelRect> {
+    let (x0, y0) = (a.0.max(b.0), a.1.max(b.1));
+    let (x1, y1) = ((a.0 + a.2).min(b.0 + b.2), (a.1 + a.3).min(b.1 + b.3));
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
 /// A pipeline and the layout of its one bind group.
 struct Pass {
     pipeline: wgpu::RenderPipeline,
@@ -467,6 +498,10 @@ pub struct Develop {
     /// dabs were stamped onto a layer, for the cache test.
     layer_builds: u64,
     layer_appends: u64,
+    /// How many times an alpha, and how many times the developed picture,
+    /// was drawn again over the reach of new dabs only.
+    alpha_patches: u64,
+    develop_patches: u64,
     output_uniform: wgpu::Buffer,
     /// The mask of the list shown as a red overlay, when one is.
     overlay: Option<usize>,
@@ -636,6 +671,8 @@ impl Develop {
             alpha_builds: 0,
             layer_builds: 0,
             layer_appends: 0,
+            alpha_patches: 0,
+            develop_patches: 0,
             output_uniform: uniform("output uniform", size_of::<OutputUniform>() as u64),
             overlay: None,
             no_overlay: zero_texel(device, queue),
@@ -802,6 +839,12 @@ impl Develop {
     /// How many times new dabs were stamped onto a layer that was kept.
     pub fn brush_layer_appends(&self) -> u64 {
         self.layer_appends
+    }
+
+    /// How many of the mask alphas drawn were drawn over the reach of new
+    /// dabs only, and how many times the developed picture was.
+    pub fn brush_patches(&self) -> (u64, u64) {
+        (self.alpha_patches, self.develop_patches)
     }
 
     /// The size of the source photo, when one is set.
@@ -1146,6 +1189,9 @@ impl Develop {
             size: (width, height),
             photo: (source.width, source.height),
         };
+        // What the masks changed of the picture in this render. A brush that
+        // only grew changes what its new dabs reach and nothing else.
+        let mut damage = Damage::Nothing;
         let only_shown = overlaid
             .iter()
             .filter(|(index, _)| masks.iter().all(|(active, _)| active != index));
@@ -1206,6 +1252,7 @@ impl Develop {
                 slot.raster_bind = raster_bind(&slot.layers);
                 slot.shape = None;
             }
+            let mut stamped = Damage::Nothing;
             for (layer, brush) in brushes.iter().enumerate() {
                 let drawn = slot.layers.update(
                     layer,
@@ -1218,8 +1265,14 @@ impl Develop {
                 );
                 match drawn {
                     Drawn::Nothing => {}
-                    Drawn::Appended(_) => self.layer_appends += 1,
-                    Drawn::Whole => self.layer_builds += 1,
+                    Drawn::Appended(reach) => {
+                        self.layer_appends += 1;
+                        stamped = stamped.with(reach);
+                    }
+                    Drawn::Whole => {
+                        self.layer_builds += 1;
+                        stamped = Damage::Whole;
+                    }
                 }
             }
             let shape = mask.shape();
@@ -1229,14 +1282,42 @@ impl Develop {
                     0,
                     bytemuck::bytes_of(&MaskUniform::new(mask, &geometry)),
                 );
-                draw(
-                    &mut encoder,
-                    "mask alpha",
-                    &self.mask.pipeline,
-                    &slot.raster_bind,
-                    &slot.alpha.view,
-                    Some(region),
-                );
+                // A shape that differs from the one the alpha holds only by
+                // strokes stamped onto its layers is drawn again where those
+                // dabs reach; anything else is drawn again whole.
+                let grew = stamped != Damage::Whole
+                    && slot
+                        .shape
+                        .as_ref()
+                        .is_some_and(|held| held.same_but_strokes(&shape));
+                if grew {
+                    let reach = match stamped {
+                        Damage::Part(reach) => intersect(reach, region),
+                        _ => None,
+                    };
+                    if let Some(reach) = reach {
+                        draw_over(
+                            &mut encoder,
+                            "mask alpha",
+                            &self.mask.pipeline,
+                            &slot.raster_bind,
+                            &slot.alpha.view,
+                            Some(reach),
+                        );
+                        self.alpha_patches += 1;
+                    }
+                    damage = damage.with(reach);
+                } else {
+                    draw(
+                        &mut encoder,
+                        "mask alpha",
+                        &self.mask.pipeline,
+                        &slot.raster_bind,
+                        &slot.alpha.view,
+                        Some(region),
+                    );
+                    damage = Damage::Whole;
+                }
                 slot.shape = Some(shape);
                 self.alpha_builds += 1;
             }
@@ -1271,30 +1352,53 @@ impl Develop {
             .as_ref()
             .is_some_and(|(drawn, scissor)| *scissor == seen && drawn == edit);
         if !developed {
-            self.queue.write_buffer(
-                &self.develop_uniform,
-                0,
-                bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
-            );
-            draw(
-                &mut encoder,
-                "develop",
-                &self.develop.pipeline,
-                &frame.develop_bind,
-                &frame.developed.view,
-                Some(seen),
-            );
-            // The ordered blend: each mask in list order over what is there.
-            for (index, _) in &masks {
-                let slot = frame.masks[*index].as_ref().expect("built above");
-                draw_over(
-                    &mut encoder,
-                    "masked develop",
-                    &self.masked.pipeline,
-                    &slot.develop_bind,
-                    &frame.developed.view,
-                    Some(seen),
+            // While a stroke grows the edit differs from the one developed
+            // only by strokes, and the picture only where the new dabs
+            // reach: the passes run over that part of what is seen alone.
+            let grew = damage != Damage::Whole
+                && frame
+                    .developed_for
+                    .as_ref()
+                    .is_some_and(|(drawn, scissor)| {
+                        *scissor == seen && drawn.same_but_strokes(edit)
+                    });
+            let over = match damage {
+                _ if !grew => Some(seen),
+                Damage::Part(reach) => intersect(reach, seen),
+                _ => None,
+            };
+            if let Some(over) = over {
+                self.queue.write_buffer(
+                    &self.develop_uniform,
+                    0,
+                    bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
                 );
+                // A part is drawn over what the texture holds around it.
+                let global = if grew { draw_over } else { draw };
+                global(
+                    &mut encoder,
+                    "develop",
+                    &self.develop.pipeline,
+                    &frame.develop_bind,
+                    &frame.developed.view,
+                    Some(over),
+                );
+                // The ordered blend: each mask in list order over what is
+                // there.
+                for (index, _) in &masks {
+                    let slot = frame.masks[*index].as_ref().expect("built above");
+                    draw_over(
+                        &mut encoder,
+                        "masked develop",
+                        &self.masked.pipeline,
+                        &slot.develop_bind,
+                        &frame.developed.view,
+                        Some(over),
+                    );
+                }
+                if grew {
+                    self.develop_patches += 1;
+                }
             }
             frame.developed_for = Some((edit.clone(), seen));
         }

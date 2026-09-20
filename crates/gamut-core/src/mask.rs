@@ -156,6 +156,11 @@ impl Default for MaskSource {
 }
 
 impl MaskSource {
+    /// Whether the two are equal, or are both brushes whatever they hold.
+    pub fn same_but_strokes(&self, other: &MaskSource) -> bool {
+        matches!((self, other), (MaskSource::Brush(_), MaskSource::Brush(_))) || self == other
+    }
+
     /// The name of the source for a list row.
     pub fn label(&self) -> &'static str {
         match self {
@@ -259,6 +264,13 @@ pub struct Component {
 }
 
 impl Component {
+    /// Whether the two differ in nothing but the strokes of a brush.
+    pub fn same_but_strokes(&self, other: &Component) -> bool {
+        self.op == other.op
+            && self.invert == other.invert
+            && self.source.same_but_strokes(&other.source)
+    }
+
     pub fn new(source: MaskSource) -> Self {
         Component {
             op: MaskOp::Add,
@@ -303,6 +315,18 @@ impl Mask {
             components: vec![Component::new(source)],
             ..Mask::default()
         }
+    }
+
+    /// Whether the two masks differ in nothing but the strokes of their
+    /// brushes: what a render that only has new dabs to stamp checks before
+    /// it leaves the rest of the picture alone.
+    pub fn same_but_strokes(&self, other: &Mask) -> bool {
+        self.name == other.name
+            && self.enabled == other.enabled
+            && self.invert == other.invert
+            && self.opacity == other.opacity
+            && self.adjust == other.adjust
+            && same_components_but_strokes(&self.components, &other.components)
     }
 
     /// Whether the mask changes the picture: it is enabled, some of it
@@ -354,6 +378,19 @@ impl Mask {
 pub struct MaskShape {
     pub components: Vec<Component>,
     pub invert: bool,
+}
+
+impl MaskShape {
+    /// Whether the two shapes differ in nothing but the strokes of their
+    /// brushes.
+    pub fn same_but_strokes(&self, other: &MaskShape) -> bool {
+        self.invert == other.invert
+            && same_components_but_strokes(&self.components, &other.components)
+    }
+}
+
+fn same_components_but_strokes(a: &[Component], b: &[Component]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_but_strokes(b))
 }
 
 /// The first [`MAX_MASKS`] masks of a list, each sanitised.
@@ -590,6 +627,53 @@ mod tests {
             panic!("brushes");
         };
         assert!(after.strokes[0].shares_with(&before.strokes[0]));
+    }
+
+    #[test]
+    fn masks_that_differ_only_in_strokes_are_told_from_the_rest() {
+        use crate::brush::{SharedStroke, Stroke};
+        let dab = SharedStroke::new(&Stroke {
+            points: vec![[0.5, 0.5]],
+            ..Stroke::default()
+        });
+        let mut mask = Mask::new("Hair", MaskSource::Brush(Brush::default()));
+        mask.components.push(Component::new(MaskSource::default()));
+        let mut painted = mask.clone();
+        let MaskSource::Brush(brush) = &mut painted.components[0].source else {
+            panic!("a brush");
+        };
+        brush.strokes.push(dab);
+        assert_ne!(mask, painted);
+        assert!(mask.same_but_strokes(&painted));
+        assert!(mask.shape().same_but_strokes(&painted.shape()));
+        assert!(mask.same_but_strokes(&mask.clone()));
+
+        let mut other = painted.clone();
+        other.adjust.exposure = 0.5;
+        assert!(!mask.same_but_strokes(&other), "an adjustment");
+        assert!(
+            mask.shape().same_but_strokes(&other.shape()),
+            "is no part of the shape"
+        );
+        let mut other = painted.clone();
+        other.opacity = 50.0;
+        assert!(!mask.same_but_strokes(&other), "the opacity");
+        let mut other = painted.clone();
+        other.components[0].invert = true;
+        assert!(!mask.same_but_strokes(&other), "a component's invert");
+        assert!(!mask.shape().same_but_strokes(&other.shape()));
+        let mut other = painted.clone();
+        other.components[1].source = MaskSource::Radial(RadialGradient::default());
+        assert!(!mask.same_but_strokes(&other), "another source");
+        let mut other = painted.clone();
+        other.components.pop();
+        assert!(
+            !mask.shape().same_but_strokes(&other.shape()),
+            "a component fewer"
+        );
+        let mut other = painted;
+        other.components[0].source = MaskSource::default();
+        assert!(!mask.same_but_strokes(&other), "a brush against a gradient");
     }
 
     #[test]

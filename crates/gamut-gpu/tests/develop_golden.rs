@@ -1721,3 +1721,116 @@ fn a_brush_layer_is_kept_until_its_strokes_change() {
     };
     assert_eq!(counts_after(&edit, &elsewhere), (3, 1, 6), "another window");
 }
+
+/// A stroke painted piece by piece, the way the window paints it, is the
+/// stroke drawn whole: new dabs go onto the layer that is there, and the
+/// alpha and the develop passes run over what those dabs reach only. Dabs
+/// build in order, so nothing is lost by it. A second brush mask that does
+/// not grow is never stamped again.
+#[test]
+fn a_stroke_painted_in_ten_appended_pieces_equals_the_stroke_drawn_whole() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let readback = Readback::new(&gpu.device);
+    let path: Vec<[f32; 2]> = (0..=40)
+        .map(|i| {
+            let t = i as f32 / 40.0;
+            [0.15 + t * 0.7, 0.5 + (t * 7.0).sin() * 0.25]
+        })
+        .collect();
+    let eraser: Vec<[f32; 2]> = (0..=20)
+        .map(|i| {
+            [
+                0.5 + (i as f32 / 20.0 - 0.5) * 0.1,
+                0.1 + i as f32 / 20.0 * 0.8,
+            ]
+        })
+        .collect();
+    // The edit with the first `painted` points of the stroke and the first
+    // `erased` points of the erase stroke after it.
+    let edit_at = |painted: usize, erased: usize| -> PhotoEdit {
+        let mut strokes = painted_strokes();
+        strokes.push(stroke(&path[..painted], 0.07, 45.0, 60.0));
+        if erased > 0 {
+            strokes.push(Stroke {
+                erase: true,
+                ..stroke(&eraser[..erased], 0.05, 30.0, 70.0)
+            });
+        }
+        let mut edit = everything_global();
+        let mut growing = exposure_mask("Growing", brush_source(&strokes));
+        growing.adjust.clarity = 25.0;
+        let resting = exposure_mask(
+            "Resting",
+            brush_source(&[stroke(&[[0.2, 0.8], [0.8, 0.85]], 0.06, 50.0, 80.0)]),
+        );
+        edit.masks = vec![growing, resting, exposure_mask("Radial", radial_source())];
+        edit
+    };
+    let [_, view] = zoomed_views();
+    for zoomed in [false, true] {
+        let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+            if zoomed {
+                view_render_of(develop, &gpu, &readback, edit, &view)
+            } else {
+                let drawn = develop
+                    .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+                    .expect("a source is set");
+                readback.read(&gpu.device, &gpu.queue, drawn, SIZE, SIZE)
+            }
+        };
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        let mut pieces = Vec::new();
+        for piece in 1..=10 {
+            pieces.push(render(&mut develop, &edit_at(piece * 4 + 1, 0)));
+        }
+        for piece in 1..=5 {
+            pieces.push(render(&mut develop, &edit_at(41, piece * 4 + 1)));
+        }
+        assert_ne!(pieces[0], pieces[9], "the stroke grew on the picture");
+        assert_ne!(pieces[9], pieces[14], "and the eraser took some of it away");
+        assert_eq!(
+            develop.brush_layer_builds(),
+            2,
+            "each layer stamped whole once"
+        );
+        assert_eq!(
+            develop.brush_layer_appends(),
+            14,
+            "and the growing one added to"
+        );
+        // Fitted, every piece is seen and is drawn over its own reach. Zoomed,
+        // a piece outside what is seen develops nothing at all.
+        let (alphas, develops) = develop.brush_patches();
+        if zoomed {
+            assert!(alphas > 0 && alphas <= 14 && develops > 0 && develops <= alphas);
+        } else {
+            assert_eq!((alphas, develops), (14, 14), "over the new dabs only");
+        }
+        assert_eq!(develop.mask_alpha_builds(), 3 + 14);
+
+        let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+        fresh.set_source(&photo);
+        let whole = render(&mut fresh, &edit_at(41, 21));
+        assert_eq!(fresh.brush_layer_appends(), 0);
+        let max = max_difference(&pieces[14], &whole);
+        println!(
+            "a stroke in appended pieces against the stroke whole, zoomed {zoomed}: max difference {max}"
+        );
+        assert!(max <= 1, "max difference {max}, zoomed {zoomed}");
+
+        // An undo takes the erase stroke away: the layer starts again and
+        // the picture is the one from before it.
+        let undone = render(&mut develop, &edit_at(41, 0));
+        assert_eq!(develop.brush_layer_builds(), 3);
+        assert!(max_difference(&undone, &pieces[9]) <= 1);
+    }
+}
