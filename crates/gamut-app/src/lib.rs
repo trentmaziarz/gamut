@@ -28,6 +28,7 @@ pub mod reel;
 pub mod screenshot;
 pub mod sidecar;
 pub mod timeline_tab;
+pub mod view;
 pub mod viewer;
 pub mod wheel;
 
