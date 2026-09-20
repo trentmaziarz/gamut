@@ -112,6 +112,20 @@ impl Prepared {
     }
 }
 
+/// The index of the mask `--show-mask` names, or the masks that exist.
+pub fn mask_named(sidecar: &Sidecar, name: &str) -> Result<usize, HeadlessError> {
+    let masks = &sidecar.edit.masks;
+    slate_core::mask::find(masks, name).ok_or_else(|| {
+        let name = name.trim();
+        HeadlessError::Edit(if masks.is_empty() {
+            format!("no mask named {name}: this edit has no masks")
+        } else {
+            let names: Vec<&str> = masks.iter().map(|m| m.name.as_str()).collect();
+            format!("no mask named {name}: the masks are {}", names.join(", "))
+        })
+    })
+}
+
 /// The crop a sidecar asks for. A sidecar whose rectangle is the whole
 /// photo (the default) is fitted to the photo at its aspect.
 pub fn crop_for(sidecar: &Sidecar, width: u32, height: u32) -> Crop {

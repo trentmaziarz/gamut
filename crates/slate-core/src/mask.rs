@@ -354,6 +354,12 @@ pub fn sanitised(masks: &[Mask]) -> Vec<Mask> {
     masks.iter().take(MAX_MASKS).map(Mask::sanitised).collect()
 }
 
+/// The index of the mask with this name, compared without case.
+pub fn find(masks: &[Mask], name: &str) -> Option<usize> {
+    let wanted = name.trim().to_lowercase();
+    masks.iter().position(|m| m.name.to_lowercase() == wanted)
+}
+
 /// A name no mask of the list has yet: the base, or the base and a number.
 pub fn free_name(masks: &[Mask], base: &str) -> String {
     let taken = |name: &str| masks.iter().any(|m| m.name.eq_ignore_ascii_case(name));
@@ -556,6 +562,17 @@ mod tests {
         mask.opacity = 50.0;
         mask.enabled = false;
         assert!(!mask.is_active());
+    }
+
+    #[test]
+    fn a_mask_is_found_by_its_name_without_regard_to_case() {
+        let masks = vec![
+            Mask::new("Sky", MaskSource::default()),
+            Mask::new("Face", MaskSource::default()),
+        ];
+        assert_eq!(find(&masks, " face "), Some(1));
+        assert_eq!(find(&masks, "SKY"), Some(0));
+        assert_eq!(find(&masks, "Hair"), None);
     }
 
     #[test]

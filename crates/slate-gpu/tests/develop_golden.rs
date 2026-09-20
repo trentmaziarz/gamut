@@ -1150,7 +1150,7 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
     let readback = Readback::new(&gpu.device);
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_source(&photo);
-    let mut render = |develop: &mut Develop| -> Vec<[u8; 3]> {
+    let render = |develop: &mut Develop| -> Vec<[u8; 3]> {
         let view = develop
             .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
             .expect("a source is set");

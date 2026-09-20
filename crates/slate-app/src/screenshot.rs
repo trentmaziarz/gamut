@@ -11,7 +11,7 @@ use slate_gpu::develop::render_size_for_crop;
 use slate_gpu::{Develop, Headless, Readback, TestImage};
 use slate_media::VideoSource;
 
-use crate::headless::{EditSource, HeadlessError, Prepared};
+use crate::headless::{EditSource, HeadlessError, Prepared, mask_named};
 use crate::project;
 
 /// The video screenshot size: the 9:16 Reel.
@@ -35,11 +35,26 @@ pub fn write(path: &Path) -> Result<(), HeadlessError> {
 /// Opens `photo`, applies its sidecar (or the one at `edit`), renders the
 /// crop at [`SIZE`] and writes it to `out` as a PNG.
 pub fn write_developed(photo: &Path, source: EditSource, out: &Path) -> Result<(), HeadlessError> {
+    write_developed_showing(photo, source, None, out)
+}
+
+/// [`write_developed`] with the mask of this name shown as the red overlay,
+/// for `--show-mask`. An unknown name is an error that lists the masks.
+pub fn write_developed_showing(
+    photo: &Path,
+    source: EditSource,
+    show_mask: Option<&str>,
+    out: &Path,
+) -> Result<(), HeadlessError> {
     let prepared = Prepared::open(photo, source)?;
+    let overlay = show_mask
+        .map(|name| mask_named(&prepared.sidecar, name))
+        .transpose()?;
     let crop = prepared.crop();
     let gpu = &prepared.gpu;
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_source(&prepared.photo);
+    develop.set_overlay(overlay);
     let render_size = render_size_for_crop(crop.rect, SIZE);
     let view = develop
         .render(&prepared.sidecar.edit, crop.rect, render_size, SIZE)

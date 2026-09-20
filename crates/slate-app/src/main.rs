@@ -6,12 +6,13 @@ use slate_app::{SlateApp, WINDOW_TITLE, export, native_options, reel, screenshot
 use slate_core::ExportPreset;
 
 const USAGE: &str = "usage: slate-app [<photo, video or project.slate>]
-       slate-app [--open <photo>] --screenshot <out.png> [look]
+       slate-app [--open <photo>] --screenshot <out.png> [look] [--show-mask <name>]
        slate-app --open <video or project.slate> --screenshot <out.png> --at <seconds>
        slate-app --open <photo> --export <4x5|1x1|3x4|9x16> <out.jpg> [look]
        slate-app --export-reel <video or project.slate> <out.mp4>
 look:  [--edit <sidecar.json>] [--version-name <name>] [--preset <look.json>]
-       the named version of the sidecar, then the look preset over it";
+       the named version of the sidecar, then the look preset over it
+--show-mask draws the named mask of the edit as a red overlay on a screenshot";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -23,6 +24,7 @@ enum Command {
         edit: Option<PathBuf>,
         version: Option<String>,
         look: Option<PathBuf>,
+        show_mask: Option<String>,
         out: PathBuf,
         at: Option<f64>,
     },
@@ -50,6 +52,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     let mut reel = None;
     let mut look = None;
     let mut version = None;
+    let mut show_mask = None;
     while let Some(arg) = args.next() {
         let mut value = |slot: &mut Option<PathBuf>| match args.next() {
             Some(path) if slot.is_none() => {
@@ -65,6 +68,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
             "--preset" => value(&mut look)?,
             "--version-name" => match (args.next(), &version) {
                 (Some(name), None) if !name.trim().is_empty() => version = Some(name),
+                _ => return Err(USAGE),
+            },
+            "--show-mask" => match (args.next(), &show_mask) {
+                (Some(name), None) if !name.trim().is_empty() => show_mask = Some(name),
                 _ => return Err(USAGE),
             },
             "--at" => {
@@ -96,7 +103,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     }
     if let Some((input, out)) = reel {
         let plain = photo.is_none() && screenshot.is_none() && export.is_none();
-        let no_look = edit.is_none() && look.is_none() && version.is_none();
+        let no_look = edit.is_none() && look.is_none() && version.is_none() && show_mask.is_none();
         return if plain && no_look && at.is_none() {
             Ok(Command::ExportReel { input, out })
         } else {
@@ -105,12 +112,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
     }
     // A look needs a photo to land on, and a video frame takes none.
     let has_look = edit.is_some() || look.is_some() || version.is_some();
-    if (look.is_some() || version.is_some()) && photo.is_none() {
+    if (look.is_some() || version.is_some() || show_mask.is_some()) && photo.is_none() {
         return Err(USAGE);
     }
     match (screenshot, export) {
         (Some(out), None) => {
-            if at.is_some() && (photo.is_none() || has_look) {
+            if at.is_some() && (photo.is_none() || has_look || show_mask.is_some()) {
                 return Err(USAGE);
             }
             Ok(Command::Screenshot {
@@ -118,10 +125,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, &'static str> {
                 edit,
                 version,
                 look,
+                show_mask,
                 out,
                 at,
             })
         }
+        // The overlay is a view of a mask: it shows on a screenshot only.
+        _ if show_mask.is_some() => Err(USAGE),
         (None, Some((preset, out))) if at.is_none() => match photo {
             Some(photo) => Ok(Command::Export {
                 photo,
@@ -159,6 +169,7 @@ fn main() -> ExitCode {
             edit,
             version,
             look,
+            show_mask,
             out,
             at: None,
         } => {
@@ -167,7 +178,8 @@ fn main() -> ExitCode {
                 version: version.as_deref(),
                 look: look.as_deref(),
             };
-            screenshot::write_developed(&photo, source, &out).map_err(|error| error.to_string())
+            screenshot::write_developed_showing(&photo, source, show_mask.as_deref(), &out)
+                .map_err(|error| error.to_string())
         }
         Command::Screenshot {
             photo: None, out, ..
@@ -217,6 +229,64 @@ mod tests {
     }
 
     #[test]
+    fn show_mask_goes_with_a_photo_screenshot_and_nothing_else() {
+        assert_eq!(
+            parsed(&[
+                "--open",
+                "a.jpg",
+                "--edit",
+                "e.json",
+                "--screenshot",
+                "o.png",
+                "--show-mask",
+                "Sky"
+            ]),
+            Ok(Command::Screenshot {
+                photo: Some(PathBuf::from("a.jpg")),
+                edit: Some(PathBuf::from("e.json")),
+                version: None,
+                look: None,
+                show_mask: Some("Sky".to_string()),
+                out: PathBuf::from("o.png"),
+                at: None,
+            })
+        );
+        let with = |rest: &[&str]| {
+            let mut args = vec!["--show-mask", "Sky"];
+            args.extend_from_slice(rest);
+            parsed(&args)
+        };
+        assert!(with(&["--open", "a.jpg", "--export", "4x5", "o.jpg"]).is_err());
+        assert!(with(&["--export-reel", "p.slate", "o.mp4"]).is_err());
+        assert!(with(&["--open", "v.mp4", "--screenshot", "o.png", "--at", "1.5"]).is_err());
+        assert!(with(&["--screenshot", "o.png"]).is_err(), "no photo");
+        assert!(with(&["a.jpg"]).is_err(), "the window takes none");
+        assert!(
+            with(&[
+                "--open",
+                "a.jpg",
+                "--screenshot",
+                "o.png",
+                "--show-mask",
+                "B"
+            ])
+            .is_err()
+        );
+        assert!(parsed(&["--open", "a.jpg", "--screenshot", "o.png", "--show-mask"]).is_err());
+        assert!(
+            parsed(&[
+                "--open",
+                "a.jpg",
+                "--screenshot",
+                "o.png",
+                "--show-mask",
+                " "
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn no_arguments_opens_the_window() {
         assert_eq!(parsed(&[]), Ok(Command::Window { photo: None }));
     }
@@ -247,6 +317,7 @@ mod tests {
                 edit: Some(PathBuf::from("e.json")),
                 version: None,
                 look: None,
+                show_mask: None,
                 out: PathBuf::from("o.png"),
                 at: None,
             })
@@ -258,6 +329,7 @@ mod tests {
                 edit: None,
                 version: None,
                 look: None,
+                show_mask: None,
                 out: PathBuf::from("o.png"),
                 at: None,
             })
@@ -284,6 +356,7 @@ mod tests {
                 edit: Some(PathBuf::from("e.json")),
                 version: Some("Warm one".to_string()),
                 look: Some(PathBuf::from("look.json")),
+                show_mask: None,
                 out: PathBuf::from("o.png"),
                 at: None,
             })
@@ -361,6 +434,7 @@ mod tests {
                 edit: None,
                 version: None,
                 look: None,
+                show_mask: None,
                 out: PathBuf::from("o.png"),
                 at: Some(3.0),
             })
