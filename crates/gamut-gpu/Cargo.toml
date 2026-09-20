@@ -1,0 +1,19 @@
+[package]
+name = "gamut-gpu"
+description = "wgpu render graph and WGSL shaders: the offscreen frame egui draws and the readback for export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+log = { workspace = true }
+pollster = { workspace = true }
+wgpu = { workspace = true }
+gamut-color = { path = "../gamut-color" }
+gamut-core = { path = "../gamut-core" }
+gamut-media = { path = "../gamut-media" }
+
+[dev-dependencies]
+half = { workspace = true }

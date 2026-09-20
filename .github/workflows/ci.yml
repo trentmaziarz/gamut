@@ -77,7 +77,7 @@ jobs:
         run: |
           gh release download fixtures-m1 -p '*' -D fixtures
           gh release download fixtures-m2 -p '*' -D fixtures
-          "SLATE_FIXTURES=$env:GITHUB_WORKSPACE\fixtures" >> $env:GITHUB_ENV
+          "GAMUT_FIXTURES=$env:GITHUB_WORKSPACE\fixtures" >> $env:GITHUB_ENV
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint
@@ -85,8 +85,8 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Build the release app
-        run: cargo build --release -p slate-app
+        run: cargo build --release -p gamut-app
       - name: Time the develop render and the playback path
-        run: cargo test -p slate-gpu --release --test develop_timing --test playback_timing -- --nocapture
+        run: cargo test -p gamut-gpu --release --test develop_timing --test playback_timing -- --nocapture
       - name: Time the Reel export
-        run: cargo test -p slate-app --release --test reel_timing -- --nocapture
+        run: cargo test -p gamut-app --release --test reel_timing -- --nocapture

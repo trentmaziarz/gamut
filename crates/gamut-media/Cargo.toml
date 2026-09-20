@@ -1,0 +1,17 @@
+[package]
+name = "gamut-media"
+description = "Decode and encode: ffmpeg with NVDEC and NVENC, HEIC, RAW, JPEG, PNG, audio playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+ffmpeg-the-third = { workspace = true }
+libc = { workspace = true }
+image = { workspace = true }
+libheif-rs = { workspace = true }
+log = { workspace = true }
+gamut-color = { path = "../gamut-color" }
+thiserror = { workspace = true }
