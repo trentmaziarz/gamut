@@ -199,6 +199,8 @@ pub struct Session {
     pub project: Option<OpenProject>,
     pub edit: PhotoEdit,
     pub crop: Crop,
+    /// What the Adjust tab remembers that is not part of the edit.
+    pub adjust: crate::adjust::AdjustState,
     pub grid_guide: bool,
     /// The Viewer must run the develop graph again.
     pub develop_dirty: bool,

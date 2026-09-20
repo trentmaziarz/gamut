@@ -16,6 +16,7 @@
 
 pub mod adjust;
 pub mod app;
+pub mod curve_editor;
 pub mod export;
 pub mod headless;
 pub mod player;
@@ -25,5 +26,6 @@ pub mod screenshot;
 pub mod sidecar;
 pub mod timeline_tab;
 pub mod viewer;
+pub mod wheel;
 
 pub use app::{SlateApp, WINDOW_TITLE, native_options};
