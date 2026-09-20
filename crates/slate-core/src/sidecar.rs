@@ -15,7 +15,7 @@ pub const VERSION: u32 = 1;
 pub const SUFFIX: &str = ".slate.json";
 
 /// The saved state of one photo.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sidecar {
     pub version: u32,

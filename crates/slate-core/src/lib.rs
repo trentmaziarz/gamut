@@ -11,23 +11,28 @@ use serde::{Deserialize, Serialize};
 
 pub mod crop;
 pub mod export;
+pub mod look;
 pub mod project;
 pub mod sidecar;
 pub mod timeline;
 
 pub use crop::{Crop, CropAspect, CropRect};
 pub use export::ExportPreset;
+pub use look::{Curve, HslRange, Look, ToneCurves, Wheel, Wheels};
 pub use project::{MediaRef, Project};
 pub use sidecar::Sidecar;
 pub use timeline::{Clip, Track};
 
-/// The edit parameters of one photo: the Basic panel of M1.
+/// The edit parameters of one photo: the Basic panel of M1, the presence
+/// sliders and the look of M3.
 ///
-/// Every field is a slider. Zero is the neutral position for each of them,
-/// so `PhotoEdit::default()` leaves the photo as it was shot. Temperature
-/// and tint are offsets from the white balance read from the file, exposure
-/// is in stops, and the rest run from -100 to 100 in the Lightroom manner.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Every scalar field is a slider. Zero is the neutral position for each of
+/// them, so `PhotoEdit::default()` leaves the photo as it was shot.
+/// Temperature and tint are offsets from the white balance read from the
+/// file, exposure is in stops, and the rest run from -100 to 100 in the
+/// Lightroom manner. The tone curves hold point lists, so the type is
+/// `Clone` and not `Copy`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PhotoEdit {
     pub white_balance_temperature: f32,
@@ -40,6 +45,10 @@ pub struct PhotoEdit {
     pub blacks: f32,
     pub vibrance: f32,
     pub saturation: f32,
+    pub texture: f32,
+    pub clarity: f32,
+    pub dehaze: f32,
+    pub look: Look,
 }
 
 #[cfg(test)]
@@ -59,6 +68,10 @@ mod tests {
             blacks: -8.0,
             vibrance: 15.0,
             saturation: -3.0,
+            texture: 20.0,
+            clarity: -15.0,
+            dehaze: 30.0,
+            look: Default::default(),
         };
         let text = serde_json::to_string(&edit).expect("serialize");
         let back: PhotoEdit = serde_json::from_str(&text).expect("deserialize");

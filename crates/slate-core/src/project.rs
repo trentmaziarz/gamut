@@ -186,6 +186,61 @@ mod tests {
         assert_eq!(empty, Project::default());
     }
 
+    /// A project exactly as the format stood before the look was added.
+    const BEFORE_THE_LOOK: &str = r#"{
+  "version": 1,
+  "media": [
+    {
+      "path": "sample-5s.mp4"
+    }
+  ],
+  "track": {
+    "clips": [
+      {
+        "media": 0,
+        "source_in": 0.0,
+        "source_out": 5.7
+      }
+    ]
+  },
+  "crop": {
+    "aspect": "Square",
+    "rect": {
+      "x": 0.21875,
+      "y": 0.0,
+      "width": 0.5625,
+      "height": 1.0
+    }
+  },
+  "edit": {
+    "white_balance_temperature": 0.0,
+    "white_balance_tint": 0.0,
+    "exposure": 0.25,
+    "contrast": 0.0,
+    "highlights": 0.0,
+    "shadows": 0.0,
+    "whites": 0.0,
+    "blacks": 0.0,
+    "vibrance": 0.0,
+    "saturation": 0.0
+  }
+}"#;
+
+    #[test]
+    fn a_project_from_before_the_look_still_parses() {
+        let back = Project::from_json(BEFORE_THE_LOOK).expect("parse");
+        assert_eq!(back.media[0].path, "sample-5s.mp4");
+        assert_eq!(back.track.clips.len(), 1);
+        assert_eq!(back.crop.aspect, CropAspect::Square);
+        assert_eq!(
+            back.edit,
+            PhotoEdit {
+                exposure: 0.25,
+                ..PhotoEdit::default()
+            }
+        );
+    }
+
     #[test]
     fn a_project_next_to_a_video_in_another_folder_resolves_back() {
         let project_dir = Path::new("C:/work/projects");

@@ -181,11 +181,11 @@ impl OpenProject {
     }
 
     /// The project as it should be saved, with the live edit and crop.
-    pub fn snapshot(&self, edit: PhotoEdit, crop: Crop) -> Project {
+    pub fn snapshot(&self, edit: &PhotoEdit, crop: Crop) -> Project {
         Project {
             track: self.track.clone(),
             crop,
-            edit,
+            edit: edit.clone(),
             ..self.project.clone()
         }
     }
@@ -244,9 +244,9 @@ impl Session {
             return;
         }
         let result = if let Some(photo) = &self.photo {
-            sidecar::save(&photo.path, &Sidecar::new(self.edit, self.crop)).map(|_| ())
+            sidecar::save(&photo.path, &Sidecar::new(self.edit.clone(), self.crop)).map(|_| ())
         } else if let Some(project) = &self.project {
-            project_file::save(&project.path, &project.snapshot(self.edit, self.crop))
+            project_file::save(&project.path, &project.snapshot(&self.edit, self.crop))
         } else {
             Ok(())
         };
@@ -316,7 +316,10 @@ impl SlateApp {
         self.viewer.set_photo(&photo);
         let saved = sidecar::load(&path);
         let (edit, crop) = match saved {
-            Some(sidecar) => (sidecar.edit, crop_for(&sidecar, photo.width, photo.height)),
+            Some(sidecar) => {
+                let crop = crop_for(&sidecar, photo.width, photo.height);
+                (sidecar.edit, crop)
+            }
             None => (
                 PhotoEdit::default(),
                 Crop::fitted(self.session.crop.aspect, photo.width, photo.height),
@@ -350,7 +353,7 @@ impl SlateApp {
             loaded.project.crop
         };
         self.session.photo = None;
-        self.session.edit = loaded.project.edit;
+        self.session.edit = loaded.project.edit.clone();
         self.session.crop = crop;
         self.session.project = Some(OpenProject {
             path: loaded.path,
@@ -525,7 +528,7 @@ impl SlateApp {
         let Some(out) = dialog.save_file() else {
             return;
         };
-        let snapshot = project.snapshot(self.session.edit, self.session.crop);
+        let snapshot = project.snapshot(&self.session.edit, self.session.crop);
         let dir = project.dir.clone();
         let result = crate::reel::export(&snapshot, &dir, &out).map_err(|error| error.to_string());
         self.session.status = Some(match result {

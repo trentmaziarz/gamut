@@ -306,6 +306,7 @@ fn every_slider_together_matches_develop_pixel() {
             blacks: -15.0,
             vibrance: 30.0,
             saturation: 10.0,
+            ..PhotoEdit::default()
         },
     );
 }
