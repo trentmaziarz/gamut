@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub mod crop;
 pub mod export;
 pub mod look;
+pub mod preset;
 pub mod project;
 pub mod sidecar;
 pub mod timeline;
@@ -19,8 +20,9 @@ pub mod timeline;
 pub use crop::{Crop, CropAspect, CropRect};
 pub use export::ExportPreset;
 pub use look::{Curve, HslRange, Look, ToneCurves, Wheel, Wheels};
+pub use preset::{LookPreset, PartialEdit};
 pub use project::{MediaRef, Project};
-pub use sidecar::Sidecar;
+pub use sidecar::{NamedVersion, Sidecar, VersionError};
 pub use timeline::{Clip, Track};
 
 /// The edit parameters of one photo: the Basic panel of M1, the presence

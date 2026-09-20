@@ -2,6 +2,7 @@
 //! IMG_0001.HEIC the sidecar is IMG_0001.HEIC.slate.json.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,22 +17,65 @@ pub const VERSION: u32 = 2;
 /// What is appended to the photo's file name.
 pub const SUFFIX: &str = ".slate.json";
 
-/// The saved state of one photo.
+/// One named version of a photo: an edit and a crop kept under a name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedVersion {
+    pub name: String,
+    pub edit: PhotoEdit,
+    pub crop: Crop,
+}
+
+/// Why a version could not be saved, renamed or found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionError {
+    /// The name is empty.
+    EmptyName,
+    /// Another version already has this name; case does not tell names
+    /// apart.
+    NameTaken(String),
+    /// No version has this name. Holds the names that exist.
+    NotFound { name: String, existing: Vec<String> },
+}
+
+impl fmt::Display for VersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VersionError::EmptyName => f.write_str("a version needs a name"),
+            VersionError::NameTaken(name) => write!(f, "a version named {name} already exists"),
+            VersionError::NotFound { name, existing } if existing.is_empty() => {
+                write!(f, "no version named {name}: this photo has no versions")
+            }
+            VersionError::NotFound { name, existing } => write!(
+                f,
+                "no version named {name}: the versions are {}",
+                existing.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VersionError {}
+
+/// The saved state of one photo. The top-level edit and crop are the working
+/// state; `versions` holds the named ones.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sidecar {
     pub version: u32,
     pub edit: PhotoEdit,
     pub crop: Crop,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<NamedVersion>,
+    /// The version the working state was last switched to or saved as, so a
+    /// later switch knows where to save the working state back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_version: Option<String>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Sidecar {
-            version: VERSION,
-            edit: PhotoEdit::default(),
-            crop: Crop::default(),
-        }
+        Sidecar::new(PhotoEdit::default(), Crop::default())
     }
 }
 
@@ -41,7 +85,103 @@ impl Sidecar {
             version: VERSION,
             edit,
             crop,
+            versions: Vec::new(),
+            active_version: None,
         }
+    }
+
+    /// The index of the version with this name, compared without case.
+    pub fn find_version(&self, name: &str) -> Option<usize> {
+        let wanted = name.trim().to_lowercase();
+        self.versions
+            .iter()
+            .position(|v| v.name.to_lowercase() == wanted)
+    }
+
+    fn not_found(&self, name: &str) -> VersionError {
+        VersionError::NotFound {
+            name: name.trim().to_string(),
+            existing: self.versions.iter().map(|v| v.name.clone()).collect(),
+        }
+    }
+
+    /// The version with this name, or the names that exist.
+    pub fn version(&self, name: &str) -> Result<&NamedVersion, VersionError> {
+        match self.find_version(name) {
+            Some(index) => Ok(&self.versions[index]),
+            None => Err(self.not_found(name)),
+        }
+    }
+
+    /// Keeps the working state under a new name and makes it the active
+    /// version.
+    pub fn save_version(&mut self, name: &str) -> Result<(), VersionError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(VersionError::EmptyName);
+        }
+        if self.find_version(name).is_some() {
+            return Err(VersionError::NameTaken(name.to_string()));
+        }
+        self.versions.push(NamedVersion {
+            name: name.to_string(),
+            edit: self.edit.clone(),
+            crop: self.crop,
+        });
+        self.active_version = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Copies a version into the working state. When the working state came
+    /// from a version, it is saved back to that version first, so nothing
+    /// done since is lost.
+    pub fn switch_to(&mut self, name: &str) -> Result<(), VersionError> {
+        let target = self
+            .find_version(name)
+            .ok_or_else(|| self.not_found(name))?;
+        if let Some(active) = self.active_version.clone()
+            && let Some(index) = self.find_version(&active)
+        {
+            self.versions[index].edit = self.edit.clone();
+            self.versions[index].crop = self.crop;
+        }
+        let version = self.versions[target].clone();
+        self.edit = version.edit;
+        self.crop = version.crop;
+        self.active_version = Some(version.name);
+        Ok(())
+    }
+
+    pub fn rename_version(&mut self, name: &str, new_name: &str) -> Result<(), VersionError> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err(VersionError::EmptyName);
+        }
+        let index = self
+            .find_version(name)
+            .ok_or_else(|| self.not_found(name))?;
+        if self
+            .find_version(new_name)
+            .is_some_and(|other| other != index)
+        {
+            return Err(VersionError::NameTaken(new_name.to_string()));
+        }
+        if self.active_version.as_deref() == Some(self.versions[index].name.as_str()) {
+            self.active_version = Some(new_name.to_string());
+        }
+        self.versions[index].name = new_name.to_string();
+        Ok(())
+    }
+
+    pub fn delete_version(&mut self, name: &str) -> Result<(), VersionError> {
+        let index = self
+            .find_version(name)
+            .ok_or_else(|| self.not_found(name))?;
+        let removed = self.versions.remove(index);
+        if self.active_version.as_deref() == Some(removed.name.as_str()) {
+            self.active_version = None;
+        }
+        Ok(())
     }
 
     /// The sidecar path for a photo: its full file name plus [`SUFFIX`].
@@ -63,7 +203,7 @@ impl Sidecar {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUFFIX, Sidecar, VERSION};
+    use super::{SUFFIX, Sidecar, VERSION, VersionError};
     use crate::{Crop, CropAspect, CropRect, PhotoEdit};
     use std::path::Path;
 
@@ -96,6 +236,66 @@ mod tests {
         assert_eq!(back.version, VERSION);
         assert_eq!(back.edit.contrast, 12.0);
         assert_eq!(back.crop, Crop::default());
+    }
+
+    #[test]
+    fn version_names_collide_without_regard_to_case() {
+        let mut sidecar = Sidecar::default();
+        sidecar.save_version("Warm").expect("the first");
+        assert_eq!(
+            sidecar.save_version(" warm "),
+            Err(VersionError::NameTaken("warm".to_string()))
+        );
+        assert_eq!(sidecar.save_version("  "), Err(VersionError::EmptyName));
+        sidecar.save_version("Cold").expect("another name");
+        assert_eq!(
+            sidecar.rename_version("cold", "WARM"),
+            Err(VersionError::NameTaken("WARM".to_string()))
+        );
+        sidecar
+            .rename_version("cold", "Cold")
+            .expect("its own name");
+        sidecar.rename_version("COLD", "Cool").expect("a free name");
+        assert_eq!(sidecar.active_version.as_deref(), Some("Cool"));
+        assert!(sidecar.find_version("cool").is_some());
+        let error = sidecar.version("nope").expect_err("unknown");
+        assert_eq!(
+            error.to_string(),
+            "no version named nope: the versions are Warm, Cool"
+        );
+    }
+
+    #[test]
+    fn switching_saves_the_working_state_back_to_the_version_it_came_from() {
+        let mut sidecar = Sidecar::default();
+        sidecar.edit.exposure = 1.0;
+        sidecar.save_version("Bright").expect("save");
+        sidecar.edit.exposure = -1.0;
+        sidecar.active_version = None;
+        sidecar.save_version("Dark").expect("save");
+
+        // Working on Dark: a change, then a switch away and back.
+        sidecar.edit.contrast = 30.0;
+        sidecar.switch_to("bright").expect("switch");
+        assert_eq!(sidecar.edit.exposure, 1.0);
+        assert_eq!(sidecar.edit.contrast, 0.0);
+        assert_eq!(sidecar.active_version.as_deref(), Some("Bright"));
+        sidecar.switch_to("Dark").expect("switch back");
+        assert_eq!(sidecar.edit.exposure, -1.0);
+        assert_eq!(sidecar.edit.contrast, 30.0);
+
+        let back = Sidecar::from_json(&sidecar.to_json()).expect("parse");
+        assert_eq!(back, sidecar);
+        sidecar.delete_version("dark").expect("delete");
+        assert_eq!(sidecar.active_version, None);
+        assert_eq!(sidecar.versions.len(), 1);
+        assert_eq!(sidecar.edit.contrast, 30.0, "the working state stays");
+    }
+
+    #[test]
+    fn a_sidecar_without_versions_writes_no_versions_key() {
+        let text = Sidecar::default().to_json();
+        assert!(!text.contains("versions") && !text.contains("active_version"));
     }
 
     /// A sidecar exactly as version 1 of the format wrote it.
