@@ -1,7 +1,8 @@
 # Shortcuts
 
-This page gives the key or the pointer action for each thing Gamut does. Most
-keys are pressed alone, and the combinations use Ctrl.
+This page lists Gamut's keys and pointer actions, group by group. Most keys are
+pressed alone, and the combinations use Ctrl. The brush also uses Shift, with a
+bracket key or a click, and Alt, held while painting.
 
 ## Where things are
 
@@ -11,54 +12,133 @@ keys are pressed alone, and the combinations use Ctrl.
   crop buttons.
 - Along the bottom is the Timeline. Its keys and drags act on a video.
 - The Mixer sets hue, saturation and luminance for each of eight colours.
-- A preset is a saved look that any photo can take, from the Presets section.
-- A version is a named saved state of one photo, kept in the Versions section,
-  where Switch to brings one back.
-- Pick is a button in the Masks section, on a luminance range or colour range
-  mask.
+- A preset is a saved look, kept in the Presets section. Apply puts it on the
+  open picture.
+- A version is a named saved state of one photo, kept in the Versions section.
+  Each row there has a Switch to button, which brings that version back.
+- Every mask is built from one or more components. A component is one shape or
+  range that says where the mask applies. The kinds are linear gradient, radial
+  gradient, luminance range, colour range and brush.
+- The Masks section starts with five buttons: New linear, New radial, New
+  luminance range, New colour range and New brush. Each one makes a mask with a
+  single component of that kind and selects it.
+- Click the name of a mask in the list at the top of the Masks section to select
+  it. Its handles then show on the picture. A banner at the top of the Adjust
+  tab reads "Editing mask:" with the name and a Done button.
+- While a mask is selected, the sections Basic to Grading adjust that mask. Done
+  goes back to the whole picture and leaves no mask selected.
+- The components of the selected mask are listed under it. Each one has the
+  buttons Add, Subtract and Intersect, which say how it combines with the
+  components above it.
+- At the bottom of the selected mask is the Add component row, with the buttons
+  Linear, Radial, Luminance, Colour and Brush.
+- Pick is a button on a luminance range or colour range component.
 - The Edit menu, beside File, holds Undo and Redo.
 
 ## Viewer: zoom
 
-- The scroll wheel over the picture zooms in and out about the pointer. The
-  spot under the pointer stays under it.
+- The scroll wheel over the picture zooms in and out about the pointer, on a
+  photo and on a video frame alike. The spot under the pointer stays under it.
 - One notch of the wheel changes the zoom by a factor of 1.25.
-- Ctrl with the wheel does the same. A pinch on a touchpad zooms too.
-- F fits the whole picture to the Viewer, and Ctrl+0 does the same.
+- Ctrl with the wheel does the same as the wheel alone.
+- A pinch on a touchpad zooms too.
+- F fits the whole picture to the Viewer. Ctrl+0 does the same.
 - Ctrl+1 shows the picture at 100 percent, one screen pixel per picture pixel,
   about the middle of the Viewer.
-- Ctrl+= zooms in one step about the middle of the Viewer, and Ctrl+- zooms out
-  one step, by the same 1.25.
-- The smallest zoom shows the whole picture, and at that size the picture is in
-  Fit.
-- A picture in Fit grows and shrinks with the window, while a zoomed picture
-  keeps its percentage.
+- Ctrl+= zooms in one step about the middle of the Viewer. Ctrl+- zooms out one
+  step. The step is the same 1.25.
+- Fit is the smallest zoom, the one that shows the whole picture. Fit is also a
+  state. A picture in Fit follows the window as it is resized, while a zoomed
+  picture keeps its percentage.
 - Zooming all the way out puts the picture back in Fit.
 - 800 percent is the largest zoom.
 - From 400 percent up, single pixels are drawn as squares with no smoothing, so
   they can be judged.
 - The top row of the Adjust tab shows the zoom as a percentage, with the buttons
-  Fit, 100%, - and +, which do what the keys do for a person with no wheel.
-- All of this works the same on a photo and a video frame.
+  Fit, 100%, - and +. They do what the keys and the wheel do.
 
 ## Viewer: pan
 
 - Hold Space and drag with the left button to pan. The pointer shows a hand
   while Space is held.
 - Drag with the middle button, the wheel pressed down, to pan without a key.
-- A pan works wherever it starts, even on the crop or a mask handle, and moves
-  neither.
-- A picture in Fit has nowhere to go, so a pan does nothing until you zoom in.
+- A pan works wherever it starts, even on the crop or a mask handle. It moves
+  neither of them. A pan works while you paint as well.
+- A picture in Fit is seen whole. A pan does nothing until you zoom in.
 
 ## Crop and masks
 
-- A plain drag inside the crop rectangle moves the crop.
+- The crop rectangle is always on the picture. The crop buttons at the bottom of
+  the Adjust tab are 4:5, 1:1, 3:4 and 9:16.
+- Each crop button gives the largest rectangle of that shape that fits the
+  picture, centred.
+- A plain drag inside the crop rectangle moves the crop. With Paint on, that
+  same drag paints and the crop stays where it is.
+- The crop cannot be resized or drawn by hand. There is no free shape.
 - Dragging a handle of the selected mask moves that handle.
 - A linear gradient has a start handle and an end handle. A radial gradient has
   a centre handle, one handle on each radius, and a rotation handle.
-- Pick lights up when pressed and stays lit until your next click on the
+- Pick lights up when pressed. It stays lit until your next click on the
   picture, which sets the range from the pixel under the pointer.
-- The crop and the mask handles follow the pointer at every zoom.
+- Zoomed in or out, the crop and a mask handle move exactly as far as the
+  pointer moves.
+
+## Brush
+
+- The Paint button of a brush component puts the brush in your hand. The button
+  then reads "Painting...".
+- Esc puts the brush down. So does a second press of Paint, the Done button of
+  the mask, selecting another mask, and the Save, Discard, Cancel question that
+  Gamut asks when you switch versions with unsaved changes.
+- Pressing Brush in the Add component row adds a brush component to the mask you
+  are editing.
+- Subtracting a brush from a radial gradient takes the painted part out of the
+  gradient.
+- The settings sit under the brush component in the Masks section.
+- Size is the radius of the brush, as a percentage of the longer side of the
+  picture. It runs from 0.02 to 50.
+- Feather runs from 0 to 100. It is how much of the radius the edge fades over.
+  0 is a hard edge, and 100 fades from the centre.
+- Flow runs from 1 to 100. It is how much one pass paints. Passes over the same
+  place build up.
+- A stroke keeps the size, feather and flow it was painted with. Change a
+  setting afterwards and the change reaches the next stroke only.
+- The settings belong to the brush tool. They are not saved with the picture,
+  and undo does not change them.
+- A plain drag with the left button paints one stroke, anywhere on the picture.
+  That includes inside the crop rectangle.
+- While you paint, the handles of the mask's other components are hidden.
+- A click without a move paints one dab, the single round mark the brush leaves.
+- Shift with a click paints a straight line from the end of the last stroke to
+  the click. With nothing painted yet, it paints one dab.
+- Alt held during a drag makes that stroke erase. The Erase checkbox beside
+  Paint does the same for every stroke until it is unticked.
+- An erase stroke takes away what was painted in that brush before it. It is an
+  ordinary stroke, not an undo. Paint over the same place afterwards and there
+  is paint there again.
+- Both pans and the wheel work as always while the brush is up. The pointer is
+  the hand while Space is held. Painting works at every zoom.
+- [ makes the brush smaller and ] makes it larger. Each press is a factor of
+  1.1.
+- Shift+[ lowers the feather by 5. Shift+] raises it by 5.
+- O shows and hides the overlay. The Show overlay checkbox does the same.
+- The overlay is red where the mask applies. Pressing Paint turns it on, so you
+  see what you paint.
+- Putting the brush down returns the overlay to what it was before.
+- The pointer over the picture is a ring the size of the brush at the current
+  zoom. It shows what a dab will cover.
+- An inner ring marks where the feather starts.
+- A short dash in the middle of the ring means the next stroke erases.
+- A brush too small to draw as a ring shows as a small cross.
+- The section shows how many strokes the brush holds, beside a Clear strokes
+  button, which removes them all.
+- One brush holds up to 2,000 strokes. At 2,000 Gamut shows a message and the
+  brush takes no more. To go on, add another brush component from the Add
+  component row and paint in that one.
+- A stroke is kept as the path the pointer took rather than as pixels, so
+  strokes stay sharp at every zoom and in the export.
+- On a video the brush paints the frame under the playhead. The mask stays where
+  it was painted and does not follow motion.
 
 ## Tone curve and sliders
 
@@ -67,23 +147,31 @@ keys are pressed alone, and the combinations use Ctrl.
   over it.
 - The two end points cannot be removed.
 - Click a slider, then Left and Right step it. The slider keeps the arrow keys
-  from that click until you click somewhere else.
-- With a video open, Left and Right move the slider and the playhead together.
-  Click somewhere else to give the keys back to the Timeline.
+  until you click somewhere that is not a slider, an empty part of the Adjust
+  tab for example.
+- With a video open, one press of Left or Right then moves the slider one step
+  and the playhead one frame, both at once. To move only the playhead, click off
+  the slider first. To move only the slider, drag it with the mouse.
 
 ## Undo and redo
 
 - Ctrl+Z undoes.
 - Ctrl+Shift+Z redoes, and Ctrl+Y redoes too.
-- Undo and Redo in the Edit menu carry those shortcuts, and an entry is greyed
-  out when there is nothing to undo or to redo.
+- Undo and Redo in the Edit menu carry those shortcuts. An entry is greyed out
+  when there is nothing to undo or to redo.
 - One drag is one step, however long it lasted, on a slider, a curve point, a
   colour wheel, a mask handle, the crop or a trim.
-- A run of arrow-key presses on a slider becomes one step once the keys have
-  rested for 0.4 seconds.
+- A brush stroke is one step too.
+- Clear strokes is a step. So is deleting a brush component, and undoing that
+  brings the strokes back.
+- An undo that takes away the brush component puts the brush down.
+- While you keep pressing the arrow keys on a slider, no step is made. Once 0.4
+  seconds pass with no press, all the presses of that run become one step. One
+  Ctrl+Z takes the whole run back.
 - Undo covers the sliders, the tone curve, the Mixer, the colour wheels, the
-  crop, a preset applied, and masks added, changed, reordered or deleted. It
-  covers anything done to a version, such as saving one or deleting one.
+  crop, a preset applied, and masks added, changed, reordered or deleted.
+- Saving, updating, renaming, deleting and switching to a version can each be
+  undone.
 - On a video, a split, a trim and a deleted clip are covered as well.
 - The history keeps up to 500 steps. It starts empty when a file opens, and it
   is gone when that file closes or another one opens.
@@ -91,30 +179,42 @@ keys are pressed alone, and the combinations use Ctrl.
 
 ## Timeline
 
-- Space plays and pauses when you tap it, that is press and let go.
-- A Space held while the picture is dragged is a pan, and letting it go does
+- Space plays and pauses. Press it and let it go with no drag in between, and it
+  acts however long it was held.
+- A Space held while the picture is dragged is a pan. Letting it go then does
   nothing.
+- On a photo, Space alone does nothing.
 - S splits the clip at the playhead.
-- Delete removes the selected clip and closes the gap. It removes the tone curve
-  point under the pointer as well, and it does both when both are there.
+- Delete removes the selected clip and closes the gap. Delete also removes the
+  tone curve point under the pointer, so with a clip selected and the pointer
+  over a curve point one press removes both.
 - To remove only the point, right-click it. To remove only the clip, keep the
   pointer off the curve.
 - Home moves the playhead to the start and End moves it to the end. Both pause.
-- Left and Right step the playhead one frame back and forward.
+- Left and Right step the playhead one frame back and forward. A slider you
+  clicked takes those keys as well, under the slider rule above.
 - A click or a drag on the timeline moves the playhead and pauses.
 - Clicking a clip selects it, and dragging either end of a clip trims it.
 
 ## Saving and opening
 
-- Drop a photo, a video or a .gamut project on the window to open it, or use
-  File > Open.
-- Gamut saves by itself, half a second after the last change and again when the
-  window closes. There is no save key.
+- Drop a photo, a video or a .gamut project on the window to open it. File >
+  Open does the same.
+- File > Open and File > Export are menu entries. Neither has a key.
+- Gamut saves by itself. It writes the edit once half a second has passed with
+  no new change, and again when the window closes. There is no save key.
+- A crash or a forced quit loses only a change made in that half second, or a
+  drag that was still under way.
 - A photo named example.heic gets a small edit file beside it,
-  example.heic.gamut.json, and the photo itself is never changed.
-- The project file for a video named clip.mp4 is clip.mp4.gamut beside it. It
-  holds the cuts, the crop and the look, and the video itself is never changed.
-- A .gamut project opens like a photo or a video.
+  example.heic.gamut.json. The photo itself is never changed.
+- That file is not a project and is not opened by hand. Open the photo, and
+  Gamut reads it.
+- The project file for a video named clip.mp4 is clip.mp4.gamut beside it, with
+  no .json on the end. It holds the cuts, the crop and the look, and the video
+  itself is never changed.
+- A .gamut project is a file you can open or drop.
+- Brush strokes are saved in those files like every other edit. Close and open
+  the file, and the strokes are there.
 - After an undo or a redo, the file beside the photo holds the picture as it
   then looks.
 - The history itself is never written into either file.
@@ -126,8 +226,13 @@ keys are pressed alone, and the combinations use Ctrl.
 - While you type in a text field, such as a preset or version name, the keys go
   to the text. F and Space are typed as characters, and the zoom keys do nothing
   to the picture.
+- The brush keys [, ], O and Esc go to the text as well, and leave the brush
+  alone.
 - Ctrl+Z in a text field undoes your typing and leaves the picture alone.
-- The Save, Discard, Cancel question appears when you press Switch to while the
-  picture has changes that were not saved into any version.
-- Gamut is then waiting to hear what to do with those changes, and the zoom
-  keys, the pan and the undo keys wait for your answer.
+- With Paint off, [, ] and O do nothing.
+- Ctrl with [, ] or O is not a brush key. It does nothing to the brush.
+- The Save, Discard, Cancel question appears when you press Switch to in the
+  Versions section while the picture has changes that were not saved into any
+  version.
+- While that question is on the screen, the zoom keys, the pan, the undo keys
+  and the brush do nothing. Answer it and they work again.
