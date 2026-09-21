@@ -292,6 +292,22 @@ fn brush_fields(
         .on_hover_text("How much of the radius the edge fades over. Shift+[ and Shift+]");
     ui.add(egui::Slider::new(&mut tool.flow, MIN_FLOW..=100.0).text("Flow"))
         .on_hover_text("How much one dab paints; passes over the same place build up");
+    ui.checkbox(&mut tool.auto, "Auto mask").on_hover_text(
+        "Each dab paints only what is like the colour under the centre of the brush, \
+         so a stroke stops at an edge. A",
+    );
+    if tool.auto {
+        ui.add(egui::Slider::new(&mut tool.sensitivity, 0.0..=100.0).text("Sensitivity"))
+            .on_hover_text("How close to that colour a pixel must be: higher keeps to less");
+    }
+    ui.horizontal(|ui| {
+        ui.label("Pressure:");
+        let with_a_pen = "Acts with a pen. A mouse and a finger paint at full pressure.";
+        ui.checkbox(&mut tool.pressure_size, "Size")
+            .on_hover_text(format!("A lighter hand paints a smaller dab. {with_a_pen}"));
+        ui.checkbox(&mut tool.pressure_flow, "Flow")
+            .on_hover_text(format!("A lighter hand paints less. {with_a_pen}"));
+    });
     ui.horizontal(|ui| {
         let count = brush.strokes.len();
         ui.label(match count {
@@ -586,6 +602,131 @@ mod tests {
             ..Outcome::default()
         });
         assert_eq!(whole.brush, Some(BrushRequest::Clear(0)));
+    }
+
+    /// One frame of the section as the Adjust tab runs it.
+    fn panel_frame(
+        ctx: &egui::Context,
+        masks: &mut Vec<Mask>,
+        adjust: &mut AdjustState,
+        events: Vec<egui::Event>,
+    ) -> Outcome {
+        use egui::{Pos2, Rect, Vec2};
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 1400.0))),
+            events,
+            ..Default::default()
+        };
+        let mut outcome = Outcome::default();
+        // No renderer takes the font texture here, so it is let go by hand.
+        let mut output = ctx.run_ui(input, |ui| {
+            outcome = show(ui, masks, adjust, true);
+        });
+        output.textures_delta.clear();
+        outcome
+    }
+
+    /// A click at a place of the section: the pointer comes, presses, lets go.
+    fn click(
+        ctx: &egui::Context,
+        masks: &mut Vec<Mask>,
+        adjust: &mut AdjustState,
+        at: egui::Pos2,
+    ) -> Outcome {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut whole = Outcome::default();
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+            Vec::new(),
+        ] {
+            let part = panel_frame(ctx, masks, adjust, events);
+            whole.edited |= part.edited;
+            whole.view_changed |= part.view_changed;
+            whole.brush = part.brush.or(whole.brush);
+        }
+        whole
+    }
+
+    /// The first place, row by row, where a click makes `hit` true of the
+    /// tool, tried each time on a copy of the state.
+    fn place_where(
+        ctx: &egui::Context,
+        masks: &[Mask],
+        adjust: &AdjustState,
+        rows: std::ops::Range<usize>,
+        hit: impl Fn(&BrushTool) -> bool,
+    ) -> Option<egui::Pos2> {
+        for y in rows.step_by(5) {
+            for x in (10..410).step_by(10) {
+                let at = egui::Pos2::new(x as f32, y as f32);
+                let (mut masks, mut adjust) = (masks.to_vec(), adjust.clone());
+                click(ctx, &mut masks, &mut adjust, at);
+                if hit(&adjust.brush) {
+                    return Some(at);
+                }
+            }
+        }
+        None
+    }
+
+    /// The Auto mask checkbox, the Sensitivity slider under it and the two
+    /// pressure toggles, clicked through egui: they change the tool, which
+    /// the next stroke reads, and never the edit or a stroke that is there.
+    #[test]
+    fn the_auto_mask_checkbox_and_the_pressure_toggles_change_the_tool_and_not_the_edit() {
+        use gamut_core::brush::{SharedStroke, Stroke};
+        let ctx = egui::Context::default();
+        let painted = Brush {
+            strokes: vec![SharedStroke::new(&Stroke {
+                points: vec![[0.2, 0.2], [0.4, 0.4]],
+                ..Stroke::default()
+            })],
+        };
+        let mut masks = vec![Mask::new("Brush", MaskSource::Brush(painted))];
+        let mut adjust = AdjustState::default();
+        adjust.select_mask(Some(0));
+        let before = masks.clone();
+        // Warm up: egui tests a pointer against the widgets of the frame before.
+        panel_frame(&ctx, &mut masks, &mut adjust, Vec::new());
+        assert!(!adjust.brush.auto && !adjust.brush.pressure_size && adjust.brush.pressure_flow);
+
+        let auto = place_where(&ctx, &masks, &adjust, 0..1400, |tool| tool.auto)
+            .expect("an Auto mask checkbox to click");
+        let outcome = click(&ctx, &mut masks, &mut adjust, auto);
+        assert!(adjust.brush.auto, "ticked");
+        assert_eq!(outcome, Outcome::default(), "a tool setting is no edit");
+        assert_eq!(
+            masks, before,
+            "and the stroke that is there stays as it was"
+        );
+
+        // The toggles are in a row under the checkbox and the slider it opens.
+        let rows = auto.y as usize..auto.y as usize + 120;
+        let size = place_where(&ctx, &masks, &adjust, rows.clone(), |tool| {
+            tool.pressure_size
+        })
+        .expect("a Pressure: Size toggle to click");
+        let flow = place_where(&ctx, &masks, &adjust, rows, |tool| !tool.pressure_flow)
+            .expect("a Pressure: Flow toggle to click");
+        assert_eq!(size.y, flow.y, "one row");
+        assert!(size.x < flow.x, "Size before Flow");
+        let outcome = click(&ctx, &mut masks, &mut adjust, size);
+        assert!(adjust.brush.pressure_size && adjust.brush.pressure_flow);
+        let second = click(&ctx, &mut masks, &mut adjust, flow);
+        assert!(adjust.brush.pressure_size && !adjust.brush.pressure_flow);
+        assert_eq!((outcome, second), (Outcome::default(), Outcome::default()));
+        assert_eq!(masks, before);
+
+        // Unticked again, the checkbox is where it was.
+        click(&ctx, &mut masks, &mut adjust, auto);
+        assert!(!adjust.brush.auto);
     }
 
     #[test]
