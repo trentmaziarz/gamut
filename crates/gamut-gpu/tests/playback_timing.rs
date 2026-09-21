@@ -7,11 +7,17 @@
 //! GAMUT_TIMING_GATE=1 is set; the test skips when the clip is not on the
 //! machine or no CUDA device answers. For the record, a second run of 100
 //! frames renders what a Viewer zoomed to 100 percent shows of the frame,
-//! through the padded window; nothing is asserted on it.
+//! through the padded window; nothing is asserted on it. A third run of 100
+//! frames plays the clip under an auto brush mask of 200 strokes of 50
+//! points: its layer reads the frame, so every frame builds the proxy of the
+//! source and stamps the layer again, and its p95 must stay inside a frame
+//! at 30 fps as well.
 
 use std::time::Instant;
 
-use gamut_core::{CropAspect, CropRect, PhotoEdit};
+use gamut_core::brush::{Brush, SharedStroke, Stroke};
+use gamut_core::mask::MaskSource;
+use gamut_core::{CropAspect, CropRect, Mask, PhotoEdit};
 use gamut_gpu::develop::{padded_window, render_size_for_crop};
 use gamut_gpu::{Develop, Headless, ViewWindow};
 use gamut_media::hwaccel::nvdec_available;
@@ -30,6 +36,64 @@ const GATE_P95_MS: f64 = 1000.0 / 30.0;
 const GATE_MEAN_MS: f64 = 25.0;
 
 const GATE: &str = "GAMUT_TIMING_GATE";
+
+/// How many strokes the auto brush of the third run holds, and how many
+/// points each.
+const AUTO_STROKES: usize = 200;
+const STROKE_POINTS: usize = 50;
+
+/// A number from 0 to 1 that is the same on every run.
+fn next(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*seed >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// The default edit under one mask: an auto brush of [`AUTO_STROKES`] strokes
+/// of [`STROKE_POINTS`] points wandering over the frame, every third one a
+/// pen's, lifting the exposure.
+fn auto_brush_edit() -> PhotoEdit {
+    let mut seed = 20_260_920;
+    let strokes = (0..AUTO_STROKES)
+        .map(|k| {
+            let size = 0.004 + 0.03 * next(&mut seed);
+            let mut at = [next(&mut seed), next(&mut seed)];
+            let mut heading = next(&mut seed) * std::f32::consts::TAU;
+            let points: Vec<[f32; 2]> = (0..STROKE_POINTS)
+                .map(|_| {
+                    heading += (next(&mut seed) - 0.5) * 0.8;
+                    at[0] = (at[0] + heading.cos() * size * 0.25).clamp(0.0, 1.0);
+                    at[1] = (at[1] + heading.sin() * size * 0.44).clamp(0.0, 1.0);
+                    at
+                })
+                .collect();
+            let pen = k % 3 == 0;
+            SharedStroke::new(&Stroke {
+                pressure: if pen {
+                    (0..points.len())
+                        .map(|_| 0.2 + 0.8 * next(&mut seed))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                points,
+                size,
+                feather: 100.0 * next(&mut seed),
+                flow: 20.0 + 80.0 * next(&mut seed),
+                erase: k % 10 == 9,
+                auto: true,
+                sensitivity: 100.0 * next(&mut seed),
+                pressure_size: pen,
+                pressure_flow: pen,
+            })
+        })
+        .collect();
+    let mut mask = Mask::new("Auto brush", MaskSource::Brush(Brush { strokes }));
+    mask.adjust.exposure = 0.6;
+    PhotoEdit {
+        masks: vec![mask],
+        ..PhotoEdit::default()
+    }
+}
 
 #[test]
 fn playback_at_4k30_is_fast_enough() {
@@ -147,7 +211,51 @@ fn playback_at_4k30_is_fast_enough() {
         );
     }
 
+    // The same playback under an auto brush mask. Every frame is another
+    // source content: the proxy is built and the layer stamped on each one.
+    let gated = auto_brush_edit();
+    let (layers, proxies) = (develop.brush_layer_builds(), develop.proxy_builds());
+    let mut auto = Vec::with_capacity(100);
+    for i in 0..=100 {
+        let started = Instant::now();
+        let Some(frame) = source.next_frame().expect("decode") else {
+            break;
+        };
+        develop.set_video_frame(&frame, colour, rotation);
+        develop
+            .render(&gated, crop, render_size, OUTPUT)
+            .expect("the source is set");
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        if i > 0 {
+            auto.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    assert!(auto.len() >= 50, "the clip is long enough for the auto run");
+    let frames = auto.len() as u64 + 1;
+    assert_eq!(
+        (
+            develop.brush_layer_builds() - layers,
+            develop.proxy_builds() - proxies
+        ),
+        (frames, frames),
+        "every frame stamps the auto layer and builds the proxy once"
+    );
+    auto.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let auto_p95 = auto[(auto.len() * 95 / 100).min(auto.len() - 1)];
+    println!(
+        "playback under an auto brush mask of {AUTO_STROKES} strokes of {STROKE_POINTS} points, {} frames: p50 {:.2} ms, p95 {auto_p95:.2} ms, max {:.2} ms (plain playback p95 {p95:.2} ms)",
+        auto.len(),
+        auto[auto.len() / 2],
+        auto[auto.len() - 1]
+    );
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            auto_p95 < GATE_P95_MS,
+            "p95 under an auto brush mask, {auto_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
+        );
         assert!(
             p95 < GATE_P95_MS,
             "p95 {p95:.2} ms is not under {GATE_P95_MS:.1} ms"

@@ -24,6 +24,14 @@
 //! 100 frames, are held to the gate. What stamping the whole layer over the
 //! padded window costs, and what replacing the window costs with the brush
 //! in it, are printed for the record.
+//!
+//! The auto brush comes after it: a sixth mask that is a brush of 500 auto
+//! strokes of 50 points, a third of them painted with a pen whose pressure
+//! scales the size and the flow. A slider step with the six masks at the
+//! viewer size and at 100 percent, and painting an auto stroke with a pen at
+//! 100 and at 400 percent, are held to the gate. What the proxy of the source
+//! costs, built once, and what stamping the whole auto layer over the padded
+//! window costs are printed for the record.
 
 use std::time::Instant;
 
@@ -287,11 +295,58 @@ fn with_brush_mask(base: &PhotoEdit) -> PhotoEdit {
     edit
 }
 
-/// The brush of the fifth mask.
-fn timed_brush(edit: &mut PhotoEdit) -> &mut Brush {
-    match &mut edit.masks[4].components[0].source {
+/// The fifth mask is the brush of 4c, the sixth the auto brush.
+const PLAIN_BRUSH: usize = 4;
+const AUTO_BRUSH: usize = 5;
+
+/// `base` with a sixth mask: the strokes of [`with_brush_mask`] as auto
+/// strokes at sensitivities from loose to strict, every third one painted
+/// with a pen whose pressure wanders and scales the size and the flow.
+fn with_auto_mask(base: &PhotoEdit) -> PhotoEdit {
+    let mut seed = 20_260_921;
+    let plain = with_brush_mask(&PhotoEdit::default());
+    let MaskSource::Brush(plain) = &plain.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    let strokes = plain
+        .strokes
+        .iter()
+        .enumerate()
+        .map(|(k, stroke)| {
+            let pen = k % 3 == 0;
+            let mut pressure = next(&mut seed);
+            SharedStroke::new(&Stroke {
+                auto: true,
+                sensitivity: 100.0 * next(&mut seed),
+                pressure: if pen {
+                    (0..stroke.points.len())
+                        .map(|_| {
+                            pressure = (pressure + (next(&mut seed) - 0.5) * 0.2).clamp(0.05, 1.0);
+                            pressure
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                pressure_size: pen,
+                pressure_flow: pen,
+                ..(**stroke).clone()
+            })
+        })
+        .collect();
+    let mut mask = Mask::new("Auto brush", MaskSource::Brush(Brush { strokes }));
+    mask.adjust.exposure = -0.4;
+    mask.adjust.saturation = 20.0;
+    let mut edit = base.clone();
+    edit.masks.push(mask);
+    edit
+}
+
+/// The brush of a mask of the timed edit.
+fn timed_brush(edit: &mut PhotoEdit, mask: usize) -> &mut Brush {
+    match &mut edit.masks[mask].components[0].source {
         MaskSource::Brush(brush) => brush,
-        _ => panic!("the fifth mask is the brush"),
+        _ => panic!("mask {mask} is a brush"),
     }
 }
 
@@ -304,6 +359,21 @@ fn painted_view(
     base: &PhotoEdit,
     view: &ViewWindow,
 ) -> (f64, f64, f64) {
+    painted_view_with(gpu, develop, base, view, PLAIN_BRUSH, &Stroke::default())
+}
+
+/// The same into the brush of mask `mask`, with a stroke that takes `like`
+/// for what a press stores beside the size, the feather and the flow. An
+/// auto stroke is painted with a pen whose pressure rises and falls.
+fn painted_view_with(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: &ViewWindow,
+    mask: usize,
+    like: &Stroke,
+) -> (f64, f64, f64) {
+    let pen = |i: usize| like.auto.then(|| 0.55 + 0.45 * (i as f32 * 0.21).sin());
     let (full_w, full_h) = (view.full.0 as f32, view.full.1 as f32);
     let (x, y, w, h) = view.visible;
     let centre = [
@@ -315,14 +385,15 @@ fn painted_view(
     let size = w.min(h) as f32 / 12.0 / longer;
     let orbit = [w as f32 * 0.3 / full_w, h as f32 * 0.3 / full_h];
     let mut edit = base.clone();
-    timed_brush(&mut edit)
+    timed_brush(&mut edit, mask)
         .strokes
         .push(SharedStroke::new(&Stroke {
             points: vec![[centre[0] + orbit[0], centre[1]]],
+            pressure: pen(0).into_iter().collect(),
             size,
             feather: 50.0,
             flow: 60.0,
-            ..Stroke::default()
+            ..like.clone()
         }));
     timed_view(gpu, develop, &edit, view);
     // A quarter radius of arc a frame.
@@ -335,8 +406,11 @@ fn painted_view(
                     centre[0] + orbit[0] * angle.cos(),
                     centre[1] + orbit[1] * angle.sin(),
                 ];
-                let stroke = timed_brush(&mut edit).strokes.last_mut().expect("pressed");
-                assert!(stroke.push(at, None));
+                let stroke = timed_brush(&mut edit, mask)
+                    .strokes
+                    .last_mut()
+                    .expect("pressed");
+                assert!(stroke.push(at, pen(i)));
                 timed_view(gpu, develop, &edit, view)
             })
             .collect(),
@@ -591,7 +665,7 @@ fn develop_at_viewer_size_is_fast_enough() {
         // window replaced with the brush in it.
         timed_view(&gpu, &mut develop, &painted, &actual);
         let mut undone = painted.clone();
-        timed_brush(&mut undone).strokes.pop();
+        timed_brush(&mut undone, PLAIN_BRUSH).strokes.pop();
         let whole = timed_view(&gpu, &mut develop, &undone, &actual);
         println!(
             "the brush layer stamped whole over the padded window {:?}, its alpha and what is seen developed: {whole:.2} ms",
@@ -628,7 +702,126 @@ fn develop_at_viewer_size_is_fast_enough() {
         brush_p95 = Some((step_p95, paint_p95, deep_p95));
     }
 
+    // The auto brush, over all of that: a sixth mask of 500 auto strokes, a
+    // third of them a pen's. First a single auto dab, so the proxy of the
+    // source is what that render pays for: it is built once and kept.
+    let proxies = develop.proxy_builds();
+    let mut one_dab = painted.clone();
+    one_dab.masks.push(Mask::new(
+        "Auto brush",
+        MaskSource::Brush(Brush {
+            strokes: vec![SharedStroke::new(&Stroke {
+                points: vec![[0.5, 0.5]],
+                size: 0.001,
+                auto: true,
+                ..Stroke::default()
+            })],
+        }),
+    ));
+    one_dab.masks[AUTO_BRUSH].adjust.exposure = -0.4;
+    let proxy_ms = timed_render(&gpu, &mut develop, &one_dab, VIEWER_SIZE);
+    println!(
+        "first render with one auto dab (the proxy of {:?} built, {} by {}): {proxy_ms:.2} ms",
+        (photo.width, photo.height),
+        gamut_color::brush::Proxy::size_for((photo.width, photo.height)).0,
+        gamut_color::brush::Proxy::size_for((photo.width, photo.height)).1,
+    );
+    let gated = with_auto_mask(&painted);
+    let layers = develop.brush_layer_builds();
+    let auto_on = timed_render(&gpu, &mut develop, &gated, VIEWER_SIZE);
+    println!(
+        "first render with the auto brush mask on ({BRUSH_STROKES} auto strokes stamped at {VIEWER_SIZE:?}): {auto_on:.2} ms"
+    );
+    let (six_p50, six_p95, six_max) = stepped(&gpu, &mut develop, &gated);
+    println!(
+        "slider step with the six masks at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {six_p50:.2} ms, p95 {six_p95:.2} ms, max {six_max:.2} ms"
+    );
+    assert_eq!(
+        develop.brush_layer_builds() - layers,
+        1,
+        "a slider stamped the auto layer again"
+    );
+    let mut auto_p95 = None;
+    if info.device_type == wgpu::DeviceType::Cpu {
+        println!("zoomed auto brush lines skipped on a CPU adapter");
+    } else {
+        let full = (photo.width, photo.height);
+        let (actual, _) = zoomed_view(full, 1);
+        let first = timed_view(&gpu, &mut develop, &gated, &actual);
+        println!(
+            "first render of the padded window at 100 percent with the six masks: {first:.2} ms"
+        );
+        let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &gated, &actual);
+        println!(
+            "slider step at 100 percent with the six masks, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+        );
+        let pen = Stroke {
+            auto: true,
+            sensitivity: 60.0,
+            pressure_size: true,
+            pressure_flow: true,
+            ..Stroke::default()
+        };
+        let (layers, appends) = (develop.brush_layer_builds(), develop.brush_layer_appends());
+        let (paint_p50, paint_p95, paint_max) =
+            painted_view_with(&gpu, &mut develop, &gated, &actual, AUTO_BRUSH, &pen);
+        println!(
+            "painting an auto stroke with a pen at 100 percent, one appended point a frame, {RENDERS} frames: p50 {paint_p50:.2} ms, p95 {paint_p95:.2} ms, max {paint_max:.2} ms"
+        );
+        assert_eq!(
+            (
+                develop.brush_layer_builds() - layers,
+                develop.brush_layer_appends() - appends
+            ),
+            (0, RENDERS as u64 + 1),
+            "painting stamped the whole auto layer again"
+        );
+
+        // For the record: the whole auto layer stamped again over the padded
+        // window, which an undo asks for and a new frame of a video.
+        timed_view(&gpu, &mut develop, &gated, &actual);
+        let mut undone = gated.clone();
+        timed_brush(&mut undone, AUTO_BRUSH).strokes.pop();
+        let whole = timed_view(&gpu, &mut develop, &undone, &actual);
+        println!(
+            "the auto brush layer stamped whole over the padded window {:?}, its alpha and what is seen developed: {whole:.2} ms",
+            (actual.window.2, actual.window.3)
+        );
+
+        let (deep, _) = zoomed_view(full, 4);
+        timed_view(&gpu, &mut develop, &gated, &deep);
+        let (deep_p50, deep_p95, deep_max) =
+            painted_view_with(&gpu, &mut develop, &gated, &deep, AUTO_BRUSH, &pen);
+        println!(
+            "painting an auto stroke with a pen at 400 percent, one appended point a frame, {RENDERS} frames: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
+        );
+        auto_p95 = Some((step_p95, paint_p95, deep_p95));
+    }
+    assert_eq!(
+        develop.proxy_builds() - proxies,
+        1,
+        "one photo, one proxy: no window, slider or stroke built it again"
+    );
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            six_p95 < GATE_MS,
+            "p95 of a slider step with the six masks, {six_p95:.2} ms, is not under {GATE_MS} ms"
+        );
+        if let Some((step_p95, paint_p95, deep_p95)) = auto_p95 {
+            assert!(
+                step_p95 < GATE_MS,
+                "p95 of a slider step at 100 percent with the six masks, {step_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                paint_p95 < GATE_MS,
+                "p95 of painting an auto stroke at 100 percent, {paint_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                deep_p95 < GATE_MS,
+                "p95 of painting an auto stroke at 400 percent, {deep_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
         assert!(
             five_p95 < GATE_MS,
             "p95 of a slider step with the five masks, {five_p95:.2} ms, is not under {GATE_MS} ms"
