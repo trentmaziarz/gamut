@@ -11,23 +11,30 @@
 //! tile after another. A default device draws into at most 32 bytes a sample,
 //! which is two of them a pass.
 //!
-//! A tile is drawn in ten passes: the moments in two, their box means across
-//! and down in two each, the solve, the box means of `a` and `b` across and
-//! down, and the apply, which alone runs at full resolution and writes the
-//! r8unorm refined alpha.
+//! A tile is drawn in 24 passes. Six take the moments of the source and
+//! their box means; they depend on no mask and no gather, so they are kept
+//! while the source, the radius and the tile stay the same, and a tile then
+//! costs 18. Each of the three gathers takes six: the moments of `q` over the
+//! cells, their box means across and down, the solve in two passes of two
+//! targets, and the move at full resolution. The move of the last gather
+//! writes the r8unorm refined alpha; the two before it write `q` into a 32
+//! bit single channel target, so no store rounds it between gathers.
 
 use bytemuck::{Pod, Zeroable};
-use gamut_color::refine::Plan;
+use gamut_color::refine::{GATHERS, Plan};
 
 use crate::{FULLSCREEN_VERTICES, fullscreen_primitive};
 
-/// The format of the float targets.
+/// The format of the float targets of the cells.
 pub(crate) const MOMENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+/// The format of the target that holds `q` between two gathers.
+pub(crate) const MOVED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 /// The most cells a side the float targets hold, unless one box needs more.
 pub(crate) const TILE_CELLS: u32 = 768;
 
-/// A rectangle of pixels: x, y, width, height.
+/// A rectangle of pixels or of cells: x, y, width, height.
 pub(crate) type Rect = (u32, u32, u32, u32);
 
 /// Mirrors the `Uniform` of `refine.wgsl`; a test holds the two layouts equal.
@@ -40,6 +47,7 @@ pub(crate) struct RefineUniform {
     pub(crate) grid_count: [u32; 2],
     pub(crate) tile_first: [u32; 2],
     pub(crate) tile_count: [u32; 2],
+    pub(crate) q_first: [u32; 2],
     pub(crate) step: u32,
     pub(crate) cells: u32,
     pub(crate) eps: f32,
@@ -50,16 +58,54 @@ pub(crate) struct RefineUniform {
 /// the float targets hold while it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Tile {
-    /// The pixels of the render the apply pass writes.
+    /// The pixels of the render the last move writes.
     pub(crate) out: Rect,
     /// The first cell held and how many, on each axis.
     pub(crate) first: (u32, u32),
     pub(crate) count: (u32, u32),
+    /// The cells the gathers are drawn over, as texels of the targets: the
+    /// ones the pixels of `out` lie among and the margin around them.
+    pub(crate) work: Rect,
 }
 
 impl Tile {
+    /// The pixel of the render the first texel of the `q` target holds: the
+    /// first pixel of the first cell.
+    fn q_first(&self, plan: &Plan) -> (u32, u32) {
+        let axis = |first: u32, origin: u32| (first * plan.step).max(origin) - origin;
+        (
+            axis(self.first.0, plan.origin.0),
+            axis(self.first.1, plan.origin.1),
+        )
+    }
+
+    /// The pixels of the render inside the cells of `work`.
+    fn work_pixels(&self, plan: &Plan) -> Rect {
+        let axis = |first: u32, start: u32, count: u32, origin: u32, size: u32| {
+            let low = ((first + start) * plan.step).max(origin) - origin;
+            let high = ((first + start + count) * plan.step).min(origin + size) - origin;
+            (low, high - low)
+        };
+        let (x, width) = axis(
+            self.first.0,
+            self.work.0,
+            self.work.2,
+            plan.origin.0,
+            plan.size.0,
+        );
+        let (y, height) = axis(
+            self.first.1,
+            self.work.1,
+            self.work.3,
+            plan.origin.1,
+            plan.size.1,
+        );
+        (x, y, width, height)
+    }
+
     pub(crate) fn uniform(&self, plan: &Plan) -> RefineUniform {
         let (grid_first, grid_count) = plan.grid();
+        let q_first = self.q_first(plan);
         RefineUniform {
             origin: [plan.origin.0, plan.origin.1],
             size: [plan.size.0, plan.size.1],
@@ -67,6 +113,7 @@ impl Tile {
             grid_count: [grid_count.0, grid_count.1],
             tile_first: [self.first.0, self.first.1],
             tile_count: [self.count.0, self.count.1],
+            q_first: [q_first.0, q_first.1],
             step: plan.step,
             cells: plan.cells,
             eps: plan.eps,
@@ -76,15 +123,10 @@ impl Tile {
 }
 
 /// The most cells a side a tile of this plan may hold: [`TILE_CELLS`], or
-/// what one box and a few pixels around it need when that is more.
+/// what the boxes of the gathers and a few pixels around them need when that
+/// is more.
 pub(crate) fn tile_side(plan: &Plan) -> u32 {
-    TILE_CELLS.max(margin(plan) * 2 + 64)
-}
-
-/// The cells a tile holds on each side of the ones its pixels lie among: the
-/// box of the moments and the box of `a` and `b`.
-fn margin(plan: &Plan) -> u32 {
-    2 * plan.cells
+    TILE_CELLS.max(plan.margin() * 2 + 64)
 }
 
 /// The cells one axis of a span of pixels of the render needs: the cells its
@@ -96,17 +138,47 @@ fn cells_for(plan: &Plan, origin: u32, start: u32, length: u32, grid: (u32, u32)
     // twin's floor((X + 0.5) / step - 0.5), which is -1 before the first
     // centre and held at the grid there.
     let before = |pixel: u32| (2 * (origin + pixel) + 1).saturating_sub(step) / (2 * step);
-    let low = before(start).saturating_sub(margin(plan)).max(grid.0);
-    let high = (before(start + length - 1) + 1 + margin(plan)).min(grid.0 + grid.1 - 1);
+    let low = before(start).saturating_sub(plan.margin()).max(grid.0);
+    let high = (before(start + length - 1) + 1 + plan.margin()).min(grid.0 + grid.1 - 1);
     (low, high.max(low) - low + 1)
 }
 
 /// The tiles that refine `over` of a render, each inside `side` cells a side.
+/// A grid that fits in one tile is always held whole, whatever `over` is, so
+/// the moments of the source held for it serve a patch under new dabs too;
+/// the gathers are then drawn over the cells the patch needs alone.
 pub(crate) fn tiles(plan: &Plan, over: Rect, side: u32) -> Vec<Tile> {
     let (grid_first, grid_count) = plan.grid();
+    if grid_count.0 <= side && grid_count.1 <= side {
+        let (first_x, columns) = cells_for(
+            plan,
+            plan.origin.0,
+            over.0,
+            over.2,
+            (grid_first.0, grid_count.0),
+        );
+        let (first_y, rows) = cells_for(
+            plan,
+            plan.origin.1,
+            over.1,
+            over.3,
+            (grid_first.1, grid_count.1),
+        );
+        return vec![Tile {
+            out: over,
+            first: grid_first,
+            count: grid_count,
+            work: (
+                first_x - grid_first.0,
+                first_y - grid_first.1,
+                columns,
+                rows,
+            ),
+        }];
+    }
     // The pixels a tile may write along one axis so that its cells fit: the
     // margin on both sides and the two cells around the span come off.
-    let span = (side.saturating_sub(2 * margin(plan) + 3)).max(1) * plan.step;
+    let span = (side.saturating_sub(2 * plan.margin() + 3)).max(1) * plan.step;
     let cuts = |start: u32, length: u32| -> Vec<(u32, u32)> {
         (0..length.div_ceil(span))
             .map(|k| (start + k * span, span.min(length - k * span)))
@@ -123,6 +195,7 @@ pub(crate) fn tiles(plan: &Plan, over: Rect, side: u32) -> Vec<Tile> {
                 out: (x, y, width, height),
                 first: (first_x, first_y),
                 count: (columns, rows),
+                work: (0, 0, columns, rows),
             });
         }
     }
@@ -133,15 +206,47 @@ struct FloatTarget {
     view: wgpu::TextureView,
 }
 
-/// The float targets of a frame: the moments in `m`, and `n` for the other
-/// side of every box mean, for `a` and `b` and for theirs.
-pub(crate) struct Scratch {
-    m: [FloatTarget; 4],
-    n: [FloatTarget; 4],
+/// The moments of the source the targets `s` hold: the plan they were taken
+/// with, but for eps and the amount, and the tile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Held {
+    full: (u32, u32),
+    origin: (u32, u32),
     size: (u32, u32),
+    step: u32,
+    cells: u32,
+    first: (u32, u32),
+    count: (u32, u32),
+}
+
+/// The float targets of a frame, eleven of cells and one of pixels.
+pub(crate) struct Scratch {
+    /// The box means of the source's moments: (I, rr), (rg, rb, gg, gb), (bb).
+    s: [FloatTarget; 3],
+    /// The far side of every box mean. While a mask is gathered `f[0]` holds
+    /// the means of (q, q I) and `f[2]` those of (p, p p).
+    f: [FloatTarget; 3],
+    /// The far side of the box mean of (p, p p).
+    g: FloatTarget,
+    /// What a gather solved: 15 numbers a cell.
+    v: [FloatTarget; 4],
+    /// `q` between two gathers, at the pixels of the cells.
+    q: FloatTarget,
+    /// The cells a side the targets of cells hold, and the pixels `q` holds.
+    size: (u32, u32),
+    q_size: (u32, u32),
+    held: Option<Held>,
     /// Told apart from every scratch before it, for the bind groups that
     /// hold its views.
     id: u64,
+}
+
+impl Scratch {
+    /// The working texture holds other pixels: the moments of the source
+    /// are taken again by the next refine.
+    pub(crate) fn forget_source(&mut self) {
+        self.held = None;
+    }
 }
 
 /// The refined alpha of one mask and what draws it.
@@ -155,36 +260,46 @@ pub(crate) struct Refined {
 }
 
 /// One bind group for each set of textures a pass reads. A texture is never
-/// in the group of a pass that writes it.
+/// in the group of a pass that writes it; `v` fills the places a pass does
+/// not read.
 struct Binds {
-    /// n0 to n3: the moments passes and the box down of the first pair.
-    n: wgpu::BindGroup,
-    /// n2, n3, n0, n1: the box down of the second pair.
-    n_second: wgpu::BindGroup,
-    /// m0 to m3: the box across of the first pair, and the solve.
-    m: wgpu::BindGroup,
-    /// m2, m3, m0, m1: the box across of the second pair.
-    m_second: wgpu::BindGroup,
-    /// n0 first: the box across of `a` and `b`, and the apply.
-    ab: wgpu::BindGroup,
-    /// n1 first: the box down of `a` and `b`.
-    ab_across: wgpu::BindGroup,
+    /// f1, g: the passes over the pixels of a cell, which read no target of
+    /// cells, and the box down of a gather.
+    cells: wgpu::BindGroup,
+    /// s0, s1 and s2: the box across of the source's moments.
+    source_pair: wgpu::BindGroup,
+    source_one: wgpu::BindGroup,
+    /// f0, f1 and f2: the box down of the source's moments.
+    far_pair: wgpu::BindGroup,
+    far_one: wgpu::BindGroup,
+    /// f0, f2: the box across of a gather.
+    gather_across: wgpu::BindGroup,
+    /// s0, s1, s2, f0, f2: the solve.
+    solve: wgpu::BindGroup,
+    /// v0 to v3, and no `q`: the move.
+    moving: wgpu::BindGroup,
 }
 
 /// The pipelines of `refine.wgsl`.
 pub(crate) struct RefinePass {
     layout: wgpu::BindGroupLayout,
-    moments_a: wgpu::RenderPipeline,
-    moments_b: wgpu::RenderPipeline,
+    source_a: wgpu::RenderPipeline,
+    source_b: wgpu::RenderPipeline,
+    gather_first: wgpu::RenderPipeline,
+    gather: wgpu::RenderPipeline,
     box_h2: wgpu::RenderPipeline,
     box_v2: wgpu::RenderPipeline,
-    solve: wgpu::RenderPipeline,
     box_h1: wgpu::RenderPipeline,
     box_v1: wgpu::RenderPipeline,
+    solve_a: wgpu::RenderPipeline,
+    solve_b: wgpu::RenderPipeline,
+    moving: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     /// The distance between two tiles in the uniform buffer.
     stride: u32,
     scratches: u64,
+    /// How many times the moments of the source were taken, in tiles.
+    pub(crate) source_builds: u64,
 }
 
 const SHADER: &str = include_str!("shaders/refine.wgsl");
@@ -225,6 +340,8 @@ impl RefinePass {
                 texture(4),
                 texture(5),
                 texture(6),
+                texture(7),
+                texture(8),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -269,17 +386,22 @@ impl RefinePass {
         let one = [MOMENT_FORMAT];
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         RefinePass {
-            moments_a: pipeline("fs_moments_a", &pair),
-            moments_b: pipeline("fs_moments_b", &pair),
+            source_a: pipeline("fs_source_a", &pair),
+            source_b: pipeline("fs_source_b", &one),
+            gather_first: pipeline("fs_gather_first", &pair),
+            gather: pipeline("fs_gather", &one),
             box_h2: pipeline("fs_box_h2", &pair),
             box_v2: pipeline("fs_box_v2", &pair),
-            solve: pipeline("fs_solve", &one),
             box_h1: pipeline("fs_box_h1", &one),
             box_v1: pipeline("fs_box_v1", &one),
+            solve_a: pipeline("fs_solve_a", &pair),
+            solve_b: pipeline("fs_solve_b", &pair),
+            moving: pipeline("fs_move", &[MOVED_FORMAT]),
             apply: pipeline("fs_apply", &[alpha_format]),
             layout,
             stride: (size as u32).div_ceil(alignment) * alignment,
             scratches: 0,
+            source_builds: 0,
         }
     }
 
@@ -328,25 +450,41 @@ impl RefinePass {
         let (_, grid) = plan.grid();
         let side = tile_side(plan);
         let wanted = (grid.0.min(side), grid.1.min(side));
-        if scratch
-            .as_ref()
-            .is_none_or(|held| held.size.0 < wanted.0 || held.size.1 < wanted.1)
-        {
-            let size = scratch.as_ref().map_or(wanted, |held| {
-                (held.size.0.max(wanted.0), held.size.1.max(wanted.1))
+        let wanted_q = (
+            (wanted.0 * plan.step).min(plan.size.0),
+            (wanted.1 * plan.step).min(plan.size.1),
+        );
+        if scratch.as_ref().is_none_or(|held| {
+            held.size.0 < wanted.0
+                || held.size.1 < wanted.1
+                || held.q_size.0 < wanted_q.0
+                || held.q_size.1 < wanted_q.1
+        }) {
+            let (size, q_size) = scratch.as_ref().map_or((wanted, wanted_q), |held| {
+                (
+                    (held.size.0.max(wanted.0), held.size.1.max(wanted.1)),
+                    (held.q_size.0.max(wanted_q.0), held.q_size.1.max(wanted_q.1)),
+                )
             });
             self.scratches += 1;
             let float = |label: &str| FloatTarget {
                 view: target(device, label, MOMENT_FORMAT, size.0, size.1).view,
             };
             *scratch = Some(Scratch {
-                m: [0; 4].map(|_| float("refine moments")),
-                n: [0; 4].map(|_| float("refine means")),
+                s: [0; 3].map(|_| float("refine source means")),
+                f: [0; 3].map(|_| float("refine means")),
+                g: float("refine mask means"),
+                v: [0; 4].map(|_| float("refine solved")),
+                q: FloatTarget {
+                    view: target(device, "refine moved", MOVED_FORMAT, q_size.0, q_size.1).view,
+                },
                 size,
+                q_size,
+                held: None,
                 id: self.scratches,
             });
         }
-        let scratch = scratch.as_ref().expect("made above");
+        let scratch = scratch.as_mut().expect("made above");
         let tiles = tiles(plan, over, side);
         if refined.slots < tiles.len() as u32 {
             refined.slots = (tiles.len() as u32).next_power_of_two();
@@ -358,7 +496,7 @@ impl RefinePass {
             .as_ref()
             .is_none_or(|(id, _)| *id != scratch.id)
         {
-            let group = |label: &str, textures: [&FloatTarget; 4]| {
+            let group = |label: &str, moved: &wgpu::TextureView, textures: [&FloatTarget; 5]| {
                 fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
                     wgpu::BindGroupEntry {
                         binding,
@@ -381,28 +519,52 @@ impl RefinePass {
                         },
                         view(1, working),
                         view(2, alpha),
-                        view(3, &textures[0].view),
-                        view(4, &textures[1].view),
-                        view(5, &textures[2].view),
-                        view(6, &textures[3].view),
+                        view(3, moved),
+                        view(4, &textures[0].view),
+                        view(5, &textures[1].view),
+                        view(6, &textures[2].view),
+                        view(7, &textures[3].view),
+                        view(8, &textures[4].view),
                     ],
                 })
             };
-            let (m, n) = (&scratch.m, &scratch.n);
+            let (s, f, g, v, q) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v, &scratch.q);
             refined.binds = Some((
                 scratch.id,
                 Binds {
-                    n: group("refine n", [&n[0], &n[1], &n[2], &n[3]]),
-                    n_second: group("refine n second", [&n[2], &n[3], &n[0], &n[1]]),
-                    m: group("refine m", [&m[0], &m[1], &m[2], &m[3]]),
-                    m_second: group("refine m second", [&m[2], &m[3], &m[0], &m[1]]),
-                    ab: group("refine ab", [&n[0], &m[1], &m[2], &m[3]]),
-                    ab_across: group("refine ab across", [&n[1], &m[1], &m[2], &m[3]]),
+                    cells: group("refine cells", &q.view, [&f[1], g, &v[0], &v[1], &v[2]]),
+                    source_pair: group(
+                        "refine source pair",
+                        &q.view,
+                        [&s[0], &s[1], &v[0], &v[1], &v[2]],
+                    ),
+                    source_one: group(
+                        "refine source one",
+                        &q.view,
+                        [&s[2], &v[0], &v[1], &v[2], &v[3]],
+                    ),
+                    far_pair: group(
+                        "refine far pair",
+                        &q.view,
+                        [&f[0], &f[1], &v[0], &v[1], &v[2]],
+                    ),
+                    far_one: group(
+                        "refine far one",
+                        &q.view,
+                        [&f[2], &v[0], &v[1], &v[2], &v[3]],
+                    ),
+                    gather_across: group(
+                        "refine gather across",
+                        &q.view,
+                        [&f[0], &f[2], &v[0], &v[1], &v[2]],
+                    ),
+                    solve: group("refine solve", &q.view, [&s[0], &s[1], &s[2], &f[0], &f[2]]),
+                    // The move writes `q`, so the alpha stands in its place.
+                    moving: group("refine move", alpha, [&v[0], &v[1], &v[2], &v[3], &f[1]]),
                 },
             ));
         }
         let (_, binds) = refined.binds.as_ref().expect("made above");
-        let (m, n) = (&scratch.m, &scratch.n);
         for (slot, tile) in tiles.iter().enumerate() {
             let offset = slot as u32 * self.stride;
             queue.write_buffer(
@@ -410,7 +572,7 @@ impl RefinePass {
                 u64::from(offset),
                 bytemuck::bytes_of(&tile.uniform(plan)),
             );
-            let cells = (0, 0, tile.count.0, tile.count.1);
+            let (s, f, g, v) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v);
             let mut pass = |label: &str,
                             pipeline: &wgpu::RenderPipeline,
                             bind: &wgpu::BindGroup,
@@ -421,64 +583,148 @@ impl RefinePass {
             fn pair<'a>(a: &'a FloatTarget, b: &'a FloatTarget) -> [&'a wgpu::TextureView; 2] {
                 [&a.view, &b.view]
             }
-            pass(
-                "refine moments a",
-                &self.moments_a,
-                &binds.n,
-                &pair(&m[0], &m[1]),
-                cells,
+            // The moments of the source over the whole tile, unless the
+            // targets hold them already.
+            let held = Held {
+                full: plan.full,
+                origin: plan.origin,
+                size: plan.size,
+                step: plan.step,
+                cells: plan.cells,
+                first: tile.first,
+                count: tile.count,
+            };
+            if scratch.held != Some(held) {
+                let all = (0, 0, tile.count.0, tile.count.1);
+                let cells = &binds.cells;
+                pass(
+                    "refine source a",
+                    &self.source_a,
+                    cells,
+                    &pair(&s[0], &s[1]),
+                    all,
+                );
+                pass("refine source b", &self.source_b, cells, &[&s[2].view], all);
+                pass(
+                    "refine source h a",
+                    &self.box_h2,
+                    &binds.source_pair,
+                    &pair(&f[0], &f[1]),
+                    all,
+                );
+                pass(
+                    "refine source h b",
+                    &self.box_h1,
+                    &binds.source_one,
+                    &[&f[2].view],
+                    all,
+                );
+                pass(
+                    "refine source v a",
+                    &self.box_v2,
+                    &binds.far_pair,
+                    &pair(&s[0], &s[1]),
+                    all,
+                );
+                pass(
+                    "refine source v b",
+                    &self.box_v1,
+                    &binds.far_one,
+                    &[&s[2].view],
+                    all,
+                );
+                scratch.held = Some(held);
+                self.source_builds += 1;
+            }
+            let work = tile.work;
+            let q_first = tile.q_first(plan);
+            let work_pixels = tile.work_pixels(plan);
+            let moved_area = (
+                work_pixels.0 - q_first.0,
+                work_pixels.1 - q_first.1,
+                work_pixels.2,
+                work_pixels.3,
             );
-            pass(
-                "refine moments b",
-                &self.moments_b,
-                &binds.n,
-                &pair(&m[2], &m[3]),
-                cells,
-            );
-            pass(
-                "refine box h a",
-                &self.box_h2,
-                &binds.m,
-                &pair(&n[0], &n[1]),
-                cells,
-            );
-            pass(
-                "refine box h b",
-                &self.box_h2,
-                &binds.m_second,
-                &pair(&n[2], &n[3]),
-                cells,
-            );
-            pass(
-                "refine box v a",
-                &self.box_v2,
-                &binds.n,
-                &pair(&m[0], &m[1]),
-                cells,
-            );
-            pass(
-                "refine box v b",
-                &self.box_v2,
-                &binds.n_second,
-                &pair(&m[2], &m[3]),
-                cells,
-            );
-            pass("refine solve", &self.solve, &binds.m, &[&n[0].view], cells);
-            pass("refine ab h", &self.box_h1, &binds.ab, &[&n[1].view], cells);
-            pass(
-                "refine ab v",
-                &self.box_v1,
-                &binds.ab_across,
-                &[&n[0].view],
-                cells,
-            );
-            pass(
-                "refine apply",
-                &self.apply,
-                &binds.ab,
-                &[&refined.alpha],
-                tile.out,
-            );
+            for gather in 0..GATHERS {
+                if gather == 0 {
+                    // With the moments of the mask itself, which the solve
+                    // of every gather reads from f2.
+                    pass(
+                        "refine gather first",
+                        &self.gather_first,
+                        &binds.cells,
+                        &pair(&f[0], &f[2]),
+                        work,
+                    );
+                    pass(
+                        "refine gather h2",
+                        &self.box_h2,
+                        &binds.gather_across,
+                        &pair(&f[1], g),
+                        work,
+                    );
+                    pass(
+                        "refine gather v2",
+                        &self.box_v2,
+                        &binds.cells,
+                        &pair(&f[0], &f[2]),
+                        work,
+                    );
+                } else {
+                    pass(
+                        "refine gather",
+                        &self.gather,
+                        &binds.cells,
+                        &[&f[0].view],
+                        work,
+                    );
+                    pass(
+                        "refine gather h1",
+                        &self.box_h1,
+                        &binds.gather_across,
+                        &[&f[1].view],
+                        work,
+                    );
+                    pass(
+                        "refine gather v1",
+                        &self.box_v1,
+                        &binds.cells,
+                        &[&f[0].view],
+                        work,
+                    );
+                }
+                pass(
+                    "refine solve a",
+                    &self.solve_a,
+                    &binds.solve,
+                    &pair(&v[0], &v[1]),
+                    work,
+                );
+                pass(
+                    "refine solve b",
+                    &self.solve_b,
+                    &binds.solve,
+                    &pair(&v[2], &v[3]),
+                    work,
+                );
+                if gather + 1 < GATHERS {
+                    pass(
+                        "refine move",
+                        &self.moving,
+                        &binds.moving,
+                        &[&scratch.q.view],
+                        moved_area,
+                    );
+                } else {
+                    pass(
+                        "refine apply",
+                        &self.apply,
+                        &binds.moving,
+                        &[&refined.alpha],
+                        tile.out,
+                    );
+                }
+            }
         }
         tiles.len() as u32
     }
@@ -558,7 +804,7 @@ fn draw(
 mod tests {
     use super::*;
     use gamut_color::acescct;
-    use gamut_color::refine::SOLVED;
+    use gamut_color::refine as twin;
     use gamut_core::mask::Refine;
     use std::mem::offset_of;
     use wgpu::naga;
@@ -601,11 +847,12 @@ mod tests {
         assert_eq!(offset("grid_count"), offset_of!(RefineUniform, grid_count));
         assert_eq!(offset("tile_first"), offset_of!(RefineUniform, tile_first));
         assert_eq!(offset("tile_count"), offset_of!(RefineUniform, tile_count));
+        assert_eq!(offset("q_first"), offset_of!(RefineUniform, q_first));
         assert_eq!(offset("step"), offset_of!(RefineUniform, step));
         assert_eq!(offset("cells"), offset_of!(RefineUniform, cells));
         assert_eq!(offset("eps"), offset_of!(RefineUniform, eps));
         assert_eq!(offset("amount"), offset_of!(RefineUniform, amount));
-        assert_eq!(members.len(), 10);
+        assert_eq!(members.len(), 11);
     }
 
     /// The value of `const NAME: f32 = value;` in the shader.
@@ -627,36 +874,93 @@ mod tests {
         assert_eq!(wgsl_constant("ACES_OFFSET"), acescct::OFFSET);
         assert_eq!(wgsl_constant("ACES_LOG_SHIFT"), acescct::LOG_SHIFT);
         assert_eq!(wgsl_constant("ACES_LOG_SCALE"), acescct::LOG_SCALE);
-        // What the twin solves a cell fits four float targets, which two
-        // passes of two targets fill: 32 bytes a sample, the most a default
+        assert_eq!(wgsl_constant("COVER_LOW"), twin::COVER_LOW);
+        assert_eq!(wgsl_constant("COVER_HIGH"), twin::COVER_HIGH);
+        assert_eq!(wgsl_constant("HARD_LOW"), twin::HARD_LOW);
+        assert_eq!(wgsl_constant("HARD_HIGH"), twin::HARD_HIGH);
+        assert_eq!(wgsl_constant("SEPARATE_LOW"), twin::SEPARATE_LOW);
+        assert_eq!(wgsl_constant("SEPARATE_HIGH"), twin::SEPARATE_HIGH);
+        assert_eq!(wgsl_constant("LINE_LOW"), twin::LINE_LOW);
+        assert_eq!(wgsl_constant("LINE_HIGH"), twin::LINE_HIGH);
+        assert_eq!(wgsl_constant("OUT_LOW"), twin::OUT_LOW);
+        assert_eq!(wgsl_constant("OUT_HIGH"), twin::OUT_HIGH);
+        assert_eq!(wgsl_constant("IN_LOW"), twin::IN_LOW);
+        assert_eq!(wgsl_constant("IN_HIGH"), twin::IN_HIGH);
+        assert_eq!(wgsl_constant("SHARE_FLOOR"), twin::SHARE_FLOOR);
+        assert_eq!(wgsl_constant("SEPARATION_FLOOR"), twin::SEPARATION_FLOOR);
+        // The shader writes the three gathers out as the loop of `run`, the
+        // smoothstep as its polynomial, and never calls the builtin.
+        assert_eq!(GATHERS, 3);
+        assert!(
+            !SHADER.contains("smoothstep("),
+            "the builtin is never called"
+        );
+        // The moments of the source, of a gather and of the mask, and what a
+        // gather solves, fit their float targets: 3, 1, 1 and 4 of four
+        // channels, two a pass at most, 32 bytes a sample, the most a default
         // device draws into.
-        assert_eq!(SOLVED.div_ceil(4), 4, "four targets of four channels");
+        assert_eq!(twin::SOURCE_MOMENTS.div_ceil(4), 3);
+        assert_eq!(twin::GATHER_MOMENTS.div_ceil(4), 1);
+        assert_eq!(twin::MASK_MOMENTS.div_ceil(4), 1);
+        assert_eq!(twin::SOLVED.div_ceil(4), 4);
         assert_eq!(MOMENT_FORMAT.target_pixel_byte_cost(), Some(16));
+        assert_eq!(MOVED_FORMAT.target_pixel_byte_cost(), Some(4));
     }
 
     #[test]
     fn a_render_that_fits_is_one_tile_of_its_whole_grid() {
         let plan = plan(0.01, (1280, 1600), (0, 0), (1280, 1600));
-        assert_eq!((plan.step, plan.cells), (4, 4));
+        assert_eq!((plan.step, plan.cells), (2, 6), "16 pixels");
         let tiles = tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan));
+        // The grid is 640 by 800 cells: more than one tile holds.
+        assert!(tiles.len() > 1);
+        let plan = self::plan(0.05, (1280, 1600), (0, 0), (1280, 1600));
+        assert_eq!((plan.step, plan.cells), (4, 14), "80 pixels");
+        let tiles = self::tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan));
         assert_eq!(
             tiles,
             vec![Tile {
                 out: (0, 0, 1280, 1600),
                 first: (0, 0),
                 count: (320, 400),
+                work: (0, 0, 320, 400),
             }]
         );
         let uniform = tiles[0].uniform(&plan);
         assert_eq!(uniform.grid_count, [320, 400]);
         assert_eq!(uniform.tile_count, [320, 400]);
-        assert_eq!((uniform.step, uniform.cells), (4, 4));
+        assert_eq!(uniform.q_first, [0, 0]);
+        assert_eq!((uniform.step, uniform.cells), (4, 14));
+        // A patch of the same render keeps the tile and works on the cells
+        // it needs alone: the cells its pixels lie among, 49 to 62 across and
+        // 74 to 85 down, and 44 cells of margin around them.
+        let patch = self::tiles(&plan, (200, 300, 50, 40), tile_side(&plan));
+        assert_eq!(patch.len(), 1);
+        assert_eq!((patch[0].first, patch[0].count), ((0, 0), (320, 400)));
+        assert_eq!(plan.margin(), 44);
+        assert_eq!(patch[0].work, (5, 30, 102, 100));
+        assert_eq!(patch[0].work_pixels(&plan), (20, 120, 408, 400));
+    }
+
+    #[test]
+    fn a_window_that_begins_inside_a_cell_places_q_on_its_first_pixel() {
+        let plan = plan(0.05, (6000, 4000), (1021, 513), (900, 700));
+        assert_eq!(plan.step, 4);
+        let tile = tiles(&plan, (0, 0, 900, 700), tile_side(&plan))[0];
+        // The first cell, 255, begins at pixel 1020, before the render.
+        assert_eq!(tile.first, (255, 128));
+        assert_eq!(tile.q_first(&plan), (0, 0));
+        let tile = Tile {
+            first: (300, 140),
+            ..tile
+        };
+        assert_eq!(tile.q_first(&plan), (1200 - 1021, 560 - 513));
     }
 
     /// Every pixel of what is refined is written by exactly one tile, and a
-    /// tile holds every cell the twin reads for its pixels: the two cells a
-    /// pixel lies among, the box of `a` and `b` around them, and the box of
-    /// the moments around that, inside the grid of the render.
+    /// tile holds, and works on, every cell the twin reads for its pixels:
+    /// the two cells a pixel lies among and the margin of the three gathers
+    /// around them, inside the grid of the render.
     #[test]
     fn the_tiles_write_every_pixel_once_and_hold_every_cell_they_read() {
         let window = ((6000, 4000), (1021, 513), (3104, 2005));
@@ -668,15 +972,20 @@ mod tests {
             ),
             // The default radius at 100 percent.
             (plan(0.01, window.0, window.1, window.2), (3, 2, 3098, 2001)),
-            // The widest box: 75 cells either side.
+            // The widest box: 53 cells either side, three times.
             (
                 plan(0.05, (6000, 4000), (0, 0), (6000, 4000)),
                 (0, 0, 6000, 4000),
             ),
-            // A patch under new dabs.
+            // A patch under new dabs, on a grid of many tiles and on one
+            // that fits in a tile.
             (
                 plan(0.02, window.0, window.1, window.2),
                 (1500, 700, 301, 277),
+            ),
+            (
+                plan(0.05, (1280, 1600), (0, 0), (1280, 1600)),
+                (600, 700, 301, 277),
             ),
         ];
         for (plan, over) in cases {
@@ -686,23 +995,28 @@ mod tests {
             let mut written = vec![0u8; (over.2 * over.3) as usize];
             for tile in &tiles {
                 assert!(tile.count.0 <= side && tile.count.1 <= side, "{tile:?}");
+                assert!(
+                    tile.work.0 + tile.work.2 <= tile.count.0
+                        && tile.work.1 + tile.work.3 <= tile.count.1,
+                    "{tile:?}"
+                );
                 for y in tile.out.1..tile.out.1 + tile.out.3 {
                     for x in tile.out.0..tile.out.0 + tile.out.2 {
                         written[((y - over.1) * over.2 + x - over.0) as usize] += 1;
                     }
                 }
                 // Start and length of the pixels, the origin of the render,
-                // the grid, and what the tile holds, on each axis.
+                // the grid, and what the tile works on, on each axis.
                 let axes = [
                     (
                         (tile.out.0, tile.out.2, plan.origin.0),
                         (grid_first.0, grid_count.0),
-                        (tile.first.0, tile.count.0),
+                        (tile.first.0 + tile.work.0, tile.work.2),
                     ),
                     (
                         (tile.out.1, tile.out.3, plan.origin.1),
                         (grid_first.1, grid_count.1),
-                        (tile.first.1, tile.count.1),
+                        (tile.first.1 + tile.work.1, tile.work.3),
                     ),
                 ];
                 for ((start, length, origin), (first, count), (held_first, held_count)) in axes {
@@ -710,7 +1024,7 @@ mod tests {
                         // The twin's place of a pixel among the cell centres.
                         let place = ((origin + pixel) as f32 + 0.5) / plan.step as f32 - 0.5;
                         let low = place.floor() as i64;
-                        let reach = 2 * i64::from(plan.cells);
+                        let reach = i64::from(plan.margin());
                         let clamp =
                             |cell: i64| cell.clamp(i64::from(first), i64::from(first + count - 1));
                         let (need_low, need_high) = (clamp(low - reach), clamp(low + 1 + reach));
@@ -721,6 +1035,16 @@ mod tests {
                         );
                     }
                 }
+                // The q target holds the pixels of every cell worked on.
+                let q_first = tile.q_first(&plan);
+                let pixels = tile.work_pixels(&plan);
+                assert!(pixels.0 >= q_first.0 && pixels.1 >= q_first.1, "{tile:?}");
+                assert!(
+                    pixels.0 - q_first.0 + pixels.2 <= (tile.count.0 * plan.step).min(plan.size.0)
+                        && pixels.1 - q_first.1 + pixels.3
+                            <= (tile.count.1 * plan.step).min(plan.size.1),
+                    "{tile:?}"
+                );
             }
             assert!(written.iter().all(|count| *count == 1), "{plan:?}");
             println!("{} tiles of at most {side} cells a side", tiles.len());
@@ -729,10 +1053,10 @@ mod tests {
 
     #[test]
     fn a_box_wider_than_a_tile_gets_a_tile_that_holds_it() {
-        // A picture of 40,000 pixels: a radius of 0.05 is 2,000 pixels, 500
-        // cells either side for each of the two boxes.
+        // A picture of 40,000 pixels: a radius of 0.05 is 2,000 pixels, 355
+        // cells either side for each of the three gathers.
         let plan = plan(0.05, (40_000, 30_000), (0, 0), (40_000, 30_000));
-        assert_eq!((plan.step, plan.cells), (4, 500));
+        assert_eq!((plan.step, plan.cells), (4, 355));
         assert!(tile_side(&plan) > TILE_CELLS);
         let tiles = tiles(&plan, (0, 0, 4000, 3000), tile_side(&plan));
         assert!(tiles.iter().all(|tile| tile.out.2 >= 4 && tile.out.3 >= 4));

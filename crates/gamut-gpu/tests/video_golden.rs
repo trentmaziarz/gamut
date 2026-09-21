@@ -587,15 +587,17 @@ fn a_turned_frame_matches_the_turned_twin() {
 /// rest, and each render is held to the twin of its own frame.
 #[test]
 fn a_refined_mask_on_a_frame_matches_the_twin_and_is_refined_again_on_the_next() {
-    // A radial gradient whose fall lies across column 32, the edge of the
-    // first frame, and reaches column 21, the edge of the second.
+    // A radial gradient with a hard rim from column 19 to column 34: two
+    // columns over the edge of the first frame at 32, and two over the edge
+    // of the second at 21. Each frame takes the spill off its own edge and
+    // leaves the other rim, which lies on no edge, as drawn.
     let mut mask = Mask::new(
         "Refined",
         MaskSource::Radial(RadialGradient {
-            centre: [0.42, 0.5],
-            radius: [0.3, 0.35],
+            centre: [0.414, 0.5],
+            radius: [0.117, 0.35],
             rotation: 0.0,
-            feather: 90.0,
+            feather: 15.0,
         }),
     );
     mask.adjust.exposure = 1.2;
@@ -620,8 +622,9 @@ fn a_refined_mask_on_a_frame_matches_the_twin_and_is_refined_again_on_the_next()
     plain.refine = Refine::default();
     let (first, second) = (alphas_on(&frames[0], &mask), alphas_on(&frames[1], &mask));
     let differing = first.iter().zip(&second).filter(|(a, b)| a != b).count();
+    println!("the same mask on the two frames: {differing} alphas differ");
     assert!(
-        differing * 20 > first.len(),
+        differing * 50 > first.len(),
         "the same mask is refined onto other edges: {differing} pixels differ"
     );
     let unrefined = alphas_on(&frames[0], &plain);
@@ -631,8 +634,9 @@ fn a_refined_mask_on_a_frame_matches_the_twin_and_is_refined_again_on_the_next()
         "a gradient reads no pixel"
     );
     let shows = first.iter().zip(&unrefined).filter(|(a, b)| a != b).count();
+    println!("refine edges moves {shows} alphas of the first frame");
     assert!(
-        shows * 20 > first.len(),
+        shows * 100 > first.len(),
         "refine edges moves {shows} pixels"
     );
     let edit = PhotoEdit {

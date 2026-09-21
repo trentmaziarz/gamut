@@ -945,12 +945,18 @@ impl Develop {
         (self.alpha_patches, self.develop_patches)
     }
 
-    /// How many times the reference proxy of an auto brush was built. It is
-    /// built once a source content and by no window and no slider.
     /// How many times a refined alpha was drawn whole, and how many times
     /// over the reach of new dabs only.
     pub fn refine_builds(&self) -> (u64, u64) {
         (self.refine_builds, self.refine_patches)
+    }
+
+    /// How many times Refine edges took the moments of the source, in tiles.
+    /// They are kept while the source, the radius and the tile stay the
+    /// same: a Refine slider, a new stroke and another mask of the same
+    /// radius take none.
+    pub fn refine_source_builds(&self) -> u64 {
+        self.refine.source_builds
     }
 
     /// How far Refine edges reads around a pixel at a render of `full`: the
@@ -975,6 +981,8 @@ impl Develop {
         }
     }
 
+    /// How many times the reference proxy of an auto brush was built. It is
+    /// built once a source content and by no window and no slider.
     pub fn proxy_builds(&self) -> u64 {
         self.proxy_builds
     }
@@ -1206,6 +1214,11 @@ impl Develop {
             frame.transmission_ready = false;
             frame.products_region = Some(region);
             frame.developed_for = None;
+            // The moments Refine edges holds of the source are of the
+            // working texture as it was.
+            if let Some(scratch) = frame.refine_scratch.as_mut() {
+                scratch.forget_source();
+            }
             for mask in frame.masks.iter_mut().flatten() {
                 mask.shape = None;
                 mask.refine = None;

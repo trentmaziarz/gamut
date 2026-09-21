@@ -2496,7 +2496,7 @@ fn an_auto_pressure_stroke_painted_in_appended_pieces_equals_the_stroke_drawn_wh
 }
 
 /// `mask` with Refine edges on. On the 64 pixel photos a radius of 0.05 is a
-/// box of three pixels either side, in cells of one pixel.
+/// box of two pixels either side, in cells of one pixel.
 fn refined_at(mut mask: Mask, amount: f32, radius: f32, sensitivity: f32) -> Mask {
     mask.refine = Refine {
         amount,
@@ -2510,23 +2510,24 @@ fn refined(mask: Mask) -> Mask {
     refined_at(mask, 100.0, 0.05, 50.0)
 }
 
-/// A radial gradient whose fall lies across the top of the near-black band at
-/// the bottom of the synthetic photo (row 58): centre at row 50, full to under
-/// 3 pixels out and gone at 13.
+/// A radial gradient drawn loosely over the colours, whose rim spills two
+/// rows into the near-black band at the bottom of the synthetic photo (the
+/// band begins at row 58): centre at row 50, full to 8 pixels out and gone at
+/// 10. Refine edges takes the spill off the band.
 fn radial_over_the_band() -> MaskSource {
     MaskSource::Radial(RadialGradient {
         centre: [0.5, 0.78],
-        radius: [0.3, 0.2],
+        radius: [0.3, 0.16],
         rotation: 0.0,
-        feather: 80.0,
+        feather: 20.0,
     })
 }
 
-/// A soft stroke down the photo with its centre on the first column of colour
-/// (column 7) and a radius of 4 pixels, so it lies over the edge between the
-/// grey ramp of the first six columns and the colours.
+/// A stroke down the photo with its centre on the first column of colour
+/// (column 7), a radius of 3 pixels and a hard rim, so it spills two columns
+/// into the grey ramp of the first six columns.
 fn stroke_along_the_grey_columns() -> MaskSource {
-    brush_source(&[stroke(&[[0.11, 0.08], [0.11, 0.85]], 0.06, 60.0, 100.0)])
+    brush_source(&[stroke(&[[0.11, 0.08], [0.11, 0.85]], 0.05, 20.0, 100.0)])
 }
 
 /// Refine edges has to move the picture for its golden test to mean anything.
@@ -2749,11 +2750,17 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     let photo = synthetic_photo();
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_source(&photo);
-    let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64) {
+    // The alphas drawn, the refined alphas drawn, and how many times the
+    // moments of the source were taken.
+    let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
             .expect("a source is set");
-        (develop.mask_alpha_builds(), develop.refine_builds().0)
+        (
+            develop.mask_alpha_builds(),
+            develop.refine_builds().0,
+            develop.refine_source_builds(),
+        )
     };
     let mut edit = masked(vec![
         refined(exposure_mask("Radial", radial_over_the_band())),
@@ -2761,12 +2768,12 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     ]);
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 1),
+        (2, 1, 1),
         "two alphas, one of them refined"
     );
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 1),
+        (2, 1, 1),
         "the same edit again"
     );
 
@@ -2776,49 +2783,56 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     edit.masks[0].opacity = 35.0;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 1),
+        (2, 1, 1),
         "sliders of the develop chain, global and of the mask"
     );
 
     edit.masks[0].refine.amount = 60.0;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 2),
-        "the Amount slider"
+        (2, 2, 1),
+        "the Amount slider gathers again over the moments of the source it holds"
     );
     edit.masks[0].refine.sensitivity = 80.0;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 3),
-        "the Edge sensitivity slider"
+        (2, 3, 1),
+        "the Edge sensitivity slider too"
     );
     edit.masks[0].refine.radius = 0.02;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (2, 4),
-        "the Radius slider"
+        (2, 4, 2),
+        "the Radius slider takes the moments of the source over its new box"
     );
 
     edit.masks[0].components[0].invert = true;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (3, 5),
+        (3, 5, 2),
         "a component redraws the alpha, and the filter reads it"
     );
+    // The second mask takes the radius of the first, so the moments of the
+    // source the frame holds serve it.
+    edit.masks[1].refine.radius = 0.02;
     edit.masks[1].refine.amount = 100.0;
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (3, 6),
+        (3, 6, 2),
         "refine switched on for the second mask filters the alpha it holds"
     );
     edit.masks[1].refine.amount = 0.0;
-    assert_eq!(builds_after(&mut develop, &edit), (3, 6), "and off again");
+    assert_eq!(
+        builds_after(&mut develop, &edit),
+        (3, 6, 2),
+        "and off again"
+    );
 
     develop.set_source(&hazy_photo());
     assert_eq!(
         builds_after(&mut develop, &edit),
-        (5, 7),
-        "a new source content draws both"
+        (5, 7, 3),
+        "a new source content draws all three"
     );
     assert_eq!(develop.refine_builds().1, 0, "never a part");
 }
@@ -2856,37 +2870,207 @@ fn blocky_photo(width: u32, height: u32) -> Photo {
     }
 }
 
-/// On a photo wider than 1024 pixels a radius of 0.01 is 11 pixels, so the
-/// moments are taken in cells of two pixels: the cell grid, the bilinear step
-/// back up and the odd last column are real.
+/// On a photo wider than 1024 pixels a radius of 0.015 is 16 pixels and one of
+/// 0.03 is 33, so the moments are taken in cells of two and of four pixels:
+/// the cell grid, the bilinear step back up and the odd last column are real.
 #[test]
 fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
     let photo = blocky_photo(1101, 90);
-    let plan = Plan::for_geometry(
-        &refined_at(Mask::default(), 100.0, 0.01, 50.0).refine,
-        &Geometry::full((1101, 90), (1101, 90)),
+    for (radius, cells) in [(0.015, (2, 6)), (0.03, (4, 6))] {
+        let plan = Plan::for_geometry(
+            &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
+            &Geometry::full((1101, 90), (1101, 90)),
+        );
+        assert_eq!((plan.step, plan.cells), cells);
+        // A radial gradient with a hard rim 8 pixels over the block edge at
+        // column 576, across the row edge at 60, and a stroke with a hard rim
+        // 5 pixels over the block edge at column 288.
+        let radial = MaskSource::Radial(RadialGradient {
+            centre: [0.4995, 0.5],
+            radius: [0.0309, 0.05],
+            rotation: 0.0,
+            feather: 15.0,
+        });
+        let brush = brush_source(&[stroke(&[[0.2543, 0.1], [0.2543, 0.9]], 0.012, 20.0, 100.0)]);
+        let edit = masked(vec![
+            refined_at(exposure_mask("Radial", radial), 100.0, radius, 50.0),
+            refined_at(exposure_mask("Brush", brush), 100.0, radius, 60.0),
+        ]);
+        let moved = assert_the_refine_shows(&photo, &edit);
+        println!(
+            "refined masks on a wide photo, cells of {}: refine edges moves {moved} pixels of the twin",
+            plan.step
+        );
+        check_on(
+            &format!(
+                "refined masks on a photo wider than 1024 pixels, cells of {}",
+                plan.step
+            ),
+            &photo,
+            &edit,
+        );
+    }
+}
+
+/// A tower of two tones against a sky: dark slate on its left half and pale
+/// stone on its right, columns 24 to 39 from row 10 down, with a little grain
+/// so no two cells are alike.
+fn tower_photo() -> Photo {
+    let mut rgba8 = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let colour = if y < 10 || !(24..40).contains(&x) {
+                [0.56, 0.76, 0.96]
+            } else if x < 32 {
+                [0.16, 0.2, 0.27]
+            } else {
+                [0.78, 0.74, 0.62]
+            };
+            let grain = 0.96 + 0.04 * ((x * 7 + y * 13) % 11) as f32 / 10.0;
+            for c in colour {
+                rgba8.push((c * grain * 255.0).round() as u8);
+            }
+            rgba8.push(255);
+        }
+    }
+    Photo {
+        width: SIZE,
+        height: SIZE,
+        rgba8,
+        source: SourceSpace::Srgb,
+        bit_depth: 8,
+        has_alpha: false,
+    }
+}
+
+/// A stroke with a hard rim down the tower of [`tower_photo`], 10 pixels
+/// either side of its middle: it spills two columns into the sky on each
+/// side and over the top.
+fn stroke_down_the_tower() -> MaskSource {
+    brush_source(&[stroke(&[[0.5, 0.3], [0.5, 1.0]], 0.156, 10.0, 100.0)])
+}
+
+/// The largest difference between two pictures over the pixels `inside`
+/// names, by column and row.
+fn most_over(a: &[[u8; 3]], b: &[[u8; 3]], inside: impl Fn(u32, u32) -> bool) -> i32 {
+    let mut most = 0;
+    for (i, (a, b)) in a.iter().zip(b).enumerate() {
+        if inside(i as u32 % SIZE, i as u32 / SIZE) {
+            for k in 0..3 {
+                most = most.max((i32::from(a[k]) - i32::from(b[k])).abs());
+            }
+        }
+    }
+    most
+}
+
+/// An object of two tones under a loose mask is kept whole: the spill leaves
+/// the sky on both sides, and neither the slate, which is far from the sky,
+/// nor the stone, which is as bright as the sky, loses its mask.
+#[test]
+fn a_two_tone_object_under_a_loose_refined_mask_is_kept_whole() {
+    let photo = tower_photo();
+    let mask = exposure_mask("Tower", stroke_down_the_tower());
+    let loose = masked(vec![mask.clone()]);
+    let snapped = masked(vec![refined(mask)]);
+    let reference = |edit: &PhotoEdit| cpu_reference(&photo, edit, Rounding::Nearest, 0);
+    let (none, loose, snapped_twin) = (
+        reference(&PhotoEdit::default()),
+        reference(&loose),
+        reference(&snapped),
     );
-    assert_eq!((plan.step, plan.cells), (2, 6));
-    // A radial gradient across the block edge at column 576 and the row edge
-    // at 60, and a soft stroke along the block edge at column 288.
-    let radial = MaskSource::Radial(RadialGradient {
-        centre: [0.5, 0.5],
-        radius: [0.06, 0.05],
-        rotation: 20.0,
-        feather: 90.0,
-    });
-    let brush = brush_source(&[stroke(&[[0.258, 0.1], [0.266, 0.9]], 0.012, 70.0, 100.0)]);
-    let edit = masked(vec![
-        refined_at(exposure_mask("Radial", radial), 100.0, 0.01, 50.0),
-        refined_at(exposure_mask("Brush", brush), 100.0, 0.01, 60.0),
-    ]);
-    let moved = assert_the_refine_shows(&photo, &edit);
-    println!("refined masks on a wide photo: refine edges moves {moved} pixels of the twin");
-    check_on(
-        "refined masks on a photo wider than 1024 pixels",
-        &photo,
-        &edit,
+    let tower = |x: u32, y: u32| (24..40).contains(&x) && (20..SIZE).contains(&y);
+    let spill =
+        |x: u32, y: u32| (x == 22 || x == 23 || x == 40 || x == 41) && (24..56).contains(&y);
+    assert!(
+        most_over(&loose, &none, spill) > 30,
+        "the loose mask lifts the sky beside the tower"
     );
+    let left = most_over(&snapped_twin, &none, spill);
+    let lost = most_over(&snapped_twin, &loose, tower);
+    println!("two-tone object: the spill keeps {left} codes, the tower loses {lost}");
+    assert!(left <= 1, "the spill keeps {left} codes of its lift");
+    assert!(lost <= 1, "the tower loses {lost} codes of its lift");
+    check_on("refined mask over a two-tone object", &photo, &snapped);
+}
+
+/// A mask that is soft at the scale of the box is soft on purpose: Refine
+/// edges runs its passes and returns it as drawn.
+#[test]
+fn a_soft_refined_mask_comes_back_as_drawn() {
+    let photo = synthetic_photo();
+    let soft = exposure_mask("Soft", radial_source());
+    let plain = cpu_reference(&photo, &masked(vec![soft.clone()]), Rounding::Nearest, 0);
+    for radius in [0.02, 0.05] {
+        let edit = masked(vec![refined_at(soft.clone(), 100.0, radius, 50.0)]);
+        let with = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+        let most = most_over(&with, &plain, |_, _| true);
+        println!("soft mask at a radius of {radius}: refine edges moves it {most} codes at most");
+        assert!(most <= 1, "radius {radius}: moved by {most} codes");
+        check_masks(&format!("soft refined mask at a radius of {radius}"), &edit);
+    }
+}
+
+/// A radial gradient with a hard rim that covers the middle of the synthetic
+/// photo and spills two rows into the near-black band, as
+/// [`radial_over_the_band`] does.
+fn radial_over_the_middle_and_the_band() -> MaskSource {
+    MaskSource::Radial(RadialGradient {
+        centre: [0.5, 0.6],
+        radius: [0.3, 0.34],
+        rotation: 0.0,
+        feather: 10.0,
+    })
+}
+
+/// How many refined alphas must lie within a tenth of a half code.
+const REFINED_HALF_CODE_PIXELS: usize = 30;
+
+/// At an amount of 50 every pixel of the spill that leaves the mask lands on
+/// 127.5 codes, within a rounding of the half code, where a GPU may store 127
+/// or 128 ([`mask_twin::UNORM_STEP_TOLERANCE`]). Under an exposure that is one
+/// output code at most, inside the unchanged tolerance; the overlay shows the
+/// alpha itself, and its reference alone accepts either code.
+#[test]
+fn a_refined_alpha_beside_a_half_code_matches() {
+    let mask = refined_at(
+        exposure_mask("Beside a half code", radial_over_the_middle_and_the_band()),
+        50.0,
+        0.05,
+        50.0,
+    );
+    let photo = synthetic_photo();
+    let linear: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    let store = |v: f32| half(v, Rounding::Nearest);
+    let alphas = mask_twin::alpha_image_before_the_store(&mask, &linear, &geometry, None, &store);
+    let beside = alphas
+        .iter()
+        .filter(|alpha| {
+            let codes = **alpha * 255.0;
+            codes > 1.0
+                && codes < 254.0
+                && (codes.fract() - 0.5).abs() < mask_twin::UNORM_STEP_TOLERANCE
+        })
+        .count();
+    println!("{beside} refined alphas lie within a tenth of a half code");
+    assert!(
+        beside >= REFINED_HALF_CODE_PIXELS,
+        "{beside} refined alphas lie beside a half code"
+    );
+    check_refined(
+        "refined alpha beside a half code",
+        &masked(vec![mask.clone()]),
+    );
+    let mut idle = mask;
+    idle.adjust = Adjustments::default();
+    check_overlay(idle);
 }
 
 /// A refined mask under a crop window and under a zoomed window equals the
@@ -2906,17 +3090,21 @@ fn a_refined_mask_under_a_crop_window_and_a_zoomed_window_matches_the_full_rende
     println!("adapter: {}", gpu.describe());
     let (width, height) = (1100, 600);
     let photo = blocky_photo(width, height);
-    // A wide radial gradient whose fall crosses every border of the windows
-    // below, and a soft stroke along the block edge at column 480.
+    // A radial gradient with a hard rim 6 pixels over the block edge at
+    // column 480 and over the row edge at 180, which crosses the left border
+    // of what the windows below show, and a stroke with a hard rim 5 pixels
+    // over the same block edge, which crosses their top and bottom borders.
+    // At 100 percent the radial is refined in cells of two pixels and at 200
+    // percent in cells of four.
     let radial = MaskSource::Radial(RadialGradient {
-        centre: [0.45, 0.27],
-        radius: [0.14, 0.11],
-        rotation: -15.0,
-        feather: 85.0,
+        centre: [0.393, 0.25],
+        radius: [0.049, 0.0327],
+        rotation: 0.0,
+        feather: 12.0,
     });
-    let brush = brush_source(&[stroke(&[[0.43, 0.05], [0.44, 0.5]], 0.02, 70.0, 100.0)]);
+    let brush = brush_source(&[stroke(&[[0.425, 0.05], [0.425, 0.5]], 0.016, 20.0, 100.0)]);
     let masks = vec![
-        refined_at(exposure_mask("Radial", radial), 100.0, 0.01, 50.0),
+        refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
         refined_at(exposure_mask("Brush", brush), 90.0, 0.02, 70.0),
     ];
     let readback = Readback::new(&gpu.device);
@@ -2974,6 +3162,14 @@ fn a_refined_mask_under_a_crop_window_and_a_zoomed_window_matches_the_full_rende
             view.full
         );
         assert!(max <= 1, "max difference {max} at {:?}", view.full);
-        assert_ne!(zoomed, without, "refine edges shows inside the window");
+        let moved = zoomed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(without.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("refine edges moves {moved} pixels of the window");
+        assert!(moved > 200, "refine edges shows inside the window");
     }
 }
