@@ -2912,6 +2912,134 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
     }
 }
 
+/// The same with Refine edges at 100 on the growing mask: a stroke with a hard
+/// rim, down beside the grey columns and along the near-black band so it
+/// spills over both edges, painted in ten appended pieces, and an erase
+/// stroke in five after it, are the strokes drawn whole. New dabs change the
+/// refined alpha the filter's reach further out than they change the alpha
+/// and no further, so the alpha, the refined alpha and the develop passes
+/// are drawn over parts only, and the refined alpha whole once.
+#[test]
+fn a_stroke_appended_into_a_refined_mask_equals_the_stroke_drawn_whole() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let readback = Readback::new(&gpu.device);
+    // Down column 7, two columns over the grey ramp, then across row 56, two
+    // rows over the band.
+    let path: Vec<[f32; 2]> = (0..=40)
+        .map(|i| {
+            if i <= 20 {
+                [0.11, 0.1 + i as f32 / 20.0 * 0.775]
+            } else {
+                [0.11 + (i - 20) as f32 / 20.0 * 0.7, 0.875]
+            }
+        })
+        .collect();
+    let eraser: Vec<[f32; 2]> = (0..=20)
+        .map(|i| [0.5, 0.7 + i as f32 / 20.0 * 0.25])
+        .collect();
+    let edit_at = |painted: usize, erased: usize, refine: bool| -> PhotoEdit {
+        let mut strokes = vec![stroke(&path[..painted], 0.05, 20.0, 100.0)];
+        if erased > 0 {
+            strokes.push(Stroke {
+                erase: true,
+                ..stroke(&eraser[..erased], 0.04, 20.0, 100.0)
+            });
+        }
+        let mut edit = everything_global();
+        let mut growing = exposure_mask("Growing", brush_source(&strokes));
+        growing.adjust.clarity = 25.0;
+        if refine {
+            growing = refined(growing);
+        }
+        edit.masks = vec![growing, exposure_mask("Radial", radial_source())];
+        edit
+    };
+    // At 100 percent, the lower left of the photo, where the stroke turns:
+    // both of its edges and the eraser lie in what is seen.
+    let view = ViewWindow {
+        full: (SIZE, SIZE),
+        window: (0, 30, 52, 34),
+        visible: (0, 40, 40, 24),
+    };
+    for zoomed in [false, true] {
+        let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+            if zoomed {
+                view_render_of(develop, &gpu, &readback, edit, &view)
+            } else {
+                let drawn = develop
+                    .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+                    .expect("a source is set");
+                readback.read(&gpu.device, &gpu.queue, drawn, SIZE, SIZE)
+            }
+        };
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        let mut pieces = Vec::new();
+        for piece in 1..=10 {
+            pieces.push(render(&mut develop, &edit_at(piece * 4 + 1, 0, true)));
+        }
+        for piece in 1..=5 {
+            pieces.push(render(&mut develop, &edit_at(41, piece * 4 + 1, true)));
+        }
+        assert!(pieces[0] != pieces[9], "the stroke grew on the picture");
+        assert!(
+            pieces[9] != pieces[14],
+            "and the eraser took some of it away"
+        );
+        assert_eq!(
+            develop.brush_layer_builds(),
+            1,
+            "the layer stamped whole once"
+        );
+        assert_eq!(develop.brush_layer_appends(), 14, "then new dabs only");
+        let (whole_refines, part_refines) = develop.refine_builds();
+        let (alphas, develops) = develop.brush_patches();
+        println!(
+            "zoomed {zoomed}: the refined alpha whole {whole_refines} times and over a part {part_refines}, the alpha over a part {alphas}, the develop {develops}"
+        );
+        assert_eq!(whole_refines, 1, "no whole refine pass after the first");
+        assert_eq!(develop.refine_source_builds(), 1, "the source taken once");
+        if zoomed {
+            assert!(alphas > 0 && alphas <= 14 && develops > 0 && develops <= alphas);
+            assert!(part_refines > 0 && part_refines <= 14);
+        } else {
+            assert_eq!((alphas, develops, part_refines), (14, 14, 14), "parts only");
+        }
+
+        let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+        fresh.set_source(&photo);
+        let whole = render(&mut fresh, &edit_at(41, 21, true));
+        assert_eq!(fresh.brush_layer_appends(), 0);
+        assert_eq!(fresh.refine_builds(), (1, 0));
+        let max = max_difference(&pieces[14], &whole);
+        println!(
+            "a stroke appended into a refined mask against the stroke whole, zoomed {zoomed}: max difference {max}"
+        );
+        assert!(max <= 1, "max difference {max}, zoomed {zoomed}");
+
+        // Refine edges is in what was compared: without it the picture is
+        // another.
+        let unrefined = render(&mut fresh, &edit_at(41, 21, false));
+        let moved = whole
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(unrefined.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("refine edges moves {moved} pixels, zoomed {zoomed}");
+        assert!(moved > 40, "refine edges moves {moved} pixels");
+    }
+}
+
 /// A tower of two tones against a sky: dark slate on its left half and pale
 /// stone on its right, columns 24 to 39 from row 10 down, with a little grain
 /// so no two cells are alike.
