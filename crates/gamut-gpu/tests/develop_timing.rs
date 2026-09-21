@@ -37,7 +37,9 @@ use std::time::Instant;
 
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::look::{Curve, Wheel};
-use gamut_core::mask::{ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient};
+use gamut_core::mask::{
+    ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient, Refine,
+};
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use gamut_gpu::develop::{PixelRect, holds, padded_window};
 use gamut_gpu::{Develop, Headless, ViewWindow};
@@ -411,6 +413,43 @@ fn painted_view_with(
                     .last_mut()
                     .expect("pressed");
                 assert!(stroke.push(at, pen(i)));
+                timed_view(gpu, develop, &edit, view)
+            })
+            .collect(),
+    )
+}
+
+/// The radial mask of [`everything_on_with_four_masks`].
+const RADIAL: usize = 1;
+
+/// The six masks with Refine edges at 100 on two of them: the widest box, a
+/// Radius of 0.05, on the auto brush mask, and 0.01 on the radial mask.
+fn with_refined_masks(base: &PhotoEdit) -> PhotoEdit {
+    let mut edit = base.clone();
+    for (mask, radius) in [(AUTO_BRUSH, 0.05), (RADIAL, 0.01)] {
+        edit.masks[mask].refine = Refine {
+            amount: 100.0,
+            radius,
+            sensitivity: 50.0,
+        };
+    }
+    edit
+}
+
+/// `RENDERS` renders of a zoomed view with `step` putting a value that runs
+/// from -1 to 1 into the edit before each.
+fn stepped_view_with(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: &ViewWindow,
+    step: impl Fn(&mut PhotoEdit, f32),
+) -> (f64, f64, f64) {
+    percentiles(
+        (0..RENDERS)
+            .map(|i| {
+                let mut edit = base.clone();
+                step(&mut edit, -1.0 + 2.0 * i as f32 / (RENDERS - 1) as f32);
                 timed_view(gpu, develop, &edit, view)
             })
             .collect(),
@@ -803,7 +842,151 @@ fn develop_at_viewer_size_is_fast_enough() {
         "one photo, one proxy: no window, slider or stroke built it again"
     );
 
+    // Refine edges at 100 on the auto brush mask and on the radial mask.
+    let refined = with_refined_masks(&gated);
+    let (refines, sources) = (develop.refine_builds().0, develop.refine_source_builds());
+    let refine_on = timed_render(&gpu, &mut develop, &refined, VIEWER_SIZE);
+    println!(
+        "first render with two refined masks at {VIEWER_SIZE:?} (Radius 0.05 and 0.01, each refined whole): {refine_on:.2} ms"
+    );
+    let (refined_p50, refined_p95, refined_max) = stepped(&gpu, &mut develop, &refined);
+    println!(
+        "slider step with the six masks, two of them refined, at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {refined_p50:.2} ms, p95 {refined_p95:.2} ms, max {refined_max:.2} ms"
+    );
+    // Each mask refined once, and the moments of the source taken once a
+    // tile of each: a Radius of 0.01 is more than one tile at this size.
+    let source_tiles = develop.refine_source_builds() - sources;
+    println!("the moments of the source were taken over {source_tiles} tiles for the two masks");
+    assert_eq!(
+        develop.refine_builds().0 - refines,
+        2,
+        "a slider of the develop chain refined a mask again"
+    );
+    let (amount_p50, amount_p95, amount_max) =
+        stepped_with(&gpu, &mut develop, &refined, |edit, value| {
+            edit.masks[AUTO_BRUSH].refine.amount = 50.0 + 49.0 * value;
+        });
+    println!(
+        "Refine edges slider step at {VIEWER_SIZE:?}, Radius 0.05, the mask refined whole each time, {RENDERS} renders: p50 {amount_p50:.2} ms, p95 {amount_p95:.2} ms, max {amount_max:.2} ms"
+    );
+    // Not asserted: the whole refine of one mask with the moments of the
+    // source held (18 passes: a step of Edge sensitivity) and taken again
+    // (24: Radius stepping between two boxes), at each end of the radius.
+    for (radius, other) in [(0.01, 0.012), (0.05, 0.04)] {
+        let mut one = gated.clone();
+        one.masks[AUTO_BRUSH].refine = Refine {
+            amount: 100.0,
+            radius,
+            sensitivity: 50.0,
+        };
+        timed_render(&gpu, &mut develop, &one, VIEWER_SIZE);
+        let (held_p50, held_p95, _) = stepped_with(&gpu, &mut develop, &one, |edit, value| {
+            edit.masks[AUTO_BRUSH].refine.sensitivity = 50.0 + 40.0 * value;
+        });
+        let (taken_p50, taken_p95, _) = stepped_with(&gpu, &mut develop, &one, |edit, value| {
+            let odd = ((value + 1.0) * (RENDERS - 1) as f32 / 2.0).round() as u32 % 2 == 1;
+            edit.masks[AUTO_BRUSH].refine.radius = if odd { other } else { radius };
+        });
+        println!(
+            "the refine of one mask at {VIEWER_SIZE:?}, Radius {radius} (not asserted): source moments held p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; taken again p50 {taken_p50:.2} ms, p95 {taken_p95:.2} ms; so the source moments about {:.2} ms and one gather about {:.2} ms",
+            (taken_p50 - held_p50).max(0.0),
+            held_p50 / 3.0
+        );
+    }
+    let mut refined_view_p95 = None;
+    if info.device_type == wgpu::DeviceType::Cpu {
+        println!("zoomed refine lines skipped on a CPU adapter");
+    } else {
+        let full = (photo.width, photo.height);
+        let (actual, _) = zoomed_view(full, 1);
+        let first = timed_view(&gpu, &mut develop, &refined, &actual);
+        println!(
+            "first render of the padded window at 100 percent with two refined masks (window {:?}): {first:.2} ms",
+            (actual.window.2, actual.window.3)
+        );
+        let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &refined, &actual);
+        println!(
+            "slider step at 100 percent with two refined masks, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+        );
+        // Each pair keeps the pad of the window, so no step replaces it.
+        for (radius, other) in [(0.01, 0.011), (0.05, 0.049)] {
+            let mut one = gated.clone();
+            one.masks[AUTO_BRUSH].refine = Refine {
+                amount: 100.0,
+                radius,
+                sensitivity: 50.0,
+            };
+            timed_view(&gpu, &mut develop, &one, &actual);
+            let (held_p50, held_p95, _) =
+                stepped_view_with(&gpu, &mut develop, &one, &actual, |edit, value| {
+                    edit.masks[AUTO_BRUSH].refine.sensitivity = 50.0 + 40.0 * value;
+                });
+            let (taken_p50, taken_p95, _) =
+                stepped_view_with(&gpu, &mut develop, &one, &actual, |edit, value| {
+                    let odd = ((value + 1.0) * (RENDERS - 1) as f32 / 2.0).round() as u32 % 2 == 1;
+                    edit.masks[AUTO_BRUSH].refine.radius = if odd { other } else { radius };
+                });
+            println!(
+                "the refine of one mask at 100 percent, Radius {radius} (not asserted): source moments held p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; taken again p50 {taken_p50:.2} ms, p95 {taken_p95:.2} ms; so the source moments about {:.2} ms and one gather about {:.2} ms",
+                (taken_p50 - held_p50).max(0.0),
+                held_p50 / 3.0
+            );
+        }
+        let pen = Stroke {
+            auto: true,
+            sensitivity: 60.0,
+            pressure_size: true,
+            pressure_flow: true,
+            ..Stroke::default()
+        };
+        timed_view(&gpu, &mut develop, &refined, &actual);
+        let (whole, parts) = develop.refine_builds();
+        let (paint_p50, paint_p95, paint_max) =
+            painted_view_with(&gpu, &mut develop, &refined, &actual, AUTO_BRUSH, &pen);
+        println!(
+            "painting an auto stroke with a pen into a refined mask at 100 percent, one appended point a frame, {RENDERS} frames: p50 {paint_p50:.2} ms, p95 {paint_p95:.2} ms, max {paint_max:.2} ms"
+        );
+        assert_eq!(
+            (
+                develop.refine_builds().0 - whole,
+                develop.refine_builds().1 - parts
+            ),
+            (0, RENDERS as u64 + 1),
+            "painting refined the whole mask again"
+        );
+        let (deep, _) = zoomed_view(full, 4);
+        timed_view(&gpu, &mut develop, &refined, &deep);
+        let (deep_p50, deep_p95, deep_max) =
+            painted_view_with(&gpu, &mut develop, &refined, &deep, AUTO_BRUSH, &pen);
+        println!(
+            "painting an auto stroke with a pen into a refined mask at 400 percent, one appended point a frame, {RENDERS} frames: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
+        );
+        refined_view_p95 = Some((step_p95, paint_p95, deep_p95));
+    }
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            refined_p95 < GATE_MS,
+            "p95 of a slider step with two refined masks, {refined_p95:.2} ms, is not under {GATE_MS} ms"
+        );
+        assert!(
+            amount_p95 < GATE_MS,
+            "p95 of a Refine edges slider step, {amount_p95:.2} ms, is not under {GATE_MS} ms"
+        );
+        if let Some((step_p95, paint_p95, deep_p95)) = refined_view_p95 {
+            assert!(
+                step_p95 < GATE_MS,
+                "p95 of a slider step at 100 percent with two refined masks, {step_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                paint_p95 < GATE_MS,
+                "p95 of painting into a refined mask at 100 percent, {paint_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                deep_p95 < GATE_MS,
+                "p95 of painting into a refined mask at 400 percent, {deep_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
         assert!(
             six_p95 < GATE_MS,
             "p95 of a slider step with the six masks, {six_p95:.2} ms, is not under {GATE_MS} ms"

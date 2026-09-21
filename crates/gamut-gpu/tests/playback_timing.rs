@@ -251,7 +251,62 @@ fn playback_at_4k30_is_fast_enough() {
         auto[auto.len() - 1]
     );
 
+    // The same with Refine edges at 100 on that mask: its alpha is drawn
+    // again on every frame, so it is refined again on every frame, the
+    // moments of the source with it.
+    let mut refined_edit = gated.clone();
+    for mask in &mut refined_edit.masks {
+        mask.refine = gamut_core::mask::Refine {
+            amount: 100.0,
+            radius: 0.01,
+            sensitivity: 50.0,
+        };
+    }
+    let (refines, sources) = (develop.refine_builds().0, develop.refine_source_builds());
+    let mut refined = Vec::with_capacity(100);
+    for i in 0..=100 {
+        let started = Instant::now();
+        let Some(frame) = source.next_frame().expect("decode") else {
+            break;
+        };
+        develop.set_video_frame(&frame, colour, rotation);
+        develop
+            .render(&refined_edit, crop, render_size, OUTPUT)
+            .expect("the source is set");
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        if i > 0 {
+            refined.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    assert!(
+        refined.len() >= 50,
+        "the clip is long enough for the refined run"
+    );
+    let frames = refined.len() as u64 + 1;
+    assert_eq!(
+        (
+            develop.refine_builds().0 - refines,
+            develop.refine_source_builds() - sources
+        ),
+        (frames, frames),
+        "every frame refines the mask again, from the moments of its own source"
+    );
+    refined.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let refined_p95 = refined[(refined.len() * 95 / 100).min(refined.len() - 1)];
+    println!(
+        "playback under a refined auto brush mask of {AUTO_STROKES} strokes, Radius 0.01, {} frames: p50 {:.2} ms, p95 {refined_p95:.2} ms, max {:.2} ms (under the auto mask alone p95 {auto_p95:.2} ms)",
+        refined.len(),
+        refined[refined.len() / 2],
+        refined[refined.len() - 1]
+    );
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            refined_p95 < GATE_P95_MS,
+            "p95 under a refined auto brush mask, {refined_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
+        );
         assert!(
             auto_p95 < GATE_P95_MS,
             "p95 under an auto brush mask, {auto_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
