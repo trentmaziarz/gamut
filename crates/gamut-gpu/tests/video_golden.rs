@@ -12,7 +12,7 @@ use gamut_color::brush::Proxy;
 use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
-use gamut_core::mask::MaskSource;
+use gamut_core::mask::{MaskSource, RadialGradient, Refine};
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use gamut_gpu::video::P010_FEATURE;
 use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
@@ -578,4 +578,96 @@ fn a_zoomed_window_of_a_frame_matches_the_full_render() {
 fn a_turned_frame_matches_the_turned_twin() {
     check("nv12 rotated 90", PlaneFormat::Nv12, SDR, 90);
     check("nv12 rotated 270", PlaneFormat::Nv12, SDR, 270);
+}
+
+/// A refined mask on a video is refined again on every frame, as its alpha is
+/// drawn again: the mask is fixed on the frame and its edge follows the edges
+/// of each frame. One graph is given two frames in turn, a dark left half
+/// against a bright right one and then a bright left third against a dark
+/// rest, and each render is held to the twin of its own frame.
+#[test]
+fn a_refined_mask_on_a_frame_matches_the_twin_and_is_refined_again_on_the_next() {
+    // A radial gradient whose fall lies across column 32, the edge of the
+    // first frame, and reaches column 21, the edge of the second.
+    let mut mask = Mask::new(
+        "Refined",
+        MaskSource::Radial(RadialGradient {
+            centre: [0.42, 0.5],
+            radius: [0.3, 0.35],
+            rotation: 0.0,
+            feather: 90.0,
+        }),
+    );
+    mask.adjust.exposure = 1.2;
+    mask.refine = Refine {
+        amount: 100.0,
+        radius: 0.05,
+        sensitivity: 50.0,
+    };
+    let frames = [
+        frame_with_luma(PlaneFormat::Nv12, &|x| if x < 32 { 50.0 } else { 190.0 }),
+        frame_with_luma(PlaneFormat::Nv12, &|x| if x < 21 { 200.0 } else { 70.0 }),
+    ];
+    let alphas_on = |frame: &VideoFrame, mask: &Mask| {
+        let linear: Vec<[f32; 3]> = (0..SIZE)
+            .flat_map(|dy| (0..SIZE).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| linear_at(frame, SDR, 0, dx, dy))
+            .collect();
+        let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+        mask_twin::alpha_image_with(mask, &linear, &geometry, None, &|a| a)
+    };
+    let mut plain = mask.clone();
+    plain.refine = Refine::default();
+    let (first, second) = (alphas_on(&frames[0], &mask), alphas_on(&frames[1], &mask));
+    let differing = first.iter().zip(&second).filter(|(a, b)| a != b).count();
+    assert!(
+        differing * 20 > first.len(),
+        "the same mask is refined onto other edges: {differing} pixels differ"
+    );
+    let unrefined = alphas_on(&frames[0], &plain);
+    assert_eq!(
+        unrefined,
+        alphas_on(&frames[1], &plain),
+        "a gradient reads no pixel"
+    );
+    let shows = first.iter().zip(&unrefined).filter(|(a, b)| a != b).count();
+    assert!(
+        shows * 20 > first.len(),
+        "refine edges moves {shows} pixels"
+    );
+    let edit = PhotoEdit {
+        masks: vec![mask.clone()],
+        ..PhotoEdit::default()
+    };
+
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    let readback = Readback::new(&gpu.device);
+    for (index, frame) in frames.iter().enumerate() {
+        develop.set_video_frame(frame, SDR, 0);
+        let view = develop
+            .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        let gpu_pixels: Vec<[u8; 3]> = readback
+            .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect();
+        let name = format!("refined mask on nv12 frame {}", index + 1);
+        hold_to_the_twin(&name, frame, SDR, 0, &edit, &gpu_pixels);
+        assert_eq!(
+            (develop.mask_alpha_builds(), develop.refine_builds()),
+            (index as u64 + 1, (index as u64 + 1, 0)),
+            "each frame draws the alpha and refines it once, whole"
+        );
+    }
 }
