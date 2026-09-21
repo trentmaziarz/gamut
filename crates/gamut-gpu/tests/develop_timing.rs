@@ -862,17 +862,32 @@ fn develop_at_viewer_size_is_fast_enough() {
         2,
         "a slider of the develop chain refined a mask again"
     );
-    let (amount_p50, amount_p95, amount_max) =
-        stepped_with(&gpu, &mut develop, &refined, |edit, value| {
+    // Every render from here to the zoomed lines refines a mask whole. On a
+    // CPU adapter that is seconds a render and says nothing about a GPU, so
+    // those lines are run on a GPU alone.
+    let on_gpu = info.device_type != wgpu::DeviceType::Cpu;
+    if !on_gpu {
+        println!("whole refine lines skipped on a CPU adapter");
+    }
+    let mut amount_p95 = None;
+    if on_gpu {
+        let (p50, p95, max) = stepped_with(&gpu, &mut develop, &refined, |edit, value| {
             edit.masks[AUTO_BRUSH].refine.amount = 50.0 + 49.0 * value;
         });
-    println!(
-        "Refine edges slider step at {VIEWER_SIZE:?}, Radius 0.05, the mask refined whole each time, {RENDERS} renders: p50 {amount_p50:.2} ms, p95 {amount_p95:.2} ms, max {amount_max:.2} ms"
-    );
+        println!(
+            "Refine edges slider step at {VIEWER_SIZE:?}, Radius 0.05, the mask refined whole each time, {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms"
+        );
+        amount_p95 = Some(p95);
+    }
     // Not asserted: the whole refine of one mask with the moments of the
     // source held (18 passes: a step of Edge sensitivity) and taken again
     // (24: Radius stepping between two boxes), at each end of the radius.
-    for (radius, other) in [(0.01, 0.012), (0.05, 0.04)] {
+    let ends: &[(f32, f32)] = if on_gpu {
+        &[(0.01, 0.012), (0.05, 0.04)]
+    } else {
+        &[]
+    };
+    for &(radius, other) in ends {
         let mut one = gated.clone();
         one.masks[AUTO_BRUSH].refine = Refine {
             amount: 100.0,
@@ -969,10 +984,12 @@ fn develop_at_viewer_size_is_fast_enough() {
             refined_p95 < GATE_MS,
             "p95 of a slider step with two refined masks, {refined_p95:.2} ms, is not under {GATE_MS} ms"
         );
-        assert!(
-            amount_p95 < GATE_MS,
-            "p95 of a Refine edges slider step, {amount_p95:.2} ms, is not under {GATE_MS} ms"
-        );
+        if let Some(amount_p95) = amount_p95 {
+            assert!(
+                amount_p95 < GATE_MS,
+                "p95 of a Refine edges slider step, {amount_p95:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
         if let Some((step_p95, paint_p95, deep_p95)) = refined_view_p95 {
             assert!(
                 step_p95 < GATE_MS,
