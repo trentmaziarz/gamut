@@ -280,6 +280,67 @@ impl Component {
     }
 }
 
+/// The smallest radius of Refine edges, as a fraction of the longer side of
+/// the photo.
+pub const MIN_REFINE_RADIUS: f32 = 0.001;
+
+/// The largest radius of Refine edges.
+pub const MAX_REFINE_RADIUS: f32 = 0.05;
+
+/// Refine edges: the finished alpha of a mask moved onto the edges of the
+/// picture under it, by a filter that reads the source pixel. It is part of
+/// where the mask is, never of what it adjusts.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Refine {
+    /// How much of the refined alpha is taken, 0 (off) to 100.
+    pub amount: f32,
+    /// How far the filter looks for an edge, as a fraction of the longer
+    /// side of the photo.
+    pub radius: f32,
+    /// How weak an edge still holds the mask, 0 (only strong edges) to 100.
+    pub sensitivity: f32,
+}
+
+impl Default for Refine {
+    fn default() -> Self {
+        Refine {
+            amount: 0.0,
+            radius: 0.01,
+            sensitivity: 50.0,
+        }
+    }
+}
+
+impl Refine {
+    /// Whether the alpha is left as it is. A file leaves the key out then.
+    pub fn is_off(&self) -> bool {
+        self.sanitised().amount == 0.0
+    }
+
+    /// Every number finite and inside its range.
+    pub fn sanitised(&self) -> Refine {
+        let default = Refine::default();
+        Refine {
+            amount: finite_or(self.amount, default.amount).clamp(0.0, 100.0),
+            radius: finite_or(self.radius, default.radius)
+                .clamp(MIN_REFINE_RADIUS, MAX_REFINE_RADIUS),
+            sensitivity: finite_or(self.sensitivity, default.sensitivity).clamp(0.0, 100.0),
+        }
+    }
+
+    /// What the alpha depends on: sanitised, and the default while it is
+    /// off, so a radius moved under an amount of 0 changes no shape.
+    pub fn shape(&self) -> Refine {
+        let refine = self.sanitised();
+        if refine.amount == 0.0 {
+            Refine::default()
+        } else {
+            refine
+        }
+    }
+}
+
 /// One mask: where, and what it adjusts there. The adjustments are added to
 /// the global ones, so a mask whose `adjust` is the default changes nothing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -291,6 +352,10 @@ pub struct Mask {
     /// How much of the mask applies, 0 to 100.
     pub opacity: f32,
     pub components: Vec<Component>,
+    /// Refine edges. The key is left out of a file while it is off, so a
+    /// file written before it existed saves back unchanged.
+    #[serde(skip_serializing_if = "Refine::is_off")]
+    pub refine: Refine,
     pub adjust: Adjustments,
 }
 
@@ -302,6 +367,7 @@ impl Default for Mask {
             invert: false,
             opacity: 100.0,
             components: Vec::new(),
+            refine: Refine::default(),
             adjust: Adjustments::default(),
         }
     }
@@ -325,6 +391,7 @@ impl Mask {
             && self.enabled == other.enabled
             && self.invert == other.invert
             && self.opacity == other.opacity
+            && self.refine == other.refine
             && self.adjust == other.adjust
             && same_components_but_strokes(&self.components, &other.components)
     }
@@ -342,6 +409,7 @@ impl Mask {
         MaskShape {
             components: mask.components,
             invert: mask.invert,
+            refine: mask.refine.shape(),
         }
     }
 
@@ -368,6 +436,7 @@ impl Mask {
                     invert: component.invert,
                 })
                 .collect(),
+            refine: self.refine.sanitised(),
             adjust: self.adjust.clone(),
         }
     }
@@ -378,6 +447,8 @@ impl Mask {
 pub struct MaskShape {
     pub components: Vec<Component>,
     pub invert: bool,
+    /// Refine edges as the alpha sees it: the default while it is off.
+    pub refine: Refine,
 }
 
 impl MaskShape {
@@ -385,6 +456,7 @@ impl MaskShape {
     /// brushes.
     pub fn same_but_strokes(&self, other: &MaskShape) -> bool {
         self.invert == other.invert
+            && self.refine == other.refine
             && same_components_but_strokes(&self.components, &other.components)
     }
 }
@@ -594,6 +666,103 @@ mod tests {
         mask.invert = false;
         mask.components[0].invert = true;
         assert_ne!(mask.shape(), shape);
+    }
+
+    #[test]
+    fn refine_round_trips_and_is_left_out_of_the_file_while_it_is_off() {
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(!text.contains("refine"), "{text}");
+        // A radius moved under an amount of 0 is not worth a key either.
+        mask.refine.radius = 0.03;
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(!text.contains("refine"), "{text}");
+        mask.refine = Refine {
+            amount: 80.0,
+            radius: 0.02,
+            sensitivity: 35.0,
+        };
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(text.contains(r#""refine":{"amount":80.0"#), "{text}");
+        let back: Mask = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back, mask);
+    }
+
+    #[test]
+    fn missing_fields_of_refine_take_defaults() {
+        let mask: Mask =
+            serde_json::from_str(r#"{"name": "Roofs", "refine": {"amount": 60}}"#).expect("parse");
+        assert_eq!(
+            mask.refine,
+            Refine {
+                amount: 60.0,
+                ..Refine::default()
+            }
+        );
+        assert_eq!(Refine::default().amount, 0.0);
+        assert_eq!(Refine::default().radius, 0.01);
+        assert_eq!(Refine::default().sensitivity, 50.0);
+        let none: Mask = serde_json::from_str(r#"{"name": "Roofs"}"#).expect("parse");
+        assert_eq!(none.refine, Refine::default());
+    }
+
+    #[test]
+    fn sanitising_brings_refine_into_its_ranges() {
+        let wild = Refine {
+            amount: 250.0,
+            radius: 9.0,
+            sensitivity: -4.0,
+        };
+        assert_eq!(
+            wild.sanitised(),
+            Refine {
+                amount: 100.0,
+                radius: MAX_REFINE_RADIUS,
+                sensitivity: 0.0,
+            }
+        );
+        let broken = Refine {
+            amount: f32::NAN,
+            radius: f32::INFINITY,
+            sensitivity: f32::NAN,
+        };
+        assert_eq!(broken.sanitised(), Refine::default());
+        assert!(broken.is_off());
+        let tiny = Refine {
+            amount: -3.0,
+            radius: 0.0,
+            sensitivity: 50.0,
+        };
+        assert_eq!(tiny.sanitised().radius, MIN_REFINE_RADIUS);
+        assert!(tiny.is_off());
+        let mut mask = Mask::new("Loud", MaskSource::default());
+        mask.refine = wild;
+        assert_eq!(mask.sanitised().refine, wild.sanitised());
+    }
+
+    #[test]
+    fn refine_is_part_of_the_shape_and_an_amount_of_0_is_no_refine() {
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        let plain = mask.shape();
+        mask.refine.radius = 0.04;
+        mask.refine.sensitivity = 90.0;
+        assert_eq!(mask.shape(), plain, "off, whatever the radius says");
+        mask.refine.amount = 50.0;
+        let refined = mask.shape();
+        assert_ne!(refined, plain);
+        assert!(!refined.same_but_strokes(&plain));
+        mask.refine.radius = 0.02;
+        assert_ne!(mask.shape(), refined);
+        mask.refine.radius = 0.04;
+        mask.refine.sensitivity = 10.0;
+        assert_ne!(mask.shape(), refined);
+        mask.refine.sensitivity = 90.0;
+        mask.adjust.exposure = 1.0;
+        assert_eq!(mask.shape(), refined, "what it adjusts is no part of it");
+        let mut other = mask.clone();
+        assert!(mask.same_but_strokes(&other));
+        other.refine.amount = 60.0;
+        assert!(!mask.same_but_strokes(&other));
     }
 
     #[test]

@@ -346,6 +346,24 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_applied_to_a_mask_leaves_its_refine_as_it_was() {
+        use crate::mask::{Mask, MaskSource, Refine};
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        mask.refine = Refine {
+            amount: 75.0,
+            radius: 0.03,
+            sensitivity: 20.0,
+        };
+        let refine = mask.refine;
+        let shape = mask.shape();
+        let preset = LookPreset::from_edit("Busy", &busy_edit().adjust, Groups::default());
+        preset.apply(&mut mask.adjust);
+        assert_ne!(mask.adjust, Adjustments::default(), "the preset landed");
+        assert_eq!(mask.refine, refine);
+        assert_eq!(mask.shape(), shape);
+    }
+
+    #[test]
     fn a_hand_written_preset_with_one_field_parses() {
         let preset =
             LookPreset::from_json(r#"{"name": "Warm", "edit": {"white_balance_temperature": 25}}"#)

@@ -607,6 +607,34 @@ mod tests {
     }
 
     #[test]
+    fn refine_round_trips_in_the_working_edit_and_a_version_carries_its_own() {
+        use crate::mask::Refine;
+        let mut sidecar = Sidecar::default();
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        mask.adjust.exposure = 0.7;
+        mask.refine = Refine {
+            amount: 100.0,
+            radius: 0.02,
+            sensitivity: 70.0,
+        };
+        sidecar.edit.masks.push(mask);
+        sidecar.save_version("Refined").expect("save");
+        sidecar.edit.masks[0].refine.amount = 40.0;
+        assert!(sidecar.is_dirty(), "a refine change is a change");
+        let text = sidecar.to_json();
+        let back = Sidecar::from_json(&text).expect("parse");
+        assert_eq!(back, sidecar);
+        assert_eq!(back.version, 3);
+        assert_eq!(back.edit.masks[0].refine.amount, 40.0);
+        assert_eq!(back.versions[0].edit.masks[0].refine.amount, 100.0);
+        assert_eq!(back.versions[0].edit.masks[0].refine.sensitivity, 70.0);
+        assert!(
+            !text.contains("history") && !text.contains("undo"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_sidecar_with_an_unknown_mask_source_is_refused_by_name() {
         let text = r#"{"version": 4, "edit": {"masks": [{"name": "Hair",
             "components": [{"source": {"type": "Depth"}}]}]}}"#;
