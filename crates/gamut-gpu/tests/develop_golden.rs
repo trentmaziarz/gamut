@@ -2283,3 +2283,140 @@ fn an_auto_layer_is_stamped_again_by_a_new_source_content_and_a_plain_one_is_not
         "a window replaced builds no proxy"
     );
 }
+
+/// The same for a stroke that reads the source and scales with the pen: an
+/// auto stroke with pressure on the size and on the flow, painted in ten
+/// appended pieces, and an auto erase stroke in five after it, are the
+/// strokes drawn whole. With the pressure on the size the dabs of a path are
+/// still the first dabs of the path continued, and a gate is a matter of the
+/// dab and the pixel alone, so new dabs go onto the layer that is there and
+/// nothing that was stamped is stamped again.
+#[test]
+fn an_auto_pressure_stroke_painted_in_appended_pieces_equals_the_stroke_drawn_whole() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let readback = Readback::new(&gpu.device);
+    // Down beside the grey columns and then across the colours, so the gate
+    // closes on part of what the dabs reach.
+    let path: Vec<[f32; 2]> = (0..=40)
+        .map(|i| {
+            let t = i as f32 / 40.0;
+            [0.14 + t * 0.7, 0.5 + (t * 7.0).sin() * 0.25]
+        })
+        .collect();
+    let pressure: Vec<f32> = (0..=40)
+        .map(|i| 0.15 + 0.85 * (i as f32 / 40.0 * 5.0).sin().abs())
+        .collect();
+    let eraser: Vec<[f32; 2]> = (0..=20)
+        .map(|i| {
+            [
+                0.5 + (i as f32 / 20.0 - 0.5) * 0.1,
+                0.1 + i as f32 / 20.0 * 0.8,
+            ]
+        })
+        .collect();
+    let edit_at = |painted: usize, erased: usize| -> PhotoEdit {
+        let mut strokes = painted_strokes();
+        strokes.push(Stroke {
+            pressure: pressure[..painted].to_vec(),
+            pressure_size: true,
+            pressure_flow: true,
+            ..auto(stroke(&path[..painted], 0.09, 45.0, 100.0), 60.0)
+        });
+        if erased > 0 {
+            strokes.push(Stroke {
+                erase: true,
+                ..auto(stroke(&eraser[..erased], 0.06, 30.0, 100.0), 30.0)
+            });
+        }
+        let mut edit = everything_global();
+        let mut growing = exposure_mask("Growing", brush_source(&strokes));
+        growing.adjust.clarity = 25.0;
+        let resting = exposure_mask(
+            "Resting",
+            brush_source(&[stroke(&[[0.2, 0.8], [0.8, 0.85]], 0.06, 50.0, 80.0)]),
+        );
+        edit.masks = vec![growing, resting, exposure_mask("Radial", radial_source())];
+        edit
+    };
+    let [_, view] = zoomed_views();
+    for zoomed in [false, true] {
+        let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+            if zoomed {
+                view_render_of(develop, &gpu, &readback, edit, &view)
+            } else {
+                let drawn = develop
+                    .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+                    .expect("a source is set");
+                readback.read(&gpu.device, &gpu.queue, drawn, SIZE, SIZE)
+            }
+        };
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        let mut pieces = Vec::new();
+        for piece in 1..=10 {
+            pieces.push(render(&mut develop, &edit_at(piece * 4 + 1, 0)));
+        }
+        for piece in 1..=5 {
+            pieces.push(render(&mut develop, &edit_at(41, piece * 4 + 1)));
+        }
+        assert_ne!(pieces[0], pieces[9], "the stroke grew on the picture");
+        assert_ne!(pieces[9], pieces[14], "and the eraser took some of it away");
+        assert_eq!(
+            develop.brush_layer_builds(),
+            2,
+            "each layer stamped whole once"
+        );
+        assert_eq!(
+            develop.brush_layer_appends(),
+            14,
+            "and the growing one added to: new dabs only"
+        );
+        assert_eq!(develop.proxy_builds(), 1, "one proxy for all of it");
+        let (alphas, develops) = develop.brush_patches();
+        if zoomed {
+            assert!(alphas > 0 && alphas <= 14 && develops > 0 && develops <= alphas);
+        } else {
+            assert_eq!((alphas, develops), (14, 14), "over the new dabs only");
+        }
+        assert_eq!(develop.mask_alpha_builds(), 3 + 14);
+
+        let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+        fresh.set_source(&photo);
+        let whole = render(&mut fresh, &edit_at(41, 21));
+        assert_eq!(fresh.brush_layer_appends(), 0);
+        let max = max_difference(&pieces[14], &whole);
+        println!(
+            "an auto pressure stroke in appended pieces against the stroke whole, zoomed {zoomed}: max difference {max}"
+        );
+        assert!(max <= 1, "max difference {max}, zoomed {zoomed}");
+
+        // The gate and the pressure are in what was compared: without either
+        // the picture is another.
+        let mut plain = edit_at(41, 21);
+        let MaskSource::Brush(painted) = &mut plain.masks[0].components[0].source else {
+            panic!("a brush");
+        };
+        for held in &mut painted.strokes {
+            *held = SharedStroke::new(&Stroke {
+                auto: false,
+                pressure: Vec::new(),
+                ..(**held).clone()
+            });
+        }
+        assert_ne!(render(&mut fresh, &plain), whole);
+
+        // An undo takes the erase stroke away: the layer starts again and
+        // the picture is the one from before it.
+        let undone = render(&mut develop, &edit_at(41, 0));
+        assert_eq!(develop.brush_layer_builds(), 3);
+        assert!(max_difference(&undone, &pieces[9]) <= 1);
+    }
+}
