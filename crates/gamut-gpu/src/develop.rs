@@ -407,6 +407,10 @@ struct Frame {
     /// The transmission map; holds nothing until `transmission_ready`.
     transmission: Target,
     developed: Target,
+    /// The other texture of the ordered blend. A mask pass reads what the
+    /// passes before it left in one of the two and writes the other, and the
+    /// last pass of a render writes `developed`.
+    developed_other: Target,
     /// The texture layer matches the working texture and `products_region`.
     texture_ready: bool,
     /// The transmission map matches the working texture and
@@ -418,6 +422,10 @@ struct Frame {
     /// when it has to be drawn again. While both hold, a render only runs
     /// the output pass.
     developed_for: Option<(PhotoEdit, (u32, u32, u32, u32))>,
+    /// How many mask passes the two developed textures were last drawn by.
+    /// Which of the two a pass writes follows from it, so a part is drawn
+    /// over what they hold only while it is the same.
+    developed_passes: usize,
     input_bind: wgpu::BindGroup,
     blur_h_bind: wgpu::BindGroup,
     blur_v_bind: wgpu::BindGroup,
@@ -444,7 +452,9 @@ struct FrameMask {
     /// The layers of the mask's brush components, which `raster_bind` holds.
     layers: Layers,
     raster_bind: wgpu::BindGroup,
-    develop_bind: wgpu::BindGroup,
+    /// The mask pass reading `developed`, then the one reading
+    /// `developed_other`; each is drawn into the texture it does not read.
+    develop_binds: [wgpu::BindGroup; 2],
 }
 
 /// One tile of the proxy build: the head pass draws the source pixels of
@@ -503,8 +513,8 @@ pub struct Develop {
     /// for the cache test.
     proxy_ids: u64,
     proxy_builds: u64,
-    /// `develop.wgsl` through `fs_masked` with alpha blending: develops one
-    /// mask over the developed texture.
+    /// `develop.wgsl` through `fs_masked`: develops one mask over what the
+    /// passes before it left in the other developed texture.
     masked: Pass,
     output: Pass,
     input_uniform: wgpu::Buffer,
@@ -623,9 +633,10 @@ impl Develop {
                 texture_entry(4),
                 table_entry(5),
                 texture_entry(6),
+                texture_entry(7),
             ],
             "fs_masked",
-            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::BlendState::REPLACE,
         );
         let curve_table = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tone curve table"),
@@ -1312,25 +1323,28 @@ impl Develop {
                 let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
                 let layers = Layers::new(&self.device, brushes.len(), width, height);
                 let raster_bind = raster_bind(&layers);
-                let develop_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("masked develop bind group"),
-                    layout: &self.masked.layout,
-                    entries: &[
-                        buffer_binding(0, &self.masked_uniforms[index]),
-                        texture_binding(1, &frame.working.view),
-                        texture_binding(2, &frame.base.view),
-                        texture_binding(3, &frame.texture_base.view),
-                        texture_binding(4, &frame.transmission.view),
-                        texture_binding(5, &self.curve_table_view),
-                        texture_binding(6, &alpha.view),
-                    ],
+                let develop_binds = [&frame.developed, &frame.developed_other].map(|before| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("masked develop bind group"),
+                        layout: &self.masked.layout,
+                        entries: &[
+                            buffer_binding(0, &self.masked_uniforms[index]),
+                            texture_binding(1, &frame.working.view),
+                            texture_binding(2, &frame.base.view),
+                            texture_binding(3, &frame.texture_base.view),
+                            texture_binding(4, &frame.transmission.view),
+                            texture_binding(5, &self.curve_table_view),
+                            texture_binding(6, &alpha.view),
+                            texture_binding(7, &before.view),
+                        ],
+                    })
                 });
                 FrameMask {
                     alpha,
                     shape: None,
                     layers,
                     raster_bind,
-                    develop_bind,
+                    develop_binds,
                 }
             });
             // A layer for each brush of the mask. The layers are kept while
@@ -1455,6 +1469,7 @@ impl Develop {
             // only by strokes, and the picture only where the new dabs
             // reach: the passes run over that part of what is seen alone.
             let grew = damage != Damage::Whole
+                && frame.developed_passes == masks.len()
                 && frame
                     .developed_for
                     .as_ref()
@@ -1473,33 +1488,40 @@ impl Develop {
                     bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
                 );
                 // A part is drawn over what the texture holds around it.
-                let global = if grew { draw_over } else { draw };
-                global(
+                let pass = if grew { draw_over } else { draw };
+                // The passes take turns at the two developed textures, and
+                // the global pass starts where the last one ends in
+                // `developed`.
+                let targets = [&frame.developed, &frame.developed_other];
+                let mut written = masks.len() % 2;
+                pass(
                     &mut encoder,
                     "develop",
                     &self.develop.pipeline,
                     &frame.develop_bind,
-                    &frame.developed.view,
+                    &targets[written].view,
                     Some(over),
                 );
-                // The ordered blend: each mask in list order over what is
-                // there.
+                // The ordered blend: each mask in list order over what the
+                // passes before it left.
                 for (index, _) in &masks {
                     let slot = frame.masks[*index].as_ref().expect("built above");
-                    draw_over(
+                    pass(
                         &mut encoder,
                         "masked develop",
                         &self.masked.pipeline,
-                        &slot.develop_bind,
-                        &frame.developed.view,
+                        &slot.develop_binds[written],
+                        &targets[1 - written].view,
                         Some(over),
                     );
+                    written = 1 - written;
                 }
                 if grew {
                     self.develop_patches += 1;
                 }
             }
             frame.developed_for = Some((edit.clone(), seen));
+            frame.developed_passes = masks.len();
         }
         let frame = self.frame.as_ref().expect("frame built above");
 
@@ -1708,6 +1730,8 @@ impl Develop {
         let texture_base = create_target(device, "texture base", BASE_FORMAT, width, height);
         let transmission = create_target(device, "transmission", BASE_FORMAT, width, height);
         let developed = create_target(device, "developed", WORKING_FORMAT, width, height);
+        let developed_other =
+            create_target(device, "developed other", WORKING_FORMAT, width, height);
         let input_bind = match &source.kind {
             SourceKind::Photo { view, .. } => {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1827,10 +1851,12 @@ impl Develop {
             texture_base,
             transmission,
             developed,
+            developed_other,
             texture_ready: false,
             transmission_ready: false,
             products_region: None,
             developed_for: None,
+            developed_passes: 0,
             input_bind,
             blur_h_bind,
             blur_v_bind,

@@ -9,10 +9,14 @@
 //
 // Two pipelines run this shader. The global pass draws fs_main over the
 // developed texture. A mask pass draws fs_masked with the mask's effective
-// adjustments in the uniform and alpha blending on: it returns the develop
-// of the source pixel with the mask's alpha times its opacity as the alpha,
-// so the blender mixes it over what the passes before it left (mask.rs in
-// gamut-color is the twin of that blend).
+// adjustments in the uniform: it mixes the develop of the source pixel over
+// what the passes before it left by the mask's alpha times its opacity
+// (mask.rs in gamut-color is the twin of that blend). The mix is made here
+// and not by the blender of the pipeline, which may work at the precision of
+// the half float target: one GPU cuts the colour and the alpha to half
+// floats first and lands a step of the target from another, and on a near
+// black channel of a saturated pixel a step is an output code. So a mask
+// pass reads the developed texture so far and writes another.
 
 struct Uniform {
     white_balance: mat3x3<f32>,
@@ -59,6 +63,8 @@ struct Uniform {
 // The alpha of the mask, from mask.wgsl. Only fs_masked reads it, so only
 // the masked pipeline binds it.
 @group(0) @binding(6) var mask_alpha: texture_2d<f32>;
+// What the passes before this mask left. Only fs_masked reads it.
+@group(0) @binding(7) var developed_before: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -327,5 +333,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_masked(in: VertexOutput) -> @location(0) vec4<f32> {
     let at = vec2<i32>(in.position.xy);
     let alpha = textureLoad(mask_alpha, at, 0).r * u.opacity;
-    return vec4<f32>(develop(at), alpha);
+    let before = textureLoad(developed_before, at, 0).rgb;
+    return vec4<f32>(develop(at) * alpha + before * (1.0 - alpha), 1.0);
 }

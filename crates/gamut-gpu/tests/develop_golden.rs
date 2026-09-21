@@ -28,6 +28,11 @@ const MAX_DIFFERENCE: i32 = 2;
 /// The mean absolute difference allowed over all channels, in 8-bit codes.
 const MEAN_DIFFERENCE: f64 = 0.5;
 
+/// The flow that puts the most alphas of the saturated row strokes beside a
+/// half code, and how many pixels that is at least.
+const HALF_CODE_FLOW: f32 = 54.0;
+const HALF_CODE_PIXELS: usize = 400;
+
 /// Hue across, brightness down, with a grey ramp in the first columns and
 /// a near-black band at the bottom.
 fn synthetic_photo() -> Photo {
@@ -1514,6 +1519,64 @@ fn a_low_flow_built_up_by_many_strokes_matches() {
     check_masks("low flow built up", &masked(vec![mask]));
 }
 
+/// A full stroke down the colours beside the grey ramp, then a stroke at a
+/// flow of 45 along the most saturated row of the photo.
+fn saturated_row_strokes(flow: f32) -> Vec<Stroke> {
+    vec![
+        stroke(&[[0.17, 0.1], [0.17, 0.8]], 0.12, 60.0, 100.0),
+        stroke(&[[0.25, 0.82], [0.9, 0.82]], 0.1, 30.0, flow),
+    ]
+}
+
+/// A part alpha over a saturated pixel lifted past 1: a step of the half
+/// float developed texture in a bright channel is an output code in the near
+/// black one. The mask pass makes the mix itself, so every GPU stores the
+/// mix the twin makes; the blender of one GPU, left to it, cut the colour
+/// and the alpha to half floats first and read 3 here.
+#[test]
+fn a_low_flow_brush_built_up_along_a_saturated_row_matches() {
+    check_masks(
+        "low flow along a saturated row",
+        &masked(vec![exposure_mask(
+            "Brush",
+            brush_source(&saturated_row_strokes(45.0)),
+        )]),
+    );
+}
+
+/// The layer is still built by the blender, which one GPU runs at half
+/// precision: it lands up to two steps of the layer, a quarter of an alpha
+/// code, from the twin. That shows only where the alpha lies that near to a
+/// half code, so this flow puts many pixels of the saturated row there.
+#[test]
+fn a_layer_alpha_beside_a_half_code_on_a_saturated_row_matches() {
+    let strokes = saturated_row_strokes(HALF_CODE_FLOW);
+    let mask = exposure_mask("Beside a half code", brush_source(&strokes));
+    let photo = synthetic_photo();
+    let linear: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    let store = |v: f32| half(v, Rounding::Nearest);
+    let alphas = mask_twin::alpha_image_before_the_store(&mask, &linear, &geometry, None, &store);
+    let beside = alphas
+        .iter()
+        .filter(|alpha| {
+            let codes = **alpha * 255.0;
+            codes > 1.0 && codes < 254.0 && (codes.fract() - 0.5).abs() < 0.25
+        })
+        .count();
+    assert!(
+        beside >= HALF_CODE_PIXELS,
+        "{beside} pixels lie beside a half code"
+    );
+    check_masks("layer alpha beside a half code", &masked(vec![mask]));
+}
+
 fn brush_and(other: MaskSource, op: MaskOp, brush_first: bool) -> PhotoEdit {
     let (first, second) = if brush_first {
         (painted_source(), other)
@@ -1856,16 +1919,15 @@ fn auto(stroke: Stroke, sensitivity: f32) -> Stroke {
 /// reach over its edge. A stroke across the smooth hues would show almost
 /// nothing: every dab takes the colour under its own centre.
 fn auto_strokes(sensitivity: f32) -> Vec<Stroke> {
-    vec![
-        auto(
-            stroke(&[[0.17, 0.1], [0.17, 0.8]], 0.12, 60.0, 100.0),
-            sensitivity,
-        ),
-        auto(
-            stroke(&[[0.25, 0.82], [0.9, 0.82]], 0.1, 30.0, 100.0),
-            sensitivity,
-        ),
-    ]
+    auto_strokes_at(sensitivity, 100.0)
+}
+
+/// [`auto_strokes`] with the flow of the stroke along the bottom named.
+fn auto_strokes_at(sensitivity: f32, flow: f32) -> Vec<Stroke> {
+    saturated_row_strokes(flow)
+        .into_iter()
+        .map(|stroke| auto(stroke, sensitivity))
+        .collect()
 }
 
 fn assert_the_gate_shows(edit: &PhotoEdit) {
@@ -1901,6 +1963,16 @@ fn an_auto_brush_mask_matches() {
     )]);
     assert_the_gate_shows(&edit);
     check_masks("auto brush mask", &edit);
+}
+
+#[test]
+fn an_auto_brush_at_a_low_flow_along_a_saturated_row_matches() {
+    let edit = masked(vec![exposure_mask(
+        "Auto",
+        brush_source(&auto_strokes_at(70.0, 45.0)),
+    )]);
+    assert_the_gate_shows(&edit);
+    check_masks("auto brush at a low flow", &edit);
 }
 
 #[test]
