@@ -683,6 +683,9 @@ mod tests {
             let length = (along[0] * along[0] + along[1] * along[1]).sqrt();
             let mut walked = 0.0;
             while walked + until <= length {
+                if centres.len() >= MAX_STROKE_DABS {
+                    return centres;
+                }
                 walked += until;
                 let t = walked / length;
                 centres.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
