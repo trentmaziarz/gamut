@@ -1488,13 +1488,13 @@ impl Develop {
                     bytemuck::bytes_of(&DevelopUniform::new(&edit.adjust, source.atmosphere)),
                 );
                 // A part is drawn over what the texture holds around it.
-                let pass = if grew { draw_over } else { draw };
+                let global = if grew { draw_over } else { draw };
                 // The passes take turns at the two developed textures, and
                 // the global pass starts where the last one ends in
                 // `developed`.
                 let targets = [&frame.developed, &frame.developed_other];
                 let mut written = masks.len() % 2;
-                pass(
+                global(
                     &mut encoder,
                     "develop",
                     &self.develop.pipeline,
@@ -1503,10 +1503,11 @@ impl Develop {
                     Some(over),
                 );
                 // The ordered blend: each mask in list order over what the
-                // passes before it left.
+                // passes before it left. A mask pass writes every pixel of
+                // its scissor, so it clears nothing.
                 for (index, _) in &masks {
                     let slot = frame.masks[*index].as_ref().expect("built above");
-                    pass(
+                    draw_over(
                         &mut encoder,
                         "masked develop",
                         &self.masked.pipeline,
@@ -2438,7 +2439,7 @@ fn draw_in_viewport(
     pass.draw(0..FULLSCREEN_VERTICES, 0..1);
 }
 
-/// [`draw`] over what the target holds, for a pipeline that blends.
+/// [`draw`] over what the target holds, with no clear.
 fn draw_over(
     encoder: &mut wgpu::CommandEncoder,
     label: &str,
