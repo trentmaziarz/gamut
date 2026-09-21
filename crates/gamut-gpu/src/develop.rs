@@ -46,6 +46,7 @@
 use bytemuck::{Pod, Zeroable};
 use gamut_color::SourceSpace;
 use gamut_color::basic;
+use gamut_color::brush::Proxy as ProxyTwin;
 use gamut_color::curve::{self, TABLE_SIZE};
 use gamut_color::dehaze;
 use gamut_color::hsl::HslParams;
@@ -60,7 +61,8 @@ use gamut_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskS
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
-use crate::brush_layer::{BrushPass, Drawn, Layers};
+use crate::brush_layer::{AutoInputs, BrushPass, Drawn, Layers, has_auto};
+use crate::proxy::{self, ProxyUniform, Tile};
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
@@ -445,6 +447,33 @@ struct FrameMask {
     develop_bind: wgpu::BindGroup,
 }
 
+/// One tile of the proxy build: the head pass draws the source pixels of
+/// `plan` into the tile texture at their own size, and `proxy.wgsl` averages
+/// them into the proxy pixels of `plan`.
+struct ProxyTile {
+    plan: Tile,
+    head_uniform: wgpu::Buffer,
+    head_bind: wgpu::BindGroup,
+    reduce_bind: wgpu::BindGroup,
+}
+
+/// The reference proxy of the source, which the dabs of an auto stroke read
+/// their reference colour from: a head-pass product of the source and of no
+/// window. It exists only once an edit holds an auto stroke.
+struct ProxyProduct {
+    /// The source textures the tiles are bound to.
+    generation: u64,
+    /// The source content the proxy holds, or `None` before it is built.
+    content: Option<u64>,
+    target: Target,
+    /// The tile texture: source pixels in the working format.
+    tile: Target,
+    tiles: Vec<ProxyTile>,
+    /// Told apart from every proxy before it, for the bind groups that hold
+    /// its view.
+    id: u64,
+}
+
 struct Output {
     target: Target,
     bind: wgpu::BindGroup,
@@ -467,6 +496,13 @@ pub struct Develop {
     mask: Pass,
     /// `brush.wgsl`: stamps the dabs of a painted source into its layer.
     brush: BrushPass,
+    /// `proxy.wgsl`: reduces a tile of the source into the proxy.
+    reduce: Pass,
+    proxy: Option<ProxyProduct>,
+    /// How many proxies have been set up, and how many times one was built,
+    /// for the cache test.
+    proxy_ids: u64,
+    proxy_builds: u64,
     /// `develop.wgsl` through `fs_masked` with alpha blending: develops one
     /// mask over the developed texture.
     masked: Pass,
@@ -645,6 +681,16 @@ impl Develop {
             develop,
             mask,
             brush: BrushPass::new(device),
+            reduce: make_pass(
+                device,
+                "proxy",
+                include_str!("shaders/proxy.wgsl"),
+                WORKING_FORMAT,
+                &[uniform_entry(0), texture_entry(1)],
+            ),
+            proxy: None,
+            proxy_ids: 0,
+            proxy_builds: 0,
             masked,
             output,
             input_uniform: uniform("input uniform", size_of::<InputUniform>() as u64),
@@ -845,6 +891,12 @@ impl Develop {
     /// dabs only, and how many times the developed picture was.
     pub fn brush_patches(&self) -> (u64, u64) {
         (self.alpha_patches, self.develop_patches)
+    }
+
+    /// How many times the reference proxy of an auto brush was built. It is
+    /// built once a source content and by no window and no slider.
+    pub fn proxy_builds(&self) -> u64 {
+        self.proxy_builds
     }
 
     /// The size of the source photo, when one is set.
@@ -1078,6 +1130,12 @@ impl Develop {
             frame.developed_for = None;
             for mask in frame.masks.iter_mut().flatten() {
                 mask.shape = None;
+                // A layer with an auto stroke reads the working texture: it
+                // is stamped again when the head passes ran. One without
+                // reads no source pixel and is kept.
+                if rerun {
+                    mask.layers.forget_auto();
+                }
             }
         }
         // The masks that change the picture, and what each develops with. A
@@ -1189,6 +1247,37 @@ impl Develop {
             size: (width, height),
             photo: (source.width, source.height),
         };
+        // The proxy an auto stroke reads its references from: set up when an
+        // edit first holds such a stroke, built once a source content.
+        let wants_proxy = masks
+            .iter()
+            .map(|(_, mask)| mask)
+            .chain(overlaid.iter().map(|(_, mask)| mask))
+            .flat_map(|mask| &mask.components)
+            .any(|component| matches!(&component.source, MaskSource::Brush(b) if has_auto(b)));
+        if wants_proxy {
+            let built = build_proxy(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                ProxyPasses {
+                    input: &self.input,
+                    video: &self.video,
+                    reduce: &self.reduce,
+                    sampler: &self.sampler,
+                },
+                source,
+                &mut self.proxy,
+                &mut self.proxy_ids,
+            );
+            self.proxy_builds += u64::from(built);
+        } else if self
+            .proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.generation != source.generation)
+        {
+            self.proxy = None;
+        }
         // What the masks changed of the picture in this render. A brush that
         // only grew changes what its new dabs reach and nothing else.
         let mut damage = Damage::Nothing;
@@ -1254,6 +1343,15 @@ impl Develop {
             }
             let mut stamped = Damage::Nothing;
             for (layer, brush) in brushes.iter().enumerate() {
+                let auto = self
+                    .proxy
+                    .as_ref()
+                    .filter(|_| has_auto(brush))
+                    .map(|proxy| AutoInputs {
+                        proxy: &proxy.target.view,
+                        working: &frame.working.view,
+                        generation: proxy.id,
+                    });
                 let drawn = slot.layers.update(
                     layer,
                     &self.device,
@@ -1262,6 +1360,7 @@ impl Develop {
                     &mut self.brush,
                     brush,
                     &geometry,
+                    auto,
                 );
                 match drawn {
                     Drawn::Nothing => {}
@@ -1748,6 +1847,170 @@ impl Develop {
 }
 
 /// A 1 by 1 alpha texture holding 0.
+/// The passes and the sampler a proxy build draws with.
+struct ProxyPasses<'a> {
+    input: &'a Pass,
+    video: &'a Pass,
+    reduce: &'a Pass,
+    sampler: &'a wgpu::Sampler,
+}
+
+/// Brings the proxy in `slot` to the content of `source`: sets it up for the
+/// source textures when it is not, and builds it when it holds another
+/// content. Whether it was built.
+///
+/// Each tile is drawn by the head pass of the source at the source's own
+/// size, one sample a pixel, so it holds the working pixels every render at
+/// that scale holds, and is then averaged into its block of the proxy.
+fn build_proxy(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    passes: ProxyPasses,
+    source: &Source,
+    slot: &mut Option<ProxyProduct>,
+    ids: &mut u64,
+) -> bool {
+    let size = (source.width, source.height);
+    let proxy_size = ProxyTwin::size_for(size);
+    if slot
+        .as_ref()
+        .is_none_or(|product| product.generation != source.generation)
+    {
+        let (w, h) = proxy_size;
+        let target = create_target(device, "proxy", WORKING_FORMAT, w, h);
+        let (w, h) = (size.0.min(proxy::TILE), size.1.min(proxy::TILE));
+        let tile = create_target(device, "proxy tile", WORKING_FORMAT, w, h);
+        let buffer = |label: &str, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let tiles = proxy::tiles(size, proxy_size)
+            .into_iter()
+            .map(|plan| {
+                let (head_uniform, head_bind) = match &source.kind {
+                    SourceKind::Photo { view, .. } => {
+                        let uniform = buffer("proxy input uniform", size_of::<InputUniform>());
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("proxy input bind group"),
+                            layout: &passes.input.layout,
+                            entries: &[
+                                buffer_binding(0, &uniform),
+                                texture_binding(1, view),
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(passes.sampler),
+                                },
+                            ],
+                        });
+                        (uniform, bind)
+                    }
+                    SourceKind::Video(planes) => {
+                        let uniform = buffer("proxy video uniform", size_of::<VideoUniform>());
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("proxy video bind group"),
+                            layout: &passes.video.layout,
+                            entries: &[
+                                buffer_binding(0, &uniform),
+                                texture_binding(1, &planes.luma_view),
+                                texture_binding(2, &planes.chroma_view),
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::Sampler(passes.sampler),
+                                },
+                            ],
+                        });
+                        (uniform, bind)
+                    }
+                };
+                let reduce_uniform = buffer("proxy uniform", size_of::<ProxyUniform>());
+                queue.write_buffer(
+                    &reduce_uniform,
+                    0,
+                    bytemuck::bytes_of(&plan.uniform(size, proxy_size)),
+                );
+                let reduce_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("proxy bind group"),
+                    layout: &passes.reduce.layout,
+                    entries: &[
+                        buffer_binding(0, &reduce_uniform),
+                        texture_binding(1, &tile.view),
+                    ],
+                });
+                ProxyTile {
+                    plan,
+                    head_uniform,
+                    head_bind,
+                    reduce_bind,
+                }
+            })
+            .collect();
+        *ids += 1;
+        *slot = Some(ProxyProduct {
+            generation: source.generation,
+            content: None,
+            target,
+            tile,
+            tiles,
+            id: *ids,
+        });
+    }
+    let product = slot.as_mut().expect("set up above");
+    if product.content == Some(source.content) {
+        return false;
+    }
+    for tile in &product.tiles {
+        let (_, _, w, h) = tile.plan.source;
+        let window = tile.plan.window(size);
+        let head = match &source.kind {
+            SourceKind::Photo { space, .. } => {
+                queue.write_buffer(
+                    &tile.head_uniform,
+                    0,
+                    bytemuck::bytes_of(&InputUniform {
+                        matrix: matrices::input_matrix(*space).to_wgsl_columns(),
+                        render_size: [w as f32, h as f32],
+                        decode_srgb: 1,
+                        taps: 1,
+                        window,
+                    }),
+                );
+                &passes.input.pipeline
+            }
+            SourceKind::Video(planes) => {
+                queue.write_buffer(
+                    &tile.head_uniform,
+                    0,
+                    bytemuck::bytes_of(&planes.uniform(window)),
+                );
+                &passes.video.pipeline
+            }
+        };
+        draw_in_viewport(
+            encoder,
+            "proxy tile",
+            head,
+            &tile.head_bind,
+            &product.tile.view,
+            (w, h),
+        );
+        draw_over(
+            encoder,
+            "proxy",
+            &passes.reduce.pipeline,
+            &tile.reduce_bind,
+            &product.target.view,
+            Some(tile.plan.proxy),
+        );
+    }
+    product.content = Some(source.content);
+    true
+}
+
 fn zero_texel(device: &wgpu::Device, queue: &wgpu::Queue) -> Target {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("no overlay"),
@@ -2116,6 +2379,39 @@ fn draw(
     draw_loading(encoder, label, pipeline, bind_group, target, scissor, clear);
 }
 
+/// [`draw`] into the top left `size` pixels of a larger target: the viewport
+/// is that part, so the pass sees a render of that size.
+fn draw_in_viewport(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &wgpu::TextureView,
+    size: (u32, u32),
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_viewport(0.0, 0.0, size.0 as f32, size.1 as f32, 0.0, 1.0);
+    pass.set_scissor_rect(0, 0, size.0, size.1);
+    pass.draw(0..FULLSCREEN_VERTICES, 0..1);
+}
+
 /// [`draw`] over what the target holds, for a pipeline that blends.
 fn draw_over(
     encoder: &mut wgpu::CommandEncoder,
@@ -2432,6 +2728,43 @@ mod tests {
         assert_eq!(value("CHROMA_RAMP"), mask::CHROMA_RAMP);
         assert_eq!(value("LINEAR_LENGTH_FLOOR"), mask::LINEAR_LENGTH_FLOOR);
         assert_eq!(value("DEGREES"), 1f32.to_degrees());
+
+        // brush.wgsl repeats the same for the gate of an auto dab and adds
+        // brush.rs.
+        let source = include_str!("shaders/brush.wgsl");
+        let value = |name: &str| -> f32 {
+            let start = source
+                .find(&format!("const {name}: f32 = "))
+                .unwrap_or_else(|| panic!("no constant {name}"));
+            let rest = &source[start..];
+            let from = rest.find("= ").expect("an equals sign") + 2;
+            let to = rest.find(';').expect("a semicolon");
+            rest[from..to].trim().parse().expect("a number")
+        };
+        use gamut_color::brush;
+        assert_eq!(value("ACES_LINEAR_CUT"), acescct::LINEAR_CUT);
+        assert_eq!(value("ACES_SLOPE"), acescct::SLOPE);
+        assert_eq!(value("ACES_OFFSET"), acescct::OFFSET);
+        assert_eq!(value("ACES_LOG_SHIFT"), acescct::LOG_SHIFT);
+        assert_eq!(value("ACES_LOG_SCALE"), acescct::LOG_SCALE);
+        assert_eq!(value("GATE_CHROMA_WEIGHT"), brush::GATE_CHROMA_WEIGHT);
+        assert_eq!(value("GATE_FALL"), brush::GATE_FALL);
+        let mask = include_str!("shaders/mask.wgsl");
+        for list in ["const LUMA", "const E1", "const E2"] {
+            assert_eq!(wgsl_list(source, list), wgsl_list(mask, list), "{list}");
+        }
+    }
+
+    #[test]
+    fn the_proxy_uniform_matches_the_wgsl_struct() {
+        use crate::proxy::ProxyUniform;
+        let (size, offsets) = wgsl_uniform(include_str!("shaders/proxy.wgsl"));
+        assert_eq!(size as usize, size_of::<ProxyUniform>());
+        assert_eq!(offsets[0], ("source_size".to_string(), 0));
+        assert_eq!(offsets[1], ("proxy_size".to_string(), 8));
+        assert_eq!(offsets[2], ("tile_origin".to_string(), 16));
+        assert_eq!(offset_of!(ProxyUniform, proxy_size), 8);
+        assert_eq!(offset_of!(ProxyUniform, tile_origin), 16);
     }
 
     #[test]

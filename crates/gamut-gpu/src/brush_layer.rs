@@ -3,12 +3,20 @@
 //! source.
 //!
 //! A layer covers the window of the frame it belongs to and is laid out on
-//! photo coordinates like every mask alpha. It is a product of that window:
-//! it reads no pixel of the source, so it is kept while the frame lives and
-//! its strokes are the ones it holds. Only the dabs that touch the window are
-//! stamped. A brush that only grew (points added to its last stroke, strokes
-//! added after it) is stamped by its new dabs alone, which is exact because
-//! dabs build in order.
+//! photo coordinates like every mask alpha. It is a product of that window.
+//! A layer with no auto stroke reads no pixel of the source, so it is kept
+//! while the frame lives and its strokes are the ones it holds. Only the dabs
+//! that touch the window are stamped. A brush that only grew (points added to
+//! its last stroke, strokes added after it) is stamped by its new dabs alone,
+//! which is exact because dabs build in order.
+//!
+//! A dab of an auto stroke paints only the colour under its centre. Its
+//! fragment stage reads the source pixel of the working texture and its
+//! vertex stage the reference, from the proxy of the whole source. A layer
+//! that holds such a stroke is a product of the source content too:
+//! [`Layers::forget_auto`] has it stamped again after the head passes ran.
+//! Dabs with no gate go through the pipelines and the entry points they
+//! always did.
 //!
 //! The layer is a half float, not the r8unorm of a mask alpha: a dab of a low
 //! flow adds less than half of an 8 bit code and would stop building. The
@@ -52,19 +60,38 @@ impl BrushUniform {
 }
 
 /// One dab as `brush.wgsl` reads it: the centre normalised to the photo, then
-/// the radius, the inner share where the feather starts and the flow share.
+/// the radius, the inner share where the feather starts and the flow share,
+/// then the pass distance of its colour gate, which only the auto entry
+/// points read and which is 0 on a dab with no gate.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub(crate) struct DabInstance {
     centre: [f32; 2],
     brush: [f32; 3],
+    pass_distance: f32,
 }
 
-/// Dabs drawn through one blend state, in the order they were painted.
+/// Dabs drawn through one pipeline, in the order they were painted.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Run {
     erase: bool,
+    auto: bool,
     range: Range<u32>,
+}
+
+/// What the dabs of an auto stroke read: the proxy of the whole source and
+/// the working texture of the frame.
+#[derive(Clone, Copy)]
+pub(crate) struct AutoInputs<'a> {
+    pub(crate) proxy: &'a wgpu::TextureView,
+    pub(crate) working: &'a wgpu::TextureView,
+    /// Counts up when either view is another texture.
+    pub(crate) generation: u64,
+}
+
+/// Whether a brush holds an auto stroke.
+pub(crate) fn has_auto(brush: &Brush) -> bool {
+    brush.strokes.iter().any(|stroke| stroke.auto)
 }
 
 /// What a draw stamps: the dabs, their runs, and the render pixels they
@@ -88,13 +115,17 @@ pub(crate) fn stamp(brush: &Brush, geometry: &Geometry, first: (usize, usize)) -
     let mut bounds: Option<[f32; 4]> = None;
     for (index, stroke) in brush.strokes.iter().enumerate().skip(first.0) {
         let skip = if index == first.0 { first.1 } else { 0 };
-        let reach = [
-            stroke.size / aspect[0] + pixel[0],
-            stroke.size / aspect[1] + pixel[1],
-        ];
         let inner = (1.0 - stroke.feather / 100.0).min(RADIAL_INNER_CEILING);
+        let pass_distance = if stroke.auto {
+            twin::gate_pass(stroke.sensitivity)
+        } else {
+            0.0
+        };
         let start = out.dabs.len() as u32;
-        for centre in twin::dab_centres(stroke, aspect).into_iter().skip(skip) {
+        for placed in twin::placed_dabs(stroke, aspect).into_iter().skip(skip) {
+            let centre = placed.centre;
+            let (radius, flow) = twin::dab_size_and_flow(stroke, placed.pressure);
+            let reach = [radius / aspect[0] + pixel[0], radius / aspect[1] + pixel[1]];
             let (x0, x1) = (centre[0] - reach[0], centre[0] + reach[0]);
             let (y0, y1) = (centre[1] - reach[1], centre[1] + reach[1]);
             let outside = x1 < window.x
@@ -110,7 +141,8 @@ pub(crate) fn stamp(brush: &Brush, geometry: &Geometry, first: (usize, usize)) -
             }
             out.dabs.push(DabInstance {
                 centre,
-                brush: [stroke.size, inner, stroke.flow / 100.0],
+                brush: [radius, inner, flow],
+                pass_distance,
             });
             bounds = Some(match bounds {
                 None => [x0, y0, x1, y1],
@@ -120,9 +152,12 @@ pub(crate) fn stamp(brush: &Brush, geometry: &Geometry, first: (usize, usize)) -
         let end = out.dabs.len() as u32;
         if end > start {
             match out.runs.last_mut() {
-                Some(run) if run.erase == stroke.erase => run.range.end = end,
+                Some(run) if run.erase == stroke.erase && run.auto == stroke.auto => {
+                    run.range.end = end
+                }
                 _ => out.runs.push(Run {
                     erase: stroke.erase,
+                    auto: stroke.auto,
                     range: start..end,
                 }),
             }
@@ -182,10 +217,15 @@ pub(crate) enum Drawn {
     Whole,
 }
 
-/// The two pipelines of `brush.wgsl` and the uniform they share.
+/// The pipelines of `brush.wgsl` and the uniform they share: paint and erase
+/// for a dab with no gate, and the same two through the auto entry points,
+/// which also bind the proxy and the working texture.
 pub(crate) struct BrushPass {
     paint: wgpu::RenderPipeline,
     erase: wgpu::RenderPipeline,
+    auto_paint: wgpu::RenderPipeline,
+    auto_erase: wgpu::RenderPipeline,
+    auto_layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
     written: Option<BrushUniform>,
@@ -215,8 +255,42 @@ impl BrushPass {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+        let texture = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let auto_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("brush auto"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture(1, wgpu::ShaderStages::VERTEX),
+                texture(2, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let auto_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("brush auto"),
+            bind_group_layouts: &[Some(&auto_layout)],
+            immediate_size: 0,
+        });
         let attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
-        let pipeline = |label: &str, source: wgpu::BlendFactor| {
+        let auto_attributes =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3, 2 => Float32];
+        let pipeline = |label: &str, source: wgpu::BlendFactor, auto: bool| {
             // Paint: s + a (1 - s). Erase: a (1 - s).
             let component = wgpu::BlendComponent {
                 src_factor: source,
@@ -225,15 +299,19 @@ impl BrushPass {
             };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(if auto {
+                    &auto_pipeline_layout
+                } else {
+                    &pipeline_layout
+                }),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(if auto { "vs_auto" } else { "vs_main" }),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<DabInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &attributes,
+                        attributes: if auto { &auto_attributes } else { &attributes },
                     })],
                 },
                 primitive: wgpu::PrimitiveState {
@@ -244,7 +322,7 @@ impl BrushPass {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(if auto { "fs_auto" } else { "fs_main" }),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: LAYER_FORMAT,
@@ -274,8 +352,11 @@ impl BrushPass {
             }],
         });
         BrushPass {
-            paint: pipeline("brush paint", wgpu::BlendFactor::One),
-            erase: pipeline("brush erase", wgpu::BlendFactor::Zero),
+            paint: pipeline("brush paint", wgpu::BlendFactor::One, false),
+            erase: pipeline("brush erase", wgpu::BlendFactor::Zero, false),
+            auto_paint: pipeline("brush auto paint", wgpu::BlendFactor::One, true),
+            auto_erase: pipeline("brush auto erase", wgpu::BlendFactor::Zero, true),
+            auto_layout,
             uniform,
             bind,
             written: None,
@@ -305,6 +386,9 @@ pub(crate) struct Layers {
     /// What `mask.wgsl` binds.
     pub(crate) array: wgpu::TextureView,
     layers: Vec<Layer>,
+    /// The bind group of the auto pipelines and the generation of the
+    /// inputs it holds.
+    auto_bind: Option<(wgpu::BindGroup, u64)>,
 }
 
 impl Layers {
@@ -344,11 +428,30 @@ impl Layers {
                 dabs: None,
             })
             .collect();
-        Layers { array, layers }
+        Layers {
+            array,
+            layers,
+            auto_bind: None,
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Forgets what every layer with an auto stroke holds, so the next
+    /// update stamps it whole: its dabs read the source, and the source
+    /// content is another.
+    pub(crate) fn forget_auto(&mut self) {
+        for layer in &mut self.layers {
+            if layer
+                .held
+                .as_ref()
+                .is_some_and(|(brush, _)| has_auto(brush))
+            {
+                layer.held = None;
+            }
+        }
     }
 
     /// Brings layer `index` to `brush`: nothing when it holds it, the new
@@ -363,6 +466,7 @@ impl Layers {
         pass: &mut BrushPass,
         brush: &Brush,
         geometry: &Geometry,
+        auto: Option<AutoInputs>,
     ) -> Drawn {
         let layer = &mut self.layers[index];
         let how = match &layer.held {
@@ -376,7 +480,7 @@ impl Layers {
         };
         let stamped = stamp(brush, geometry, first);
         let last_dabs = brush.strokes.last().map_or(0, |stroke| {
-            twin::dab_centres(stroke, geometry.aspect()).len()
+            twin::placed_dabs(stroke, geometry.aspect()).len()
         });
         layer.held = Some((brush.clone(), last_dabs));
 
@@ -402,6 +506,34 @@ impl Layers {
         let (buffer, _) = layer.dabs.as_ref().expect("made above");
         queue.write_buffer(buffer, 0, bytes);
         pass.set_geometry(queue, geometry);
+        if stamped.runs.iter().any(|run| run.auto) {
+            let inputs = auto.expect("a brush with an auto stroke is given its inputs");
+            if self
+                .auto_bind
+                .as_ref()
+                .is_none_or(|(_, generation)| *generation != inputs.generation)
+            {
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("brush auto bind group"),
+                    layout: &pass.auto_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: pass.uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(inputs.proxy),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(inputs.working),
+                        },
+                    ],
+                });
+                self.auto_bind = Some((bind, inputs.generation));
+            }
+        }
 
         let load = if whole {
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
@@ -425,10 +557,23 @@ impl Layers {
             multiview_mask: None,
         });
         if !stamped.dabs.is_empty() {
-            render.set_bind_group(0, &pass.bind, &[]);
             render.set_vertex_buffer(0, buffer.slice(..bytes.len() as u64));
             for run in &stamped.runs {
-                render.set_pipeline(if run.erase { &pass.erase } else { &pass.paint });
+                let (pipeline, bind) = match (run.auto, run.erase) {
+                    (false, false) => (&pass.paint, &pass.bind),
+                    (false, true) => (&pass.erase, &pass.bind),
+                    (true, erase) => {
+                        let (bind, _) = self.auto_bind.as_ref().expect("made above");
+                        let pipeline = if erase {
+                            &pass.auto_erase
+                        } else {
+                            &pass.auto_paint
+                        };
+                        (pipeline, bind)
+                    }
+                };
+                render.set_pipeline(pipeline);
+                render.set_bind_group(0, bind, &[]);
                 render.draw(0..QUAD_VERTICES, run.range.clone());
             }
         }
@@ -476,9 +621,11 @@ mod tests {
         assert_eq!(size_of::<BrushUniform>(), 32);
         assert_eq!(std::mem::offset_of!(BrushUniform, render_size), 16);
         assert_eq!(std::mem::offset_of!(BrushUniform, aspect), 24);
-        // centre at location 0, brush at location 1.
-        assert_eq!(size_of::<DabInstance>(), 20);
+        // centre at location 0, brush at location 1, and for the auto entry
+        // points the pass distance at location 2.
+        assert_eq!(size_of::<DabInstance>(), 24);
         assert_eq!(std::mem::offset_of!(DabInstance, brush), 8);
+        assert_eq!(std::mem::offset_of!(DabInstance, pass_distance), 20);
     }
 
     #[test]
@@ -544,6 +691,81 @@ mod tests {
         let later = stamp(&brush, &zoomed(), (1, 2));
         assert_eq!(later.dabs[..], stamped.dabs[3..]);
         assert_eq!(later.runs[0].range, 0..3);
+    }
+
+    #[test]
+    fn an_auto_stroke_is_a_run_of_its_own_and_carries_its_pass_distance() {
+        let auto = |erase: bool, sensitivity: f32| {
+            SharedStroke::new(&Stroke {
+                auto: true,
+                sensitivity,
+                ..(*stroke(&[[0.6, 0.3]], 0.02, erase)).clone()
+            })
+        };
+        let brush = Brush {
+            strokes: vec![
+                stroke(&[[0.6, 0.3]], 0.02, false),
+                auto(false, 0.0),
+                auto(false, 100.0),
+                auto(true, 50.0),
+                stroke(&[[0.6, 0.3]], 0.02, true),
+            ],
+        };
+        assert!(has_auto(&brush));
+        assert!(!has_auto(&Brush {
+            strokes: vec![stroke(&[[0.6, 0.3]], 0.02, false)],
+        }));
+        let stamped = stamp(&brush, &zoomed(), (0, 0));
+        let runs: Vec<(bool, bool, u32, u32)> = stamped
+            .runs
+            .iter()
+            .map(|r| (r.auto, r.erase, r.range.start, r.range.end))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                (false, false, 0, 1),
+                (true, false, 1, 3),
+                (true, true, 3, 4),
+                (false, true, 4, 5),
+            ]
+        );
+        let distances: Vec<f32> = stamped.dabs.iter().map(|d| d.pass_distance).collect();
+        assert_eq!(
+            distances,
+            [
+                0.0,
+                twin::GATE_PASS_LOOSE,
+                twin::gate_pass(100.0),
+                twin::gate_pass(50.0),
+                0.0
+            ]
+        );
+        assert!((twin::gate_pass(100.0) - twin::GATE_PASS_STRICT).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pressure_scales_the_radius_and_the_flow_of_a_dab_and_what_it_reaches() {
+        let pen = |size: bool, flow: bool| Brush {
+            strokes: vec![SharedStroke::new(&Stroke {
+                pressure: vec![0.5],
+                pressure_size: size,
+                pressure_flow: flow,
+                ..(*stroke(&[[0.6, 0.3]], 0.02, false)).clone()
+            })],
+        };
+        let plain = stamp(&pen(false, false), &zoomed(), (0, 0));
+        assert_eq!(plain.dabs[0].brush, [0.02, 0.6, 0.5]);
+        let lighter = stamp(&pen(false, true), &zoomed(), (0, 0));
+        assert_eq!(lighter.dabs[0].brush, [0.02, 0.6, 0.25]);
+        assert_eq!(lighter.reach, plain.reach);
+        let smaller = stamp(&pen(true, false), &zoomed(), (0, 0));
+        assert_eq!(smaller.dabs[0].brush, [0.02 * 0.6, 0.6, 0.5]);
+        let (wide, narrow) = (plain.reach.expect("a dab"), smaller.reach.expect("a dab"));
+        assert!(
+            narrow.2 < wide.2 && narrow.3 < wide.3,
+            "{narrow:?} {wide:?}"
+        );
     }
 
     #[test]

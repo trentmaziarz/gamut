@@ -14,6 +14,7 @@
 mod brush_layer;
 pub mod develop;
 pub mod headless;
+mod proxy;
 pub mod readback;
 pub mod test_image;
 pub mod video;
