@@ -80,6 +80,55 @@ bracket key or a click, and Alt, held while painting.
   a centre handle, one handle on each radius, and a rotation handle.
 - Pick lights up when pressed. It stays lit until your next click on the
   picture, which sets the range from the pixel under the pointer.
+- The controls of the selected mask sit under the list of masks in the Masks
+  section. The first is Opacity, a slider that sets how strongly the mask's
+  adjustments are applied. It starts at 100, the top of its 0 to 100 range.
+- Every mask has a slider named Refine edges, directly under Opacity. Its range
+  is 0 to 100. A new mask has it at 0, which is off.
+- Raise Refine edges and a loose edge of the mask moves onto the colour edge
+  under it. A colour edge is a boundary inside the photo where one thing meets
+  another, such as where a roof meets the sky. It is not the outer border of the
+  photo.
+- Paint a stroke loosely along a row of roofs, up into the sky. The mask lets go
+  of the sky and stays on the roofs. A mask drawn a little short of a colour
+  edge grows up to it.
+- The slider sets how much of that move is taken. At 100 the mask takes the
+  whole move. At 50 it goes halfway between the mask as drawn and the moved
+  mask.
+- A soft mask is not changed at all. With Refine edges on it looks the same as
+  with Refine edges off. A wide gradient or a brush with a high Feather has a
+  soft edge that fades out slowly. Refine edges acts on the mask's edge where it
+  is fairly hard and lies near a colour edge.
+- With no colour edge under the mask's edge, such as across open sky, the mask
+  stays as drawn.
+- While Refine edges is over 0, two sliders show under it, Radius and Edge
+  sensitivity. At 0 they are hidden.
+- Radius is how far the mask's edge may lie from a colour edge and still be
+  moved onto it. It is shown as a percentage of the longer side of the picture.
+  The lowest setting is 0.10 %, the highest is 5.00 %, and a new mask sits at
+  1.00 %. A mask's edge further from a colour edge than the Radius stays put. A
+  stroke that spills about 3 % of the longer side into the sky does not move at
+  1.00 %. At 5.00 % the sky is let go.
+- Edge sensitivity is how weak a colour edge can be and still hold the mask. It
+  begins at 50, midway between 0 and 100. At 100 a faint colour edge, such as
+  the rim of a thin cloud, holds the mask, and the mask's edge follows it. At 0
+  only a strong colour edge, such as a roof against the sky, holds it.
+- Refine edges acts on the whole mask, after its components are combined and
+  after Invert. Subtract a brush from a gradient and the one shape the two make
+  is refined. Any kind of component can be in that mask.
+- It reads the picture as it was before any edit. Change Exposure or any other
+  slider and the refined mask holds the edge it already has.
+- The overlay is a red tint where the selected mask applies. The Show overlay
+  checkbox, beside Invert under those sliders, turns it on and off. With Refine
+  edges on, the overlay shows the mask as refined. Turn it on to watch the edge
+  move as you drag the three sliders.
+- Refine edges, Radius and Edge sensitivity are saved with the mask in the
+  picture's file. One drag of any of the three is one undo step. None of the
+  three has a key.
+- Paint into a brush mask with Refine edges on and the new paint is refined as
+  you paint.
+- On a video the mask is refined again on every frame. Its edge follows the
+  colour edges of each frame.
 - Zoomed in or out, the crop and a mask handle move exactly as far as the
   pointer moves.
 
