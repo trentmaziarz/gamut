@@ -699,6 +699,253 @@ mod tests {
         assert_eq!(strokes(&session).strokes.len(), 4);
     }
 
+    fn touch(id: u64, phase: egui::TouchPhase, pos: Pos2, force: Option<f32>) -> egui::Event {
+        egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force,
+        }
+    }
+
+    /// A touch from `from` to `to` over ten frames, as egui-winit sends one:
+    /// the touch event with its force first, then the pointer events of the
+    /// mouse it stands in for. `force` gives the force at each step, 0 to 10.
+    fn touch_drag(
+        ctx: &egui::Context,
+        session: &mut Session,
+        from: Pos2,
+        to: Pos2,
+        force: &dyn Fn(usize) -> Option<f32>,
+    ) {
+        use egui::TouchPhase::{End, Move, Start};
+        let none = egui::Modifiers::NONE;
+        frame(
+            ctx,
+            session,
+            vec![
+                touch(1, Start, from, force(0)),
+                egui::Event::PointerMoved(from),
+                button(from, true, none),
+            ],
+        );
+        for step in 1..=10 {
+            let at = from + (to - from) * (step as f32 / 10.0);
+            frame(
+                ctx,
+                session,
+                vec![
+                    touch(1, Move, at, force(step)),
+                    egui::Event::PointerMoved(at),
+                ],
+            );
+        }
+        frame(
+            ctx,
+            session,
+            vec![
+                touch(1, End, to, None),
+                button(to, false, none),
+                egui::Event::PointerGone,
+            ],
+        );
+        frame(ctx, session, Vec::new());
+    }
+
+    fn with_a_brush_in_the_hand() -> (egui::Context, Session) {
+        let ctx = egui::Context::default();
+        let mut session = Session::default();
+        session
+            .edit
+            .masks
+            .push(Mask::new("Brush", MaskSource::Brush(Brush::default())));
+        session.adjust.select_mask(Some(0));
+        // Warm up: egui tests a pointer against the widgets of the frame before.
+        frame(&ctx, &mut session, Vec::new());
+        session.toggle_brush(0);
+        frame(&ctx, &mut session, Vec::new());
+        (ctx, session)
+    }
+
+    /// A pen reaches the brush twice in a frame, as a touch and as a pointer.
+    /// The stroke takes each point once, with the force the pen had there.
+    #[test]
+    fn a_pen_stroke_stores_each_point_once_with_its_pressure() {
+        let (ctx, mut session) = with_a_brush_in_the_hand();
+        session.adjust.brush.pressure_size = true;
+        let (from, to) = (Pos2::new(300.0, 400.0), Pos2::new(800.0, 450.0));
+        let rising = |step: usize| Some(0.2 + 0.07 * step as f32);
+        touch_drag(&ctx, &mut session, from, to, &rising);
+
+        assert_eq!(strokes(&session).strokes.len(), 1, "one touch, one stroke");
+        let stroke = &strokes(&session).strokes[0];
+        assert_eq!(
+            stroke.points.len(),
+            11,
+            "the press and ten moves, each once"
+        );
+        assert_eq!(stroke.pressure.len(), stroke.points.len());
+        for pair in stroke.points.windows(2) {
+            assert!(pair[1][0] > pair[0][0], "no point twice: {pair:?}");
+        }
+        assert_eq!(stroke.pressure[0], 0.2);
+        assert_eq!(stroke.pressure[10], 0.9);
+        assert!(stroke.pressure.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(
+            stroke.pressure_size && stroke.pressure_flow,
+            "the toggles at the press"
+        );
+        assert!(!session.adjust.brush.is_painting(), "the lift ends it");
+    }
+
+    #[test]
+    fn a_mouse_and_a_finger_store_no_pressure() {
+        let (ctx, mut session) = with_a_brush_in_the_hand();
+        let (from, to) = (Pos2::new(300.0, 400.0), Pos2::new(800.0, 450.0));
+        drag(&ctx, &mut session, from, to, egui::Modifiers::NONE);
+        touch_drag(&ctx, &mut session, from, to, &|_| None);
+        let brush = strokes(&session);
+        assert_eq!(brush.strokes.len(), 2);
+        for stroke in &brush.strokes {
+            assert!(stroke.points.len() >= 3);
+            assert!(
+                stroke.pressure.is_empty(),
+                "full pressure, and nothing in the file"
+            );
+            assert!(!stroke.uses_pressure());
+        }
+        // A finger paints where a mouse does.
+        assert_eq!(brush.strokes[0].points[0], brush.strokes[1].points[0]);
+
+        // A mouse after a pen: the pen's force is not the mouse's.
+        touch_drag(&ctx, &mut session, from, to, &|_| Some(0.3));
+        drag(&ctx, &mut session, from, to, egui::Modifiers::NONE);
+        let brush = strokes(&session);
+        assert!(!brush.strokes[2].pressure.is_empty());
+        assert!(brush.strokes[3].pressure.is_empty());
+    }
+
+    /// Two fingers are a pinch, which the view owns: the stroke ends where it
+    /// is and takes nothing more.
+    #[test]
+    fn a_second_touch_ends_the_stroke_where_it_is() {
+        use egui::TouchPhase::{End, Move, Start};
+        let (ctx, mut session) = with_a_brush_in_the_hand();
+        let none = egui::Modifiers::NONE;
+        let at = |step: f32| Pos2::new(300.0 + 40.0 * step, 400.0);
+        frame(
+            &ctx,
+            &mut session,
+            vec![
+                touch(1, Start, at(0.0), None),
+                egui::Event::PointerMoved(at(0.0)),
+                button(at(0.0), true, none),
+            ],
+        );
+        for step in 1..=3 {
+            let place = at(step as f32);
+            frame(
+                &ctx,
+                &mut session,
+                vec![
+                    touch(1, Move, place, None),
+                    egui::Event::PointerMoved(place),
+                ],
+            );
+        }
+        assert!(session.adjust.brush.is_painting());
+        let held = strokes(&session).strokes[0].points.len();
+        assert!(held >= 3);
+
+        let other = Pos2::new(700.0, 600.0);
+        frame(&ctx, &mut session, vec![touch(2, Start, other, None)]);
+        assert!(
+            !session.adjust.brush.is_painting(),
+            "the second finger ends it"
+        );
+        for step in 4..=8 {
+            let place = at(step as f32);
+            frame(
+                &ctx,
+                &mut session,
+                vec![
+                    touch(1, Move, place, None),
+                    egui::Event::PointerMoved(place),
+                    touch(2, Move, other, None),
+                ],
+            );
+        }
+        frame(
+            &ctx,
+            &mut session,
+            vec![
+                touch(2, End, other, None),
+                touch(1, End, at(8.0), None),
+                button(at(8.0), false, none),
+                egui::Event::PointerGone,
+            ],
+        );
+        let brush = strokes(&session);
+        assert_eq!(brush.strokes.len(), 1, "and starts no other");
+        assert_eq!(brush.strokes[0].points.len(), held, "nothing more is taken");
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A is Auto mask while a brush is in the hand: the next stroke is an
+    /// auto stroke with the sensitivity of the tool, and the stroke before it
+    /// stays what it was.
+    #[test]
+    fn the_a_key_makes_the_next_stroke_an_auto_stroke_and_leaves_the_last_alone() {
+        let (ctx, mut session) = with_a_brush_in_the_hand();
+        let (from, to) = (Pos2::new(300.0, 400.0), Pos2::new(800.0, 450.0));
+        drag(&ctx, &mut session, from, to, egui::Modifiers::NONE);
+        assert!(!strokes(&session).strokes[0].auto);
+
+        session.adjust.brush.sensitivity = 80.0;
+        frame(&ctx, &mut session, vec![key(egui::Key::A)]);
+        assert!(session.adjust.brush.auto, "A ticks Auto mask");
+        assert!(
+            !strokes(&session).strokes[0].auto,
+            "the last stroke is left alone"
+        );
+        drag(&ctx, &mut session, from, to, egui::Modifiers::NONE);
+        let brush = strokes(&session);
+        assert!(brush.strokes[1].auto);
+        assert_eq!(brush.strokes[1].sensitivity, 80.0);
+        assert!(!brush.strokes[0].auto);
+
+        frame(&ctx, &mut session, vec![key(egui::Key::A)]);
+        assert!(!session.adjust.brush.auto, "and A again unticks it");
+        // With no brush in the hand A is nobody's.
+        session.put_brush_down();
+        frame(&ctx, &mut session, vec![key(egui::Key::A)]);
+        assert!(!session.adjust.brush.auto);
+    }
+
+    /// With the Save, Discard, Cancel prompt up the brush is put down: a drag
+    /// and a pen paint nothing.
+    #[test]
+    fn with_the_prompt_up_nothing_paints() {
+        let (ctx, mut session) = with_a_brush_in_the_hand();
+        session.adjust.brush.auto = true;
+        session.adjust.pending_switch = Some("Teal".to_string());
+        let (from, to) = (Pos2::new(300.0, 400.0), Pos2::new(800.0, 450.0));
+        drag(&ctx, &mut session, from, to, egui::Modifiers::NONE);
+        touch_drag(&ctx, &mut session, from, to, &|_| Some(0.5));
+        assert!(strokes(&session).strokes.is_empty());
+        assert_eq!(session.adjust.brush.armed, None, "the brush was put down");
+    }
+
     #[test]
     fn a_wide_tab_is_limited_by_its_height() {
         let size = fit_aspect(egui::vec2(1000.0, 500.0), VIEWER_ASPECT);

@@ -69,10 +69,10 @@ fn brush(session: &Session) -> &Brush {
 /// frame for every place with the pointer down, the release, a settled frame.
 fn paint(session: &mut Session, path: &[[f32; 2]], erase: bool, shift: bool) {
     let radius = session.adjust.brush.size * SIDE;
-    assert!(session.begin_stroke(path[0], screen(path[0]), erase, shift));
+    assert!(session.begin_stroke(path[0], screen(path[0]), erase, shift, None));
     drag_frame(session);
     for at in &path[1..] {
-        session.extend_stroke(*at, screen(*at), radius, 1.0);
+        session.extend_stroke(*at, screen(*at), radius, 1.0, None);
         drag_frame(session);
     }
     session.end_stroke();
@@ -96,7 +96,7 @@ fn one_stroke_of_many_frames_is_one_undo() {
     let mut session = armed();
     let radius = session.adjust.brush.size * SIDE;
     let path = line([0.2, 0.3], [0.7, 0.6], 80);
-    assert!(session.begin_stroke(path[0], screen(path[0]), false, false));
+    assert!(session.begin_stroke(path[0], screen(path[0]), false, false, None));
     assert_eq!(
         brush(&session).strokes.len(),
         1,
@@ -104,7 +104,7 @@ fn one_stroke_of_many_frames_is_one_undo() {
     );
     assert!(session.develop_dirty, "and on the picture");
     for at in &path[1..] {
-        session.extend_stroke(*at, screen(*at), radius, 1.0);
+        session.extend_stroke(*at, screen(*at), radius, 1.0, None);
         drag_frame(&mut session);
         assert_eq!(undo_steps(&session), 0, "no step while the pointer is down");
     }
@@ -263,9 +263,9 @@ fn an_erase_stroke_clear_strokes_and_a_deleted_component_undo_and_redo() {
     round_trip(&mut session, "an erase stroke", |s| {
         let path = line([0.4, 0.2], [0.5, 0.7], 30);
         let radius = s.adjust.brush.size * SIDE;
-        assert!(s.begin_stroke(path[0], screen(path[0]), true, false));
+        assert!(s.begin_stroke(path[0], screen(path[0]), true, false, None));
         for at in &path[1..] {
-            s.extend_stroke(*at, screen(*at), radius, 1.0);
+            s.extend_stroke(*at, screen(*at), radius, 1.0, None);
         }
         s.end_stroke();
     });
@@ -333,7 +333,7 @@ fn an_undo_that_removes_the_armed_component_puts_the_brush_down() {
     assert!(session.edit.masks.is_empty());
     assert_eq!(session.adjust.brush.armed, None);
     assert_eq!(session.adjust.selected_mask, None);
-    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false));
+    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false, None));
 
     // An undo in the middle of a stroke lets the stroke go with its state.
     let mut session = armed();
@@ -343,7 +343,7 @@ fn an_undo_that_removes_the_armed_component_puts_the_brush_down() {
         false,
         false,
     );
-    assert!(session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false));
+    assert!(session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false, None));
     drag_frame(&mut session);
     assert!(session.undo());
     assert!(!session.adjust.brush.is_painting());
@@ -419,7 +419,7 @@ fn the_brush_is_put_down_under_the_save_discard_cancel_prompt() {
     // The frame under the prompt.
     session.check_brush();
     assert_eq!(session.adjust.brush.armed, None);
-    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false));
+    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false, None));
     assert_eq!(
         brush(&session).strokes.len(),
         1,
@@ -435,10 +435,10 @@ fn a_full_stroke_goes_on_in_a_new_one_and_a_full_brush_says_so() {
     let frames = MAX_STROKE_POINTS + 50;
     let step = 0.00015;
     let radius = session.adjust.brush.size * SIDE;
-    assert!(session.begin_stroke([0.1, 0.5], screen([0.1, 0.5]), false, false));
+    assert!(session.begin_stroke([0.1, 0.5], screen([0.1, 0.5]), false, false, None));
     for i in 1..=frames {
         let at = [0.1 + i as f32 * step, 0.5];
-        session.extend_stroke(at, screen(at), radius, 1e6);
+        session.extend_stroke(at, screen(at), radius, 1e6, None);
         drag_frame(&mut session);
     }
     session.end_stroke();
@@ -463,7 +463,7 @@ fn a_full_stroke_goes_on_in_a_new_one_and_a_full_brush_says_so() {
         panic!("a brush");
     };
     full.strokes = vec![dab; MAX_STROKES];
-    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false));
+    assert!(!session.begin_stroke([0.5, 0.5], screen([0.5, 0.5]), false, false, None));
     assert!(
         session
             .status
@@ -664,4 +664,195 @@ fn a_history_frame_over_a_large_brush_is_cheap_and_the_steps_share_its_strokes()
             .zip(&strokes)
             .all(|(held, pushed)| held.shares_with(pushed))
     );
+}
+
+/// Paints one stroke with a pen: a pressure at every place.
+fn paint_with_a_pen(session: &mut Session, path: &[[f32; 2]], pressure: &dyn Fn(usize) -> f32) {
+    let radius = session.adjust.brush.size * SIDE;
+    assert!(session.begin_stroke(path[0], screen(path[0]), false, false, Some(pressure(0))));
+    drag_frame(session);
+    for (i, at) in path.iter().enumerate().skip(1) {
+        session.extend_stroke(*at, screen(*at), radius, 1.0, Some(pressure(i)));
+        drag_frame(session);
+    }
+    session.end_stroke();
+    settle(session);
+}
+
+#[test]
+fn a_pressure_stroke_is_one_undo_and_holds_a_pressure_for_every_point() {
+    let mut session = armed();
+    session.adjust.brush.pressure_size = true;
+    let path = line([0.2, 0.3], [0.7, 0.6], 60);
+    paint_with_a_pen(&mut session, &path, &|i| 0.1 + 0.9 * i as f32 / 60.0);
+    assert_eq!(undo_steps(&session), 1, "one stroke, one step");
+    let stroke = &brush(&session).strokes[0];
+    assert!(stroke.points.len() > 20);
+    assert_eq!(stroke.pressure.len(), stroke.points.len());
+    assert_eq!(stroke.pressure[0], 0.1);
+    assert!(stroke.pressure.windows(2).all(|pair| pair[1] >= pair[0]));
+    assert!(stroke.pressure_size && stroke.pressure_flow);
+    assert!(stroke.uses_pressure());
+    assert!(session.undo());
+    assert!(brush(&session).strokes.is_empty());
+    assert!(session.redo());
+    assert_eq!(
+        brush(&session).strokes[0].pressure.len(),
+        stroke_points(&session, 0)
+    );
+}
+
+fn stroke_points(session: &Session, index: usize) -> usize {
+    brush(session).strokes[index].points.len()
+}
+
+#[test]
+fn the_saved_sidecar_after_an_undo_carries_the_pressure_of_the_strokes_that_remain() {
+    let dir = std::env::temp_dir().join("gamut-brush-test");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let photo = dir.join("pressed.jpg");
+    let _ = std::fs::remove_file(Sidecar::path_for(&photo));
+    let mut session = armed();
+    session.photo = Some(OpenPhoto {
+        path: photo.clone(),
+        width: 6000,
+        height: 4000,
+    });
+    session.adjust.brush.auto = true;
+    session.adjust.brush.sensitivity = 65.0;
+    let path = line([0.2, 0.3], [0.7, 0.6], 60);
+    paint_with_a_pen(&mut session, &path, &|i| 0.25 + 0.5 * i as f32 / 60.0);
+    // A mouse stroke between two pen strokes holds no pressure.
+    paint(
+        &mut session,
+        &line([0.3, 0.7], [0.6, 0.2], 60),
+        false,
+        false,
+    );
+    paint_with_a_pen(&mut session, &path, &|_| 0.8);
+
+    let on_disk = |session: &mut Session| -> (Sidecar, String) {
+        session.save_now();
+        let text = std::fs::read_to_string(Sidecar::path_for(&photo)).expect("read");
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(
+            !text.contains("history") && !text.contains("undo"),
+            "{text}"
+        );
+        (load(&photo).expect("the sidecar loads"), text)
+    };
+    let (saved, text) = on_disk(&mut session);
+    assert_eq!(saved, session.sidecar());
+    assert!(text.contains("\"auto\": true") && text.contains("\"sensitivity\": 65.0"));
+    assert_eq!(
+        text.matches("\"pressure\": \"").count(),
+        2,
+        "the two pen strokes"
+    );
+
+    assert!(session.undo());
+    let (saved, text) = on_disk(&mut session);
+    assert_eq!(saved, session.sidecar(), "the file is what is shown");
+    assert_eq!(text.matches("\"pressure\": \"").count(), 1);
+    let MaskSource::Brush(kept) = &saved.edit.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    assert_eq!(kept.strokes.len(), 2);
+    assert_eq!(
+        kept.strokes[0].pressure,
+        brush(&session).strokes[0].pressure
+    );
+    assert!(kept.strokes[0].pressure.len() > 20 && kept.strokes[0].auto);
+    assert!(kept.strokes[1].pressure.is_empty());
+
+    // Closed and opened again: equal, stroke for stroke and pressure for
+    // pressure, and the settings of the tool are not in the file.
+    let mut fresh = Session::default();
+    fresh.take_sidecar(load(&photo).expect("loads"));
+    assert_eq!(fresh.sidecar(), session.sidecar());
+    assert!(
+        !fresh.adjust.brush.auto,
+        "the tool starts as it always does"
+    );
+}
+
+#[test]
+fn auto_mask_the_sensitivity_and_the_pressure_toggles_are_no_history() {
+    let mut session = armed();
+    session.adjust.brush.auto = true;
+    session.adjust.brush.sensitivity = 90.0;
+    session.adjust.brush.pressure_size = true;
+    session.adjust.brush.pressure_flow = false;
+    settle(&mut session);
+    session.brush_key(BrushKey::ToggleAuto);
+    settle(&mut session);
+    assert!(!session.adjust.brush.auto, "A unticks it");
+    assert_eq!(
+        undo_steps(&session),
+        0,
+        "the settings of the tool are no step"
+    );
+    assert!(!session.can_undo());
+
+    session.brush_key(BrushKey::ToggleAuto);
+    paint(
+        &mut session,
+        &line([0.2, 0.2], [0.4, 0.2], 10),
+        false,
+        false,
+    );
+    session.brush_key(BrushKey::ToggleAuto);
+    session.adjust.brush.sensitivity = 10.0;
+    paint(
+        &mut session,
+        &line([0.2, 0.4], [0.4, 0.4], 10),
+        false,
+        false,
+    );
+    let strokes = &brush(&session).strokes;
+    assert!(strokes[0].auto && strokes[0].sensitivity == 90.0);
+    assert!(
+        !strokes[1].auto,
+        "changed after the press, the last stroke keeps its own"
+    );
+    assert!(strokes[0].pressure_size && !strokes[0].pressure_flow);
+    assert_eq!(undo_steps(&session), 2, "two strokes, two steps");
+    // An undo gives the stroke back and leaves the tool as it is.
+    assert!(session.undo());
+    assert!(!session.adjust.brush.auto);
+    assert_eq!(session.adjust.brush.sensitivity, 10.0);
+    assert!(session.adjust.brush.pressure_size && !session.adjust.brush.pressure_flow);
+}
+
+#[test]
+fn a_project_paints_an_auto_stroke_and_undoes_it() {
+    let mut session = open_sample();
+    session
+        .edit
+        .masks
+        .push(Mask::new("Brush", MaskSource::Brush(Brush::default())));
+    session.edit.masks[0].adjust.exposure = 0.8;
+    session.mark_edited();
+    settle(&mut session);
+    session.adjust.select_mask(Some(0));
+    session.toggle_brush(0);
+    session.adjust.brush.auto = true;
+    paint_with_a_pen(&mut session, &line([0.2, 0.3], [0.7, 0.6], 40), &|i| {
+        0.3 + 0.01 * i as f32
+    });
+    assert_eq!(undo_steps(&session), 2, "the mask and the stroke");
+    let Snapshot::Project { edit, .. } = session.snapshot() else {
+        panic!("a project");
+    };
+    assert_eq!(
+        *edit, session.edit,
+        "the stroke is in what the project saves"
+    );
+    let stroke = &brush(&session).strokes[0];
+    assert!(stroke.auto && stroke.pressure.len() == stroke.points.len());
+    assert!(session.undo());
+    assert!(brush(&session).strokes.is_empty());
+    assert!(session.redo());
+    assert!(brush(&session).strokes[0].auto);
+    assert_eq!(session.adjust.brush.armed, Some(0));
 }

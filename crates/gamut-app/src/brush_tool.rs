@@ -9,8 +9,14 @@
 //! its first dab, so the picture shows it and the history sees one unsettled
 //! change while the pointer is down: one stroke is one undo step.
 //!
-//! The settings (size, feather, flow, erase) are tool state: never saved,
-//! never part of the history.
+//! A pen paints with its pressure: egui hands a touch over with its force,
+//! which a pen has and a finger and a mouse have not, and each point of the
+//! stroke keeps the force the pen had there. One touch paints; a second one
+//! ends the stroke, because two fingers are a pinch and the view owns that.
+//!
+//! The settings (size, feather, flow, erase, Auto mask, its sensitivity and
+//! the two pressure toggles) are tool state: never saved, never part of the
+//! history. A stroke keeps the settings of its press.
 
 use egui::{Color32, CursorIcon, Key, PointerButton, Pos2, Sense, Stroke as Line, Vec2};
 use gamut_core::brush::{Brush, MAX_BRUSH_SIZE, MIN_BRUSH_SIZE, MIN_FLOW, SharedStroke, Stroke};
@@ -42,6 +48,16 @@ pub struct BrushTool {
     pub flow: f32,
     /// The Erase toggle. Alt held does the same for one stroke.
     pub erase: bool,
+    /// Auto mask: each dab of the next stroke paints only the colour under
+    /// its centre, as close as `sensitivity` asks.
+    pub auto: bool,
+    pub sensitivity: f32,
+    /// What the pressure of a pen scales in the next stroke. A mouse and a
+    /// finger paint at full pressure whatever these say.
+    pub pressure_size: bool,
+    pub pressure_flow: bool,
+    /// The touch that paints, from its start to its end, and its force.
+    touch: TouchState,
     /// Where on the screen the stroke being painted took its last point.
     growing: Option<Pos2>,
     /// What Show overlay was before the brush was armed.
@@ -57,6 +73,11 @@ impl Default for BrushTool {
             feather: stroke.feather,
             flow: stroke.flow,
             erase: false,
+            auto: false,
+            sensitivity: stroke.sensitivity,
+            pressure_size: false,
+            pressure_flow: true,
+            touch: TouchState::default(),
             growing: None,
             overlay_before: None,
         }
@@ -69,15 +90,21 @@ impl BrushTool {
         self.growing.is_some()
     }
 
-    /// The settings as the stroke a press starts.
-    fn stroke(&self, points: Vec<[f32; 2]>, erase: bool) -> Stroke {
+    /// The settings as the stroke a press starts. `pressure` is what the
+    /// pen reports at the press, and every point of the press takes it; a
+    /// mouse and a finger report none and the stroke holds none.
+    pub fn stroke(&self, points: Vec<[f32; 2]>, erase: bool, pressure: Option<f32>) -> Stroke {
         Stroke {
+            pressure: pressure.map_or_else(Vec::new, |p| vec![p; points.len()]),
             points,
             size: self.size,
             feather: self.feather,
             flow: self.flow,
             erase,
-            ..Stroke::default()
+            auto: self.auto,
+            sensitivity: self.sensitivity,
+            pressure_size: self.pressure_size,
+            pressure_flow: self.pressure_flow,
         }
     }
 
@@ -112,6 +139,74 @@ impl BrushTool {
     }
 }
 
+/// The touch that paints. egui-winit sends a touch twice: as a touch event
+/// with its force, and for the first touch also as the pointer events a
+/// mouse would send. The stroke takes its points from the pointer, as it
+/// does for a mouse, and only its pressure from the touch.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TouchState {
+    /// The touch that moves the pointer, while it is down.
+    active: Option<egui::TouchId>,
+    /// Its force when it last reported one: a pen. A finger reports none.
+    force: Option<f32>,
+}
+
+/// What the events of one frame mean to the brush.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FrameInput {
+    /// Every place the pointer was, in order, each with the pressure of the
+    /// pen at that moment, or `None` from a mouse or a finger.
+    pub moves: Vec<(Pos2, Option<f32>)>,
+    /// The pressure at the end of the frame: what a press takes.
+    pub pressure: Option<f32>,
+    /// A second touch began while the first was down: two fingers are a
+    /// pinch, which the view owns, and the stroke ends where it is.
+    pub second_touch: bool,
+}
+
+/// Reads the events of a frame in the order the window sent them.
+pub fn frame_input(events: &[egui::Event], touch: &mut TouchState) -> FrameInput {
+    let mut out = FrameInput::default();
+    let mut began = false;
+    for event in events {
+        match event {
+            egui::Event::Touch {
+                id, phase, force, ..
+            } => match phase {
+                egui::TouchPhase::Start if touch.active.is_none() => {
+                    *touch = TouchState {
+                        active: Some(*id),
+                        force: *force,
+                    };
+                    began = true;
+                }
+                egui::TouchPhase::Start if touch.active != Some(*id) => out.second_touch = true,
+                egui::TouchPhase::Start => {}
+                egui::TouchPhase::Move if touch.active == Some(*id) => {
+                    // A pen that lifts to no pressure reports none: the last
+                    // force stands.
+                    touch.force = force.or(touch.force);
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel if touch.active == Some(*id) => {
+                    *touch = TouchState::default();
+                }
+                _ => {}
+            },
+            // A press that no touch of this frame began is the mouse's, and
+            // a touch whose end never came counts for nothing any more.
+            egui::Event::PointerButton { pressed: true, .. } if !began => {
+                *touch = TouchState::default();
+            }
+            egui::Event::PointerMoved(pos) => {
+                out.moves.push((*pos, touch.active.and(touch.force)));
+            }
+            _ => {}
+        }
+    }
+    out.pressure = touch.active.and(touch.force);
+    out
+}
+
 /// Whether the stroke being painted takes the pointer's place as its next
 /// point: once it moved a quarter of the brush radius, and never for less
 /// than one pixel of the screen. `radius` is the brush radius in points.
@@ -138,6 +233,7 @@ pub enum BrushKey {
     LessFeather,
     MoreFeather,
     ToggleOverlay,
+    ToggleAuto,
     PutDown,
 }
 
@@ -159,12 +255,14 @@ pub struct BrushKeys {
     pub open_curly: bool,
     pub close_curly: bool,
     pub o: bool,
+    pub a: bool,
     pub escape: bool,
 }
 
 /// The brush keys work only while a brush is armed and nobody types. `[`
 /// and `]` make the brush smaller and larger, with Shift they move the
-/// feather, O shows and hides the overlay, Esc puts the brush down.
+/// feather, O shows and hides the overlay, A turns Auto mask on and off,
+/// Esc puts the brush down.
 pub fn brush_key(keys: BrushKeys) -> Option<BrushKey> {
     if !keys.armed || keys.typing {
         return None;
@@ -185,6 +283,8 @@ pub fn brush_key(keys: BrushKeys) -> Option<BrushKey> {
         Some(BrushKey::Larger)
     } else if keys.o && !keys.shift {
         Some(BrushKey::ToggleOverlay)
+    } else if keys.a && !keys.shift {
+        Some(BrushKey::ToggleAuto)
     } else {
         None
     }
@@ -204,8 +304,9 @@ const SMALLEST_RING: f32 = 2.5;
 /// The brush cursor at the pointer: a ring of the brush radius at this zoom
 /// and an inner ring where the feather starts, each drawn twice, dark under
 /// light, so it shows on any picture. A dash in the middle says the stroke
-/// will erase.
-fn draw_cursor(painter: &egui::Painter, at: Pos2, rings: (f32, f32), erase: bool) {
+/// will erase. With Auto mask on a small cross marks the centre: that is
+/// where each dab reads its colour.
+fn draw_cursor(painter: &egui::Painter, at: Pos2, rings: (f32, f32), erase: bool, auto: bool) {
     let dark = Color32::from_black_alpha(170);
     let light = Color32::from_white_alpha(235);
     let (radius, inner) = rings;
@@ -227,6 +328,20 @@ fn draw_cursor(painter: &egui::Painter, at: Pos2, rings: (f32, f32), erase: bool
         painter.line_segment([at - arm, at + arm], Line::new(3.0, dark));
         painter.line_segment([at - arm, at + arm], Line::new(1.0, light));
     }
+    // Under the smallest ring the cursor is a cross already.
+    if auto && radius >= SMALLEST_RING {
+        for arm in centre_cross() {
+            painter.line_segment([at - arm, at + arm], Line::new(3.0, dark));
+            painter.line_segment([at - arm, at + arm], Line::new(1.0, light));
+        }
+    }
+}
+
+/// The two arms of the cross Auto mask puts at the centre of the ring, in
+/// points: shorter than the cross of a brush too small for a ring, and with
+/// Erase on its flat arm is the erase dash grown a little.
+pub fn centre_cross() -> [Vec2; 2] {
+    [Vec2::new(5.0, 0.0), Vec2::new(0.0, 5.0)]
 }
 
 impl Session {
@@ -294,7 +409,14 @@ impl Session {
     /// The press: a new stroke with the settings of this moment. `erase` is
     /// the toggle or Alt; `shift` draws a line from the end of the last
     /// stroke. `false` when no brush is armed or the brush is full.
-    pub fn begin_stroke(&mut self, at: [f32; 2], screen: Pos2, erase: bool, shift: bool) -> bool {
+    pub fn begin_stroke(
+        &mut self,
+        at: [f32; 2],
+        screen: Pos2,
+        erase: bool,
+        shift: bool,
+        pressure: Option<f32>,
+    ) -> bool {
         let tool = self.adjust.brush.clone();
         let Some(brush) = self.armed_brush_mut() else {
             return false;
@@ -309,7 +431,7 @@ impl Session {
         let points = pressed_points(brush, at, shift);
         brush
             .strokes
-            .push(SharedStroke::new(&tool.stroke(points, erase)));
+            .push(SharedStroke::new(&tool.stroke(points, erase, pressure)));
         self.adjust.brush.growing = Some(screen);
         self.mark_edited();
         true
@@ -324,6 +446,7 @@ impl Session {
         screen: Pos2,
         radius: f32,
         pixels_per_point: f32,
+        pressure: Option<f32>,
     ) {
         let Some(from) = self.adjust.brush.growing else {
             return;
@@ -337,15 +460,26 @@ impl Session {
         let Some(stroke) = brush.strokes.last_mut() else {
             return;
         };
-        if !stroke.push(at, None) {
+        if !stroke.push(at, pressure) {
             let (last, again) = (stroke.points.last().copied(), (**stroke).clone());
             if !brush.has_room() {
                 return;
             }
-            let points = last.into_iter().chain([at]).collect();
-            brush
-                .strokes
-                .push(SharedStroke::new(&Stroke { points, ..again }));
+            // The stroke goes on from its last point and that point's
+            // pressure.
+            let points: Vec<[f32; 2]> = last.into_iter().chain([at]).collect();
+            let pressure = if again.pressure.is_empty() && pressure.is_none() {
+                Vec::new()
+            } else {
+                let before = again.pressure.last().copied().unwrap_or(1.0);
+                let held = [before, pressure.unwrap_or(before)];
+                held[2 - points.len()..].to_vec()
+            };
+            brush.strokes.push(SharedStroke::new(&Stroke {
+                points,
+                pressure,
+                ..again
+            }));
         }
         self.adjust.brush.growing = Some(screen);
         self.mark_edited();
@@ -387,6 +521,7 @@ impl Session {
                 self.adjust.mask_overlay = !self.adjust.mask_overlay;
                 self.develop_dirty = true;
             }
+            BrushKey::ToggleAuto => self.adjust.brush.auto = !self.adjust.brush.auto,
             BrushKey::PutDown => self.put_brush_down(),
         }
     }
@@ -416,6 +551,7 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
         open_curly: i.key_pressed(Key::OpenCurlyBracket),
         close_curly: i.key_pressed(Key::CloseCurlyBracket),
         o: i.key_pressed(Key::O),
+        a: i.key_pressed(Key::A),
         escape: i.key_pressed(Key::Escape),
     });
     if let Some(key) = brush_key(keys) {
@@ -427,40 +563,38 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
     }
     let response = ui.interact(map.visible, ui.id().with("brush paint"), Sense::drag());
     let paints = pan.take(&response, Over::Brush) == Gesture::Paint;
-    let (alt, shift, origin, moves) = ui.input(|i| {
-        let moves: Vec<Pos2> = i
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                egui::Event::PointerMoved(pos) => Some(*pos),
-                _ => None,
-            })
-            .collect();
+    let mut touch = session.adjust.brush.touch;
+    let (alt, shift, origin, input) = ui.input(|i| {
         (
             i.modifiers.alt,
             i.modifiers.shift,
             i.pointer.press_origin(),
-            moves,
+            frame_input(&i.events, &mut touch),
         )
     });
+    session.adjust.brush.touch = touch;
     let pixels_per_point = ui.pixels_per_point();
     let radius = session.adjust.brush.size * map.long_side();
     let started = response.drag_started_by(PointerButton::Primary) && paints;
     if started && let Some(origin) = origin {
         let erase = session.adjust.brush.erase || alt;
-        session.begin_stroke(map.to_picture(origin), origin, erase, shift);
+        session.begin_stroke(map.to_picture(origin), origin, erase, shift, input.pressure);
     }
     if session.adjust.brush.is_painting() {
         if paints {
             // On the frame of the press the moves before it are not the
             // stroke's; where the pointer is now is.
-            let places = if started { Vec::new() } else { moves };
-            for place in places.into_iter().chain(response.interact_pointer_pos()) {
-                session.extend_stroke(map.to_picture(place), place, radius, pixels_per_point);
+            let places = if started { Vec::new() } else { input.moves };
+            let now = response
+                .interact_pointer_pos()
+                .map(|place| (place, input.pressure));
+            for (place, pressure) in places.into_iter().chain(now) {
+                let at = map.to_picture(place);
+                session.extend_stroke(at, place, radius, pixels_per_point, pressure);
             }
             ui.ctx().request_repaint();
         }
-        if !response.dragged_by(PointerButton::Primary) {
+        if !response.dragged_by(PointerButton::Primary) || input.second_touch {
             session.end_stroke();
         }
     }
@@ -477,7 +611,7 @@ pub fn show(ui: &mut egui::Ui, map: &PictureMap, session: &mut Session, pan: &mu
         let tool = &session.adjust.brush;
         let rings = cursor_rings(tool.size, tool.feather, map.long_side());
         let painter = ui.painter().with_clip_rect(map.visible);
-        draw_cursor(&painter, at, rings, tool.erase || alt);
+        draw_cursor(&painter, at, rings, tool.erase || alt, tool.auto);
     }
 }
 
@@ -589,6 +723,15 @@ mod tests {
             Some(BrushKey::ToggleOverlay)
         );
         assert_eq!(
+            key(BrushKeys { a: true, ..armed() }),
+            Some(BrushKey::ToggleAuto)
+        );
+        assert_eq!(
+            key(BrushKeys { a: true, ..shift }),
+            None,
+            "Shift+A is not the brush's"
+        );
+        assert_eq!(
             key(BrushKeys {
                 escape: true,
                 ..armed()
@@ -606,6 +749,7 @@ mod tests {
             open_curly: true,
             close_curly: true,
             o: true,
+            a: true,
             escape: true,
             ..BrushKeys::default()
         };
@@ -625,6 +769,8 @@ mod tests {
             ..BrushKeys::default()
         };
         assert_eq!(brush_key(BrushKeys { o: true, ..held }), None);
+        // Ctrl+A selects all in a text field.
+        assert_eq!(brush_key(BrushKeys { a: true, ..held }), None);
         assert_eq!(brush_key(BrushKeys { open: true, ..held }), None);
         assert_eq!(
             brush_key(BrushKeys {
@@ -633,6 +779,145 @@ mod tests {
             }),
             Some(BrushKey::PutDown)
         );
+    }
+
+    #[test]
+    fn a_press_stores_the_settings_of_the_tool_in_the_stroke() {
+        let tool = BrushTool::default();
+        assert!(!tool.auto && !tool.pressure_size, "off until asked for");
+        assert!(
+            tool.pressure_flow,
+            "a pen paints lighter with a lighter hand"
+        );
+        let plain = tool.stroke(vec![[0.5, 0.5]], false, None);
+        assert!(!plain.auto && plain.pressure.is_empty());
+        assert!(plain.pressure_flow && !plain.pressure_size);
+
+        let tool = BrushTool {
+            auto: true,
+            sensitivity: 80.0,
+            pressure_size: true,
+            pressure_flow: false,
+            ..BrushTool::default()
+        };
+        let line = tool.stroke(vec![[0.1, 0.1], [0.5, 0.5]], true, Some(0.4));
+        assert!(line.auto && line.erase);
+        assert_eq!(line.sensitivity, 80.0);
+        assert!(line.pressure_size && !line.pressure_flow);
+        assert_eq!(
+            line.pressure,
+            [0.4, 0.4],
+            "a Shift line is at the pressure of the press"
+        );
+        assert_eq!(SharedStroke::new(&line).pressure.len(), line.points.len());
+    }
+
+    fn touch(id: u64, phase: egui::TouchPhase, pos: Pos2, force: Option<f32>) -> egui::Event {
+        egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force,
+        }
+    }
+
+    fn press(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_point_takes_the_force_of_a_pen_and_none_from_a_finger_or_a_mouse() {
+        use egui::Event::PointerMoved;
+        use egui::TouchPhase::{End, Move, Start};
+        let (a, b, c) = (
+            Pos2::new(10.0, 10.0),
+            Pos2::new(20.0, 10.0),
+            Pos2::new(30.0, 10.0),
+        );
+
+        // A pen, as egui-winit sends it: the touch first, then the pointer.
+        let mut pen = TouchState::default();
+        let down = frame_input(
+            &[
+                touch(7, Start, a, Some(0.2)),
+                PointerMoved(a),
+                press(a, true),
+            ],
+            &mut pen,
+        );
+        assert_eq!(down.moves, [(a, Some(0.2))]);
+        assert_eq!(down.pressure, Some(0.2));
+        let moved = frame_input(
+            &[
+                touch(7, Move, b, Some(0.5)),
+                PointerMoved(b),
+                touch(7, Move, c, Some(0.9)),
+                PointerMoved(c),
+            ],
+            &mut pen,
+        );
+        assert_eq!(
+            moved.moves,
+            [(b, Some(0.5)), (c, Some(0.9))],
+            "each move its own force"
+        );
+        // A pen that reports no force for a moment keeps the last one.
+        let held = frame_input(&[touch(7, Move, c, None), PointerMoved(c)], &mut pen);
+        assert_eq!(held.moves, [(c, Some(0.9))]);
+        let up = frame_input(&[touch(7, End, c, None), press(c, false)], &mut pen);
+        assert_eq!(up.pressure, None, "lifted");
+        assert_eq!(pen, TouchState::default());
+
+        // A finger reports no force.
+        let mut finger = TouchState::default();
+        let down = frame_input(
+            &[touch(3, Start, a, None), PointerMoved(a), press(a, true)],
+            &mut finger,
+        );
+        assert_eq!((down.moves, down.pressure), (vec![(a, None)], None));
+
+        // A mouse sends no touch at all, and a press of its own drops a touch
+        // whose end never came.
+        let mut stale = TouchState::default();
+        frame_input(&[touch(7, Start, a, Some(0.3))], &mut stale);
+        let mouse = frame_input(
+            &[PointerMoved(b), press(b, true), PointerMoved(c)],
+            &mut stale,
+        );
+        assert_eq!(mouse.moves, [(b, Some(0.3)), (c, None)]);
+        assert_eq!(mouse.pressure, None);
+    }
+
+    #[test]
+    fn a_second_touch_is_told_from_the_one_that_paints() {
+        use egui::TouchPhase::{Cancel, Move, Start};
+        let at = Pos2::new(10.0, 10.0);
+        let mut state = TouchState::default();
+        assert!(!frame_input(&[touch(1, Start, at, None)], &mut state).second_touch);
+        assert!(!frame_input(&[touch(1, Move, at, None)], &mut state).second_touch);
+        assert!(frame_input(&[touch(2, Start, at, None)], &mut state).second_touch);
+        // The second finger moving or lifting changes nothing of the first.
+        let before = state;
+        frame_input(
+            &[touch(2, Move, at, Some(0.5)), touch(2, Cancel, at, None)],
+            &mut state,
+        );
+        assert_eq!(state, before);
+        frame_input(&[touch(1, Cancel, at, None)], &mut state);
+        assert_eq!(state, TouchState::default());
+    }
+
+    #[test]
+    fn the_cross_of_auto_mask_is_smaller_than_the_cross_of_a_tiny_brush() {
+        for arm in centre_cross() {
+            assert!(arm.length() < 6.0 && arm.length() > 4.0);
+        }
     }
 
     #[test]
