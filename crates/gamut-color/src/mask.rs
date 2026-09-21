@@ -991,10 +991,11 @@ mod tests {
         let pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
             .map(|i| if i % size.0 < 24 { [0.03; 3] } else { [0.5; 3] })
             .collect();
-        // Centre at x 14.4, full to 6 pixels out and gone at 12: the fall
-        // runs from x 20.4 to 26.4, across the edge at 24.
+        // Centre at x 14.4, full to 10.2 pixels out and gone at 12: the fall
+        // runs from x 24.6 to 26.4, over the edge at 24.
         let gradient = RadialGradient {
             centre: [0.3, 0.5],
+            feather: 15.0,
             ..RadialGradient::default()
         };
         let mut mask = Mask::new("Across", MaskSource::Radial(gradient));
@@ -1023,15 +1024,13 @@ mod tests {
             "the filter of the stored alpha, stored again"
         );
         let row = |alpha: &[f32], x: u32| alpha[(16 * size.0 + x) as usize];
-        let (before, after) = (
-            row(&plain, 23) - row(&plain, 24),
-            row(&refined, 23) - row(&refined, 24),
-        );
+        assert_eq!(row(&plain, 24), 1.0, "the mask spills over the edge");
+        assert_eq!(row(&refined, 23), 1.0, "the dark side stays");
         assert!(
-            (0.05..0.3).contains(&before),
-            "a fall across the edge: {before}"
+            row(&refined, 24) < 0.1,
+            "the spill is left at {}",
+            row(&refined, 24)
         );
-        assert!(after > before + 0.25, "{before} became {after}");
     }
 
     #[test]

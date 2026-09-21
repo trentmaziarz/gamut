@@ -558,7 +558,7 @@ fn draw(
 mod tests {
     use super::*;
     use gamut_color::acescct;
-    use gamut_color::refine::MOMENTS;
+    use gamut_color::refine::SOLVED;
     use gamut_core::mask::Refine;
     use std::mem::offset_of;
     use wgpu::naga;
@@ -627,10 +627,10 @@ mod tests {
         assert_eq!(wgsl_constant("ACES_OFFSET"), acescct::OFFSET);
         assert_eq!(wgsl_constant("ACES_LOG_SHIFT"), acescct::LOG_SHIFT);
         assert_eq!(wgsl_constant("ACES_LOG_SCALE"), acescct::LOG_SCALE);
-        // The moments of the twin fit the four float targets of a cell, which
-        // two passes of two targets fill: 32 bytes a sample, the most a
-        // default device draws into.
-        assert_eq!(MOMENTS.div_ceil(4), 4, "four targets of four channels");
+        // What the twin solves a cell fits four float targets, which two
+        // passes of two targets fill: 32 bytes a sample, the most a default
+        // device draws into.
+        assert_eq!(SOLVED.div_ceil(4), 4, "four targets of four channels");
         assert_eq!(MOMENT_FORMAT.target_pixel_byte_cost(), Some(16));
     }
 

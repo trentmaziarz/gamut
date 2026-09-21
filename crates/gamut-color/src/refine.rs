@@ -2,53 +2,129 @@
 //! of the picture under it. refine.wgsl in gamut-gpu mirrors this module; the
 //! golden tests hold the two together.
 //!
-//! It is the colour guided filter of He, Sun and Tang. The input `p` is the
-//! alpha of the mask as the GPU stores it. The guide `I` is the SOURCE pixel,
-//! encoded to ACEScct, never the developed one, so no slider of the develop
-//! chain moves a refined mask. Over a box around each place,
+//! The input `p` is the alpha of the mask as the GPU stores it. The guide `I`
+//! is the SOURCE pixel, encoded to ACEScct, never the developed one, so no
+//! slider of the develop chain moves a refined mask.
+//!
+//! The filter gathers the colours of the guide around each place twice: once
+//! for what lies inside the mask and once for what lies outside it, each pixel
+//! counted by how far it is in or out. It then places every pixel between the
+//! two mean colours, along the one direction of colour that best tells the
+//! classes apart. A pixel at the outside's end leaves the mask, one at the
+//! inside's end joins it, and one between keeps the alpha it had. Over a box
+//! around each place, with `q` the weight of the inside class,
 //!
 //! ```text
-//! a = (var(I) + eps Id)^-1 cov(I, p)      b = mean(p) - a . mean(I)
-//! q = mean(a) . I + mean(b), held inside 0 to 1
+//! mu1 = E[q I] / E[q]            mu0 = (E[I] - E[q I]) / (1 - E[q])
+//! Sw  = E[I I] - E[q] mu1 mu1' - (1 - E[q]) mu0 mu0' + eps Id
+//! a   = Sw^-1 (mu1 - mu0)        d2  = (mu1 - mu0) . a
+//! P   = Sw^-1 - a a' / d2        mid = (mu1 + mu0) / 2
 //! ```
 //!
-//! and the refined alpha is `p + (q - p) amount / 100`. Where the guide is
-//! flat `a` is 0 and `q` is a box blur of `p`; where the guide has an edge `q`
-//! steps with it.
+//! and at a pixel of colour `I`
 //!
-//! The moments are taken on a grid of cells (the fast guided filter): a cell
-//! is [`Plan::step`] pixels square and lies on the pixel grid of the WHOLE
-//! picture at the scale of the render, not on the grid of the window that is
-//! being rendered, so a zoomed window and the full render hold the same cells.
-//! `a` and `b` come back up bilinearly and `q` reads the guide at full
-//! resolution. Everything is measured from the size of the whole picture, so
-//! the fitted view, 100 percent and the export show the same edge at their
-//! own scales.
+//! ```text
+//! est = 0.5 + (a . I - a . mid) / d2, held inside 0 to 1
+//! m   = (I - mid)' P (I - mid)
+//! ```
 //!
-//! Arithmetic is f32 in the order the shader sums in. `store` is applied
-//! wherever the GPU writes a texture of the filter; those are 32 bit float
-//! targets, so a golden test passes the identity.
+//! `est` is where the colour sits along the line between the classes and `m`
+//! how far it lies off that line; a colour far off the line keeps the alpha
+//! it was given. There are [`GATHERS`] gathers. The first weighs the classes
+//! by the mask as drawn and each later one by the result of the gather
+//! before, so spill that has left stops colouring the inside class. Every
+//! gather moves the mask AS DRAWN with its own class colours: the mask as
+//! moved so far is only ever a weight. The refined alpha is
+//! `p + (q - p) amount / 100` with `q` the result of the last gather.
+//!
+//! Two gates hold the move. Where the box lies wholly inside or wholly
+//! outside the mask nothing moves, so the mask never grows a halo; and a
+//! mask that is soft at the scale of the box is soft on purpose and comes
+//! back as drawn. Where the guide is flat the classes do not separate and
+//! the mask comes back bit for bit.
+//!
+//! The moments are taken on a grid of cells: a cell is [`Plan::step`] pixels
+//! square and lies on the pixel grid of the WHOLE picture at the scale of the
+//! render, not on the grid of the window that is being rendered, so a zoomed
+//! window and the full render hold the same cells. What is solved a cell
+//! comes back up bilinearly and the move reads the guide at full resolution.
+//! Everything is measured from the size of the whole picture, so the fitted
+//! view, 100 percent and the export show the same edge at their own scales.
+//!
+//! Arithmetic is f32 in the order the shader sums in, and every smoothstep is
+//! written out as its polynomial. `store` is applied wherever the GPU writes
+//! a texture of the filter; those are 32 bit float targets, so a golden test
+//! passes the identity.
 
 use gamut_core::mask::Refine;
 
 use crate::acescct;
 use crate::mask::Geometry;
 
-/// The guide's eps at a sensitivity of 0, before squaring: only an edge of
-/// about two stops holds the mask.
+/// The guide's eps at a sensitivity of 0, before squaring.
 pub const EPS_LOOSE: f32 = 0.1;
 
 /// The guide's eps at a sensitivity of 100, before squaring.
 pub const EPS_STRICT: f32 = 0.005;
 
 /// The radius in render pixels one step of the cell grid is taken for.
-pub const PIXELS_A_STEP: f32 = 4.0;
+pub const PIXELS_A_STEP: f32 = 8.0;
 
 /// The widest cell, in render pixels.
 pub const MAX_STEP: u32 = 4;
 
-/// The channels of the moments of one cell: p, I p (3), I (3), I I (6).
-pub const MOMENTS: usize = 13;
+/// The half side of the box as a share of the radius: 1 over the root of 2,
+/// so the corner of the box lies one radius out and nothing moves further
+/// than the radius.
+pub const BOX_OF_RADIUS: f32 = 0.71;
+
+/// How many times the classes are gathered.
+pub const GATHERS: usize = 3;
+
+/// The moments of the source in one cell: I (3), then I I as rr, rg, rb, gg,
+/// gb, bb. No mask and no gather changes them.
+pub const SOURCE_MOMENTS: usize = 9;
+
+/// The moments of the mask as drawn in one cell: p and p p.
+pub const MASK_MOMENTS: usize = 2;
+
+/// The moments of one gather in one cell: q and q I (3).
+pub const GATHER_MOMENTS: usize = 4;
+
+/// What one gather solves a cell: a (3), s, d2, c, P as rr, rg, rb, gg, gb,
+/// bb, and mid (3).
+pub const SOLVED: usize = 15;
+
+/// The share of the smaller class in the box over which the move comes in.
+pub const COVER_LOW: f32 = 0.0;
+pub const COVER_HIGH: f32 = 0.1;
+
+/// The hardness of the mask in the box over which the move comes in: 0 is
+/// one flat grey over the box and 1 only 0 and 1.
+pub const HARD_LOW: f32 = 0.3;
+pub const HARD_HIGH: f32 = 0.6;
+
+/// The separation of the classes over which the move comes in.
+pub const SEPARATE_LOW: f32 = 0.15;
+pub const SEPARATE_HIGH: f32 = 0.8;
+
+/// The squared distance off the colour line over which the move goes out.
+pub const LINE_LOW: f32 = 0.6;
+pub const LINE_HIGH: f32 = 1.2;
+
+/// The place along the colour line under which a pixel leaves the mask.
+pub const OUT_LOW: f32 = 0.15;
+pub const OUT_HIGH: f32 = 0.4;
+
+/// The place along the colour line over which a pixel joins the mask.
+pub const IN_LOW: f32 = 0.6;
+pub const IN_HIGH: f32 = 0.85;
+
+/// The least share of a class its mean colour is divided by.
+pub const SHARE_FLOOR: f32 = 1e-6;
+
+/// The least separation anything is divided by.
+pub const SEPARATION_FLOOR: f32 = 1e-9;
 
 /// The eps of the filter at a sensitivity of 0 to 100: a log scale from
 /// [`EPS_LOOSE`] squared to [`EPS_STRICT`] squared.
@@ -60,6 +136,13 @@ pub fn eps(sensitivity: f32) -> f32 {
 /// The guide of a source pixel in linear Rec.2020.
 pub fn guide(px: [f32; 3]) -> [f32; 3] {
     acescct::encode_pixel(px)
+}
+
+/// 0 under `low`, 1 over `high` and the smoothstep polynomial between. The
+/// shader writes the same polynomial out and never calls its builtin.
+pub fn smooth(x: f32, low: f32, high: f32) -> f32 {
+    let t = ((x - low) / (high - low)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// What the filter of one mask works with on one render. The GPU builds its
@@ -87,7 +170,7 @@ impl Plan {
     pub fn new(refine: &Refine, full: (u32, u32), origin: (u32, u32), size: (u32, u32)) -> Self {
         let radius = refine.radius * full.0.max(full.1) as f32;
         let step = ((radius / PIXELS_A_STEP).floor() as u32).clamp(1, MAX_STEP);
-        let cells = ((radius / step as f32).round() as u32).max(1);
+        let cells = ((radius * BOX_OF_RADIUS / step as f32).round() as u32).max(1);
         Plan {
             full,
             origin,
@@ -116,11 +199,18 @@ impl Plan {
         )
     }
 
-    /// How far around a pixel the filter reads, in render pixels: the box of
-    /// the moments, the box of `a` and `b`, the cell beside for the bilinear
-    /// step, and the cell a window may cut at its border.
+    /// How many cells around the two a pixel lies among one tile of the GPU
+    /// holds, and the twin reads: a box for each gather, and the cell beside
+    /// for the bilinear step of the two gathers before the last.
+    pub fn margin(&self) -> u32 {
+        GATHERS as u32 * self.cells + (GATHERS as u32 - 1)
+    }
+
+    /// How far around a pixel the filter reads, in render pixels: the margin,
+    /// the cell beside for the bilinear step of the last gather, and the cell
+    /// a window may cut at its border.
     pub fn reach(&self) -> u32 {
-        (2 * self.cells + 2) * self.step
+        (self.margin() + 2) * self.step
     }
 
     /// The first cell of the render on each axis and how many it touches.
@@ -146,14 +236,13 @@ pub fn reach(refine: &Refine, full: (u32, u32)) -> u32 {
     }
 }
 
-/// The moments of every cell of the render's grid: each the mean of p, I p,
-/// I and I I over the pixels of the cell that the render holds.
-pub fn cell_moments(
-    alpha: &[f32],
-    guides: &[[f32; 3]],
+/// The mean of `sample` over the pixels of every cell of the render's grid
+/// that the render holds. `sample` takes the index of a pixel of the render.
+pub fn cell_moments<const N: usize>(
     plan: &Plan,
+    sample: &dyn Fn(usize) -> [f32; N],
     store: &dyn Fn(f32) -> f32,
-) -> Vec<[f32; MOMENTS]> {
+) -> Vec<[f32; N]> {
     let ((first_x, first_y), (columns, rows)) = plan.grid();
     let (width, height) = plan.size;
     let mut out = Vec::with_capacity((columns * rows) as usize);
@@ -167,27 +256,11 @@ pub fn cell_moments(
             };
             let (x0, x1) = span(first_x, cx, plan.origin.0, width);
             let (y0, y1) = span(first_y, cy, plan.origin.1, height);
-            let mut sum = [0.0f32; MOMENTS];
+            let mut sum = [0.0f32; N];
             for y in y0..y1 {
                 for x in x0..x1 {
-                    let i = (y * width + x) as usize;
-                    let (p, g) = (alpha[i], guides[i]);
-                    let sample = [
-                        p,
-                        g[0] * p,
-                        g[1] * p,
-                        g[2] * p,
-                        g[0],
-                        g[1],
-                        g[2],
-                        g[0] * g[0],
-                        g[0] * g[1],
-                        g[0] * g[2],
-                        g[1] * g[1],
-                        g[1] * g[2],
-                        g[2] * g[2],
-                    ];
-                    for (total, value) in sum.iter_mut().zip(sample) {
+                    let values = sample((y * width + x) as usize);
+                    for (total, value) in sum.iter_mut().zip(values) {
                         *total += value;
                     }
                 }
@@ -232,22 +305,101 @@ pub fn box_mean<const N: usize>(
     pass(&across, 0, 1)
 }
 
-/// `a` (three channels) and `b` of one cell from the means of its moments.
-pub fn solve(mean: &[f32; MOMENTS], eps: f32) -> [f32; 4] {
-    let p = mean[0];
-    let mu = [mean[4], mean[5], mean[6]];
-    let cov = [
-        mean[1] - mu[0] * p,
-        mean[2] - mu[1] * p,
-        mean[3] - mu[2] * p,
+/// The means of the source's moments over the box, a cell. They depend on no
+/// mask and no gather, so the GPU holds them once a source and radius.
+pub fn source_means(
+    guides: &[[f32; 3]],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<[f32; SOURCE_MOMENTS]> {
+    let (_, grid) = plan.grid();
+    let moments = cell_moments(
+        plan,
+        &|i| {
+            let g = guides[i];
+            [
+                g[0],
+                g[1],
+                g[2],
+                g[0] * g[0],
+                g[0] * g[1],
+                g[0] * g[2],
+                g[1] * g[1],
+                g[1] * g[2],
+                g[2] * g[2],
+            ]
+        },
+        store,
+    );
+    box_mean(&moments, grid, plan.cells, store)
+}
+
+/// The means of the moments of the mask as drawn over the box, a cell.
+pub fn mask_means(
+    alpha: &[f32],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<[f32; MASK_MOMENTS]> {
+    let (_, grid) = plan.grid();
+    let moments = cell_moments(plan, &|i| [alpha[i], alpha[i] * alpha[i]], store);
+    box_mean(&moments, grid, plan.cells, store)
+}
+
+/// The means of the moments of one gather over the box, a cell: the weight
+/// `q` of the inside class and the guide weighed by it.
+pub fn gather_means(
+    q: &[f32],
+    guides: &[[f32; 3]],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<[f32; GATHER_MOMENTS]> {
+    let (_, grid) = plan.grid();
+    let moments = cell_moments(
+        plan,
+        &|i| {
+            let (q, g) = (q[i], guides[i]);
+            [q, g[0] * q, g[1] * q, g[2] * q]
+        },
+        store,
+    );
+    box_mean(&moments, grid, plan.cells, store)
+}
+
+/// How far the box holds both classes and a mask that means an edge, 0 to 1,
+/// from the means of the mask's moments: 0 where the box lies wholly inside
+/// or wholly outside the mask, which holds the halo at 0, and 0 where the
+/// mask is soft at the scale of the box.
+pub fn both(mask: &[f32; MASK_MOMENTS]) -> f32 {
+    let (p, pp) = (mask[0], mask[1]);
+    let hardness = (pp - p * p).max(0.0) / (p * (1.0 - p)).max(SHARE_FLOOR);
+    smooth(p.min(1.0 - p), COVER_LOW, COVER_HIGH) * smooth(hardness, HARD_LOW, HARD_HIGH)
+}
+
+/// What one gather solves in one cell from the means of the source's, the
+/// mask's and its own moments, in the order of [`SOLVED`].
+pub fn solve(
+    source: &[f32; SOURCE_MOMENTS],
+    mask: &[f32; MASK_MOMENTS],
+    gather: &[f32; GATHER_MOMENTS],
+    eps: f32,
+) -> [f32; SOLVED] {
+    let n1 = gather[0];
+    let n0 = 1.0 - n1;
+    let (inside, outside) = (n1.max(SHARE_FLOOR), n0.max(SHARE_FLOOR));
+    let mu1 = [gather[1] / inside, gather[2] / inside, gather[3] / inside];
+    let mu0 = [
+        (source[0] - gather[1]) / outside,
+        (source[1] - gather[2]) / outside,
+        (source[2] - gather[3]) / outside,
     ];
-    // var(I) + eps Id, symmetric: rr, rg, rb, gg, gb, bb.
-    let rr = mean[7] - mu[0] * mu[0] + eps;
-    let rg = mean[8] - mu[0] * mu[1];
-    let rb = mean[9] - mu[0] * mu[2];
-    let gg = mean[10] - mu[1] * mu[1] + eps;
-    let gb = mean[11] - mu[1] * mu[2];
-    let bb = mean[12] - mu[2] * mu[2] + eps;
+    // The scatter inside the classes, symmetric: rr, rg, rb, gg, gb, bb.
+    let within = |mean: f32, i: usize, j: usize| mean - n1 * mu1[i] * mu1[j] - n0 * mu0[i] * mu0[j];
+    let rr = within(source[3], 0, 0).max(0.0) + eps;
+    let rg = within(source[4], 0, 1);
+    let rb = within(source[5], 0, 2);
+    let gg = within(source[6], 1, 1).max(0.0) + eps;
+    let gb = within(source[7], 1, 2);
+    let bb = within(source[8], 2, 2).max(0.0) + eps;
     // Its inverse by cofactors.
     let c_rr = gg * bb - gb * gb;
     let c_rg = rb * gb - rg * bb;
@@ -259,13 +411,115 @@ pub fn solve(mean: &[f32; MOMENTS], eps: f32) -> [f32; 4] {
     // The matrix is positive definite, so its determinant is at least eps
     // cubed; the floor only guards a rounding that went under it.
     let scale = 1.0 / det.max(eps * eps * eps);
-    let a = [
-        (c_rr * cov[0] + c_rg * cov[1] + c_rb * cov[2]) * scale,
-        (c_rg * cov[0] + c_gg * cov[1] + c_gb * cov[2]) * scale,
-        (c_rb * cov[0] + c_gb * cov[1] + c_bb * cov[2]) * scale,
+    let inv = [
+        c_rr * scale,
+        c_rg * scale,
+        c_rb * scale,
+        c_gg * scale,
+        c_gb * scale,
+        c_bb * scale,
     ];
-    let b = p - (a[0] * mu[0] + a[1] * mu[1] + a[2] * mu[2]);
-    [a[0], a[1], a[2], b]
+    let delta = [mu1[0] - mu0[0], mu1[1] - mu0[1], mu1[2] - mu0[2]];
+    let a = [
+        inv[0] * delta[0] + inv[1] * delta[1] + inv[2] * delta[2],
+        inv[1] * delta[0] + inv[3] * delta[1] + inv[4] * delta[2],
+        inv[2] * delta[0] + inv[4] * delta[1] + inv[5] * delta[2],
+    ];
+    let d2 = (delta[0] * a[0] + delta[1] * a[1] + delta[2] * a[2]).max(0.0);
+    let c = smooth(d2, SEPARATE_LOW, SEPARATE_HIGH) * both(mask);
+    let over = d2.max(SEPARATION_FLOOR);
+    let mid = [
+        (mu1[0] + mu0[0]) / 2.0,
+        (mu1[1] + mu0[1]) / 2.0,
+        (mu1[2] + mu0[2]) / 2.0,
+    ];
+    let s = a[0] * mid[0] + a[1] * mid[1] + a[2] * mid[2];
+    [
+        a[0],
+        a[1],
+        a[2],
+        s,
+        d2,
+        c,
+        inv[0] - a[0] * a[0] / over,
+        inv[1] - a[0] * a[1] / over,
+        inv[2] - a[0] * a[2] / over,
+        inv[3] - a[1] * a[1] / over,
+        inv[4] - a[1] * a[2] / over,
+        inv[5] - a[2] * a[2] / over,
+        mid[0],
+        mid[1],
+        mid[2],
+    ]
+}
+
+/// The mask as drawn `p` moved at one pixel of guide `g` by what a gather
+/// solved, mixed from the four cells around the pixel.
+pub fn moved(p: f32, g: [f32; 3], v: &[f32; SOLVED]) -> f32 {
+    let along = (v[0] * g[0] + v[1] * g[1] + v[2] * g[2]) - v[3];
+    let est = (0.5 + along / v[4].max(SEPARATION_FLOOR)).clamp(0.0, 1.0);
+    let e = [g[0] - v[12], g[1] - v[13], g[2] - v[14]];
+    let m = (v[6] * e[0] * e[0]
+        + v[9] * e[1] * e[1]
+        + v[11] * e[2] * e[2]
+        + 2.0 * (v[7] * e[0] * e[1] + v[8] * e[0] * e[2] + v[10] * e[1] * e[2]))
+        .max(0.0);
+    let on_line = 1.0 - smooth(m, LINE_LOW, LINE_HIGH);
+    let out = on_line * (1.0 - smooth(est, OUT_LOW, OUT_HIGH));
+    let into = on_line * smooth(est, IN_LOW, IN_HIGH);
+    p + v[5] * (into * (1.0 - p) - out * p)
+}
+
+/// The result of the last gather over every pixel of a render: the mask as
+/// drawn moved onto the edges of the guide, before the amount mixes it in.
+pub fn gathered(
+    alpha: &[f32],
+    guides: &[[f32; 3]],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
+    let ((first_x, first_y), grid) = plan.grid();
+    let source = source_means(guides, plan, store);
+    let mask = mask_means(alpha, plan, store);
+    let step = plan.step as f32;
+    // Where a pixel lies among the centres of the cells on one axis: the
+    // cell before it, the one after, and the share of the second.
+    let among = |pixel: u32, origin: u32, first: u32, count: u32| {
+        let u = ((origin + pixel) as f32 + 0.5) / step - 0.5 - first as f32;
+        let low = u.floor();
+        let clamp = |i: f32| (i.max(0.0) as u32).min(count - 1);
+        (clamp(low), clamp(low + 1.0), u - low)
+    };
+    let width = plan.size.0;
+    let mut q = alpha.to_vec();
+    for _ in 0..GATHERS {
+        let means = gather_means(&q, guides, plan, store);
+        let solved: Vec<[f32; SOLVED]> = means
+            .iter()
+            .enumerate()
+            .map(|(cell, gather)| solve(&source[cell], &mask[cell], gather, plan.eps).map(store))
+            .collect();
+        q = alpha
+            .iter()
+            .zip(guides)
+            .enumerate()
+            .map(|(i, (p, g))| {
+                let (x, y) = (i as u32 % width, i as u32 / width);
+                let (x0, x1, fx) = among(x, plan.origin.0, first_x, grid.0);
+                let (y0, y1, fy) = among(y, plan.origin.1, first_y, grid.1);
+                let at = |cx: u32, cy: u32| &solved[(cy * grid.0 + cx) as usize];
+                let (tl, tr, bl, br) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                let mut mixed = [0.0f32; SOLVED];
+                for (c, value) in mixed.iter_mut().enumerate() {
+                    let top = tl[c] + (tr[c] - tl[c]) * fx;
+                    let bottom = bl[c] + (br[c] - bl[c]) * fx;
+                    *value = top + (bottom - top) * fy;
+                }
+                store(moved(*p, *g, &mixed))
+            })
+            .collect();
+    }
+    q
 }
 
 /// The refined alpha of a sanitised `refine` over every pixel of a render,
@@ -284,44 +538,10 @@ pub fn refined(
     }
     let plan = Plan::for_geometry(&refine.sanitised(), geometry);
     let guides: Vec<[f32; 3]> = pixels.iter().map(|px| guide(*px)).collect();
-    let ((first_x, first_y), grid) = plan.grid();
-    let moments = cell_moments(alpha, &guides, &plan, store);
-    let means = box_mean(&moments, grid, plan.cells, store);
-    let ab: Vec<[f32; 4]> = means
+    gathered(alpha, &guides, &plan, store)
         .iter()
-        .map(|mean| solve(mean, plan.eps).map(store))
-        .collect();
-    let ab = box_mean(&ab, grid, plan.cells, store);
-    let step = plan.step as f32;
-    // Where a pixel lies among the centres of the cells on one axis: the
-    // cell before it, the one after, and the share of the second.
-    let among = |pixel: u32, origin: u32, first: u32, count: u32| {
-        let u = ((origin + pixel) as f32 + 0.5) / step - 0.5 - first as f32;
-        let low = u.floor();
-        let clamp = |i: f32| (i.max(0.0) as u32).min(count - 1);
-        (clamp(low), clamp(low + 1.0), u - low)
-    };
-    let width = plan.size.0;
-    alpha
-        .iter()
-        .zip(&guides)
-        .enumerate()
-        .map(|(i, (p, g))| {
-            let (x, y) = (i as u32 % width, i as u32 / width);
-            let (x0, x1, fx) = among(x, plan.origin.0, first_x, grid.0);
-            let (y0, y1, fy) = among(y, plan.origin.1, first_y, grid.1);
-            let at = |cx: u32, cy: u32| ab[(cy * grid.0 + cx) as usize];
-            let (tl, tr, bl, br) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            let mut q = 0.0;
-            for c in 0..4 {
-                let top = tl[c] + (tr[c] - tl[c]) * fx;
-                let bottom = bl[c] + (br[c] - bl[c]) * fx;
-                let value = top + (bottom - top) * fy;
-                q += if c < 3 { value * g[c] } else { value };
-            }
-            let q = q.clamp(0.0, 1.0);
-            p + (q - p) * plan.amount
-        })
+        .zip(alpha)
+        .map(|(q, p)| (p + (q - p) * plan.amount).clamp(0.0, 1.0))
         .collect()
 }
 
@@ -355,14 +575,18 @@ mod tests {
     }
 
     /// An alpha that ramps from 1 on the left to 0 on the right across
-    /// `width` pixels about the middle column, through 0.5 there.
-    fn ramp_alpha(size: (u32, u32), width: f32) -> Vec<f32> {
+    /// `width` pixels about the column `centre`, through 0.5 there.
+    fn ramp_alpha(size: (u32, u32), centre: f32, width: f32) -> Vec<f32> {
         (0..size.0 * size.1)
             .map(|i| {
-                let x = (i % size.0) as f32 + 0.5 - size.0 as f32 / 2.0;
+                let x = (i % size.0) as f32 + 0.5 - centre;
                 stored_alpha((0.5 - x / width).clamp(0.0, 1.0))
             })
             .collect()
+    }
+
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
     }
 
     #[test]
@@ -370,15 +594,10 @@ mod tests {
         let size = (40, 30);
         let geometry = Geometry::full(size, size);
         let pixels = step_guide(size, 0.05, 0.6);
-        let alpha = ramp_alpha(size, 17.0);
+        let alpha = ramp_alpha(size, 20.0, 17.0);
         for radius in [0.001, 0.02, 0.05] {
             let out = refined(&alpha, &pixels, &geometry, &on(0.0, radius, 80.0), IDENTITY);
-            assert!(
-                out.iter()
-                    .zip(&alpha)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "radius {radius}"
-            );
+            assert!(same_bits(&out, &alpha), "radius {radius}");
         }
     }
 
@@ -391,14 +610,26 @@ mod tests {
     }
 
     #[test]
+    fn the_smoothstep_is_its_polynomial_between_its_ends() {
+        assert_eq!(smooth(0.1, 0.15, 0.8), 0.0);
+        assert_eq!(smooth(0.9, 0.15, 0.8), 1.0);
+        assert!((smooth(0.475, 0.15, 0.8) - 0.5).abs() < 1e-6);
+        assert!((smooth(0.025, 0.0, 0.1) - 0.15625).abs() < 1e-6);
+    }
+
+    #[test]
     fn the_plan_takes_its_cells_from_the_whole_picture() {
+        // A cell step for every 8 pixels of radius, a box of 0.71 radius.
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (6000, 4000), (0, 0), (6000, 4000));
-        assert_eq!((plan.step, plan.cells), (4, 15), "60 pixels");
-        assert_eq!(plan.reach(), 128);
+        assert_eq!((plan.step, plan.cells), (4, 11), "60 pixels");
+        assert_eq!(plan.margin(), 35);
+        assert_eq!(plan.reach(), 148);
+        let plan = Plan::new(&on(100.0, 0.01, 50.0), (1800, 1200), (0, 0), (1800, 1200));
+        assert_eq!((plan.step, plan.cells), (2, 6), "18 pixels");
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (1100, 700), (0, 0), (1100, 700));
-        assert_eq!((plan.step, plan.cells), (2, 6), "11 pixels");
+        assert_eq!((plan.step, plan.cells), (1, 8), "11 pixels");
         let plan = Plan::new(&on(100.0, 0.05, 50.0), (64, 64), (0, 0), (64, 64));
-        assert_eq!((plan.step, plan.cells), (1, 3), "3.2 pixels");
+        assert_eq!((plan.step, plan.cells), (1, 2), "3.2 pixels");
         let plan = Plan::new(&on(100.0, 0.001, 50.0), (64, 64), (0, 0), (64, 64));
         assert_eq!((plan.step, plan.cells), (1, 1), "never under one cell");
         // A window of the same picture has the same cells, counted from the
@@ -409,10 +640,10 @@ mod tests {
             (1022, 513),
             (900, 700),
         );
-        assert_eq!((window.step, window.cells), (4, 15));
+        assert_eq!((window.step, window.cells), (4, 11));
         assert_eq!(window.grid(), ((255, 128), (226, 176)));
         assert_eq!(reach(&on(0.0, 0.05, 50.0), (6000, 4000)), 0, "off");
-        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 128);
+        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 148);
     }
 
     #[test]
@@ -434,191 +665,299 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_guide_gives_a_plain_box_blur_of_the_alpha() {
+    fn a_flat_guide_gives_the_mask_back_exactly() {
         let size = (48, 24);
         let geometry = Geometry::full(size, size);
-        let pixels = vec![[0.18; 3]; (size.0 * size.1) as usize];
-        let alpha = ramp_alpha(size, 9.0);
-        let refine = on(100.0, 0.05, 50.0);
-        let plan = Plan::for_geometry(&refine, &geometry);
-        assert_eq!((plan.step, plan.cells), (1, 2));
-        let out = refined(&alpha, &pixels, &geometry, &refine, IDENTITY);
-        // With a flat guide a is 0 and b the mean of p, so q is the box mean
-        // of the box mean.
-        let cells: Vec<[f32; 1]> = alpha.iter().map(|p| [*p]).collect();
-        let once = box_mean(&cells, size, plan.cells, IDENTITY);
-        let twice = box_mean(&once, size, plan.cells, IDENTITY);
-        for (i, (got, want)) in out.iter().zip(&twice).enumerate() {
-            assert!(
-                (got - want[0]).abs() < 2e-4,
-                "pixel {i}: {got} is not {}",
-                want[0]
-            );
+        let alpha = ramp_alpha(size, 24.0, 3.0);
+        for grey in [0.0, 0.18, 0.7] {
+            let pixels = vec![[grey, grey * 0.9, grey * 1.1]; (size.0 * size.1) as usize];
+            for sensitivity in [0.0, 50.0, 100.0] {
+                let refine = on(100.0, 0.05, sensitivity);
+                let out = refined(&alpha, &pixels, &geometry, &refine, IDENTITY);
+                // The classes do not separate, so nothing is allowed to move.
+                assert!(same_bits(&out, &alpha), "grey {grey} at {sensitivity}");
+            }
         }
     }
 
     #[test]
-    fn a_blurred_alpha_snaps_onto_a_step_of_the_guide() {
-        let size = (96, 16);
+    fn a_loose_alpha_snaps_onto_a_step_of_the_guide() {
+        let size = (200, 16);
         let geometry = Geometry::full(size, size);
         let pixels = step_guide(size, 0.03, 0.5);
-        // A soft edge of the mask: a ramp one radius wide through 0.5 at the
-        // edge of the guide. The filter pulls each side toward the mean of
-        // the alpha on that side of the edge inside its box, so a ramp far
-        // wider than the box stays a ramp; this one snaps.
         let refine = on(100.0, 0.05, 50.0);
         let plan = Plan::for_geometry(&refine, &geometry);
-        let radius = (plan.cells * plan.step) as f32;
-        let alpha = ramp_alpha(size, radius);
+        assert_eq!((plan.step, plan.cells), (1, 7), "a radius of 10 pixels");
+        // The mask is 1 on the dark side and spills 4 pixels over the edge
+        // of the guide, a blurred step 3 pixels wide.
+        let edge = size.0 / 2;
+        let alpha = ramp_alpha(size, edge as f32 + 4.0, 3.0);
         let out = refined(&alpha, &pixels, &geometry, &refine, IDENTITY);
         let row = |x: u32| out[(8 * size.0 + x) as usize];
         let given = |x: u32| alpha[(8 * size.0 + x) as usize];
-        let edge = size.0 / 2;
-        let (inside, outside) = (edge - radius as u32, edge + radius as u32 - 1);
-        assert!(given(edge - 1) - given(edge) < 0.25, "the input is a ramp");
-        assert!(row(inside) > 0.9, "one radius inside: {}", row(inside));
-        assert!(row(outside) < 0.1, "one radius outside: {}", row(outside));
-        let step = row(edge - 1) - row(edge);
-        let given_step = given(edge - 1) - given(edge);
+        assert!(given(edge) > 0.9 && given(edge + 2) > 0.9, "the spill");
         assert!(
-            step > 0.6 && step > 3.0 * given_step,
-            "it steps with the guide: {step} where the input steps {given_step}"
+            row(edge - 10) > 0.9,
+            "one radius inside: {}",
+            row(edge - 10)
         );
+        assert!(row(edge + 9) < 0.1, "one radius outside: {}", row(edge + 9));
+        for x in edge..edge + 6 {
+            assert!(row(x) < 0.1, "the spill at {x} is left at {}", row(x));
+        }
+        for x in edge - 6..edge {
+            assert!(row(x) > 0.9, "the kept side at {x} is left at {}", row(x));
+        }
+        // A mask drawn short of the edge grows up to it.
+        let short = ramp_alpha(size, edge as f32 - 4.0, 3.0);
+        let grown = refined(&short, &pixels, &geometry, &refine, IDENTITY);
+        for x in edge - 6..edge {
+            let got = grown[(8 * size.0 + x) as usize];
+            assert!(got > 0.9, "short of the edge at {x}: {got}");
+        }
+        assert!(grown[(8 * size.0 + edge) as usize] < 0.1);
         // Half the amount goes half the way.
         let half = refined(&alpha, &pixels, &geometry, &on(50.0, 0.05, 50.0), IDENTITY);
-        let i = (8 * size.0 + inside) as usize;
+        let i = (8 * size.0 + edge + 1) as usize;
         assert!((half[i] - (alpha[i] + out[i]) / 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn a_sensitivity_of_0_smooths_across_a_weak_edge_that_100_keeps() {
-        let size = (96, 16);
+    fn a_colour_far_off_the_line_between_the_classes_keeps_its_mask() {
+        // A dark object on the left of a blue field under a mask that spills
+        // over the edge: what one gather solves at the edge.
+        let size = (200, 16);
         let geometry = Geometry::full(size, size);
-        // A third of a stop: 0.02 of the ACEScct code between the two sides.
-        let pixels = step_guide(size, 0.18, 0.18 * 1.26);
-        let alpha = ramp_alpha(size, 5.0);
-        let at = |sensitivity: f32| {
-            let out = refined(
-                &alpha,
-                &pixels,
-                &geometry,
-                &on(100.0, 0.05, sensitivity),
-                IDENTITY,
-            );
-            let edge = size.0 / 2;
-            out[(8 * size.0 + edge - 1) as usize] - out[(8 * size.0 + edge) as usize]
+        let (dark, blue) = ([0.02, 0.03, 0.05], [0.25, 0.5, 0.9]);
+        let edge = size.0 / 2;
+        let pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| if i % size.0 < edge { dark } else { blue })
+            .collect();
+        let refine = on(100.0, 0.05, 50.0);
+        let alpha = ramp_alpha(size, edge as f32 + 4.0, 3.0);
+        let guides: Vec<[f32; 3]> = pixels.iter().map(|px| guide(*px)).collect();
+        let plan = Plan::for_geometry(&refine, &geometry);
+        let (_, grid) = plan.grid();
+        let source = source_means(&guides, &plan, IDENTITY);
+        let mask = mask_means(&alpha, &plan, IDENTITY);
+        let gather = gather_means(&alpha, &guides, &plan, IDENTITY);
+        let cell = (8 * grid.0 + edge) as usize;
+        let solved = solve(&source[cell], &mask[cell], &gather[cell], plan.eps);
+        assert!(solved[5] > 0.99, "the move is allowed here: {}", solved[5]);
+        let place = |g: [f32; 3]| {
+            let along = (solved[0] * g[0] + solved[1] * g[1] + solved[2] * g[2]) - solved[3];
+            let e = [g[0] - solved[12], g[1] - solved[13], g[2] - solved[14]];
+            let m = solved[6] * e[0] * e[0]
+                + solved[9] * e[1] * e[1]
+                + solved[11] * e[2] * e[2]
+                + 2.0
+                    * (solved[7] * e[0] * e[1]
+                        + solved[8] * e[0] * e[2]
+                        + solved[10] * e[1] * e[2]);
+            (0.5 + along / solved[4], m)
         };
-        let (loose, strict) = (at(0.0), at(100.0));
-        assert!(loose < 0.15, "smoothed across: a step of {loose}");
-        assert!(strict > 0.5, "kept: a step of {strict}");
+        // The field lies at the outside's end of the line and on it: it
+        // leaves the mask. The object stays.
+        let (est, m) = place(guide(blue));
+        assert!(est < OUT_LOW && m < LINE_LOW, "the field: {est}, {m}");
+        assert!(moved(1.0, guide(blue), &solved) < 0.01);
+        assert!(moved(1.0, guide(dark), &solved) > 0.99);
+        // A bright warm colour, a sunlit face of the object: along the line
+        // it lies at the outside's end too, and off the line it is far from
+        // both classes. It keeps the alpha it was given, whatever that was.
+        let warm = guide([0.9, 0.5, 0.25]);
+        let (est, m) = place(warm);
+        assert!(est < OUT_LOW, "along the line the warm colour reads {est}");
+        assert!(m > LINE_HIGH, "off the line the warm colour reads {m}");
+        for p in [1.0, 0.4, 0.0] {
+            assert_eq!(moved(p, warm, &solved), p);
+        }
     }
 
     #[test]
-    fn nothing_divides_by_zero_on_a_flat_black_guide() {
-        let size = (32, 32);
+    fn a_mask_that_is_a_ramp_wider_than_twice_the_box_comes_back() {
+        let size = (240, 16);
         let geometry = Geometry::full(size, size);
-        let pixels = vec![[0.0; 3]; (size.0 * size.1) as usize];
-        let alpha = ramp_alpha(size, 6.0);
-        for sensitivity in [0.0, 100.0] {
-            let out = refined(
-                &alpha,
-                &pixels,
-                &geometry,
-                &on(100.0, 0.05, sensitivity),
-                IDENTITY,
-            );
-            assert!(out.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
-        }
-        assert!(
-            solve(&[0.0; MOMENTS], eps(100.0))
+        let pixels = step_guide(size, 0.03, 0.5);
+        let refine = on(100.0, 0.05, 50.0);
+        let plan = Plan::for_geometry(&refine, &geometry);
+        let side = (2 * plan.cells + 1) * plan.step;
+        for width in [2.0 * side as f32 + 1.0, 4.0 * side as f32] {
+            let alpha = ramp_alpha(size, 120.0, width);
+            let out = refined(&alpha, &pixels, &geometry, &refine, IDENTITY);
+            let most = out
                 .iter()
-                .all(|v| v.is_finite())
-        );
+                .zip(&alpha)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(most <= 0.02, "a ramp of {width} pixels moved by {most}");
+        }
     }
 
-    /// A picture with a texture and an edge, so nothing about it is regular.
+    /// A dark disc with a grain on a bright field with the same, under a mask
+    /// that is a disc with a hard rim a few pixels off the first: it spills
+    /// over the edge on one side and stops short of it on the other.
     fn busy(full: (u32, u32)) -> (Vec<[f32; 3]>, Vec<f32>) {
         let mut pixels = Vec::new();
         let mut alpha = Vec::new();
+        let (cx, cy) = (full.0 as f32 * 0.5, full.1 as f32 * 0.5);
+        let rim = full.1 as f32 * 0.3;
         for y in 0..full.1 {
             for x in 0..full.0 {
-                let (fx, fy) = (x as f32, y as f32);
-                let side = if fx + 0.3 * fy < full.0 as f32 * 0.55 {
-                    0.04
-                } else {
-                    0.4
-                };
-                let grain = 0.02 * ((fx * 0.9).sin() * (fy * 1.3).cos() + 1.0);
+                let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let from = |cx: f32, cy: f32| ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                // The edge of the disc is 8 pixels wide, so many colours lie
+                // between the classes and a changed class mean shows.
+                let out = ((from(cx, cy) - rim) / 8.0 + 0.5).clamp(0.0, 1.0);
+                let side = 0.04 * 10.0f32.powf(out);
+                let grain = 0.3 * side * ((fx * 0.9).sin() * (fy * 1.3).cos() + 1.0);
                 pixels.push([side + grain, side + 0.5 * grain, side * 0.8 + grain]);
-                let d = ((fx - full.0 as f32 * 0.5).powi(2) + (fy - full.1 as f32 * 0.5).powi(2))
-                    .sqrt();
-                alpha.push(stored_alpha(
-                    (1.4 - d / (full.1 as f32 * 0.4)).clamp(0.0, 1.0),
-                ));
+                let d = from(cx + 2.5, cy - 1.5);
+                alpha.push(stored_alpha(((rim - d) / 2.0 + 0.5).clamp(0.0, 1.0)));
             }
         }
         (pixels, alpha)
     }
 
     #[test]
-    fn a_window_padded_by_the_reach_gives_what_the_full_render_gives() {
-        let full = (200, 120);
+    fn nothing_moves_further_than_one_box_from_the_transition_of_the_mask() {
+        let full = (240, 160);
         let (pixels, alpha) = busy(full);
-        for radius in [0.012, 0.03, 0.05] {
-            let refine = on(100.0, radius, 60.0);
-            let whole = refined(
-                &alpha,
-                &pixels,
-                &Geometry::full(full, full),
-                &refine,
-                IDENTITY,
+        let guides: Vec<[f32; 3]> = pixels.iter().map(|px| guide(*px)).collect();
+        // 0.08 is past what a sanitised refine holds: cells of 2 pixels.
+        for radius in [0.02, 0.05, 0.08] {
+            let plan = Plan::new(&on(100.0, radius, 50.0), full, (0, 0), full);
+            let out = gathered(&alpha, &guides, &plan, IDENTITY);
+            let moved = out.iter().zip(&alpha).filter(|(a, b)| a != b).count();
+            assert!(
+                moved > 100,
+                "radius {radius}: the filter moves {moved} pixels"
             );
-            let reach = reach(&refine, full);
-            // What is wanted, off the cell grid on purpose, and the window
-            // that holds it and the reach.
-            let wanted = (71u32, 33u32, 50u32, 40u32);
-            let (x0, y0) = (
-                wanted.0 - reach.min(wanted.0),
-                wanted.1 - reach.min(wanted.1),
-            );
-            let x1 = (wanted.0 + wanted.2 + reach).min(full.0);
-            let y1 = (wanted.1 + wanted.3 + reach).min(full.1);
-            let size = (x1 - x0, y1 - y0);
-            let cut = |source: &[f32]| -> Vec<f32> {
-                (0..size.0 * size.1)
-                    .map(|i| source[((y0 + i / size.0) * full.0 + x0 + i % size.0) as usize])
-                    .collect()
-            };
-            let window_pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
-                .map(|i| pixels[((y0 + i / size.0) * full.0 + x0 + i % size.0) as usize])
-                .collect();
-            let geometry = Geometry {
-                window: CropRect {
-                    x: x0 as f32 / full.0 as f32,
-                    y: y0 as f32 / full.1 as f32,
-                    width: size.0 as f32 / full.0 as f32,
-                    height: size.1 as f32 / full.1 as f32,
-                },
-                size,
-                photo: full,
-            };
-            let plan = Plan::for_geometry(&refine, &geometry);
-            assert_eq!(
-                (plan.full, plan.origin),
-                (full, (x0, y0)),
-                "radius {radius}"
-            );
-            let window = refined(&cut(&alpha), &window_pixels, &geometry, &refine, IDENTITY);
-            for y in wanted.1..wanted.1 + wanted.3 {
-                for x in wanted.0..wanted.0 + wanted.2 {
-                    let a = whole[(y * full.0 + x) as usize];
-                    let b = window[((y - y0) * size.0 + x - x0) as usize];
-                    assert!(
-                        a.to_bits() == b.to_bits(),
-                        "radius {radius}, pixel ({x}, {y}): {a} in the whole, {b} in the window"
-                    );
+            // A pixel is far when every pixel within the box, and the cell
+            // beside for the bilinear step, holds the same 0 or the same 1.
+            let far = ((plan.cells + 2) * plan.step) as i32;
+            let (w, h) = (full.0 as i32, full.1 as i32);
+            for y in 0..h {
+                for x in 0..w {
+                    let here = alpha[(y * w + x) as usize];
+                    if here != 0.0 && here != 1.0 {
+                        continue;
+                    }
+                    let flat = (-far..=far).all(|dy| {
+                        (-far..=far).all(|dx| {
+                            let (sx, sy) = ((x + dx).clamp(0, w - 1), (y + dy).clamp(0, h - 1));
+                            alpha[(sy * w + sx) as usize] == here
+                        })
+                    });
+                    if flat {
+                        let got = out[(y * w + x) as usize];
+                        assert!(
+                            got.to_bits() == here.to_bits(),
+                            "radius {radius}, pixel ({x}, {y}): {here} became {got}"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn nothing_divides_by_zero_on_a_flat_black_guide_or_a_mask_of_all_1() {
+        let size = (32, 32);
+        let geometry = Geometry::full(size, size);
+        let black = vec![[0.0; 3]; (size.0 * size.1) as usize];
+        let (busy_pixels, _) = busy(size);
+        let ramp = ramp_alpha(size, 16.0, 6.0);
+        let full = vec![1.0; (size.0 * size.1) as usize];
+        let none = vec![0.0; (size.0 * size.1) as usize];
+        for sensitivity in [0.0, 100.0] {
+            let refine = on(100.0, 0.05, sensitivity);
+            for (pixels, alpha) in [
+                (&black, &ramp),
+                (&black, &full),
+                (&busy_pixels, &full),
+                (&busy_pixels, &none),
+            ] {
+                let out = refined(alpha, pixels, &geometry, &refine, IDENTITY);
+                assert!(out.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            }
+            let out = refined(&full, &busy_pixels, &geometry, &refine, IDENTITY);
+            assert!(same_bits(&out, &full), "a mask of all 1 comes back");
+        }
+        let solved = solve(&[0.0; SOURCE_MOMENTS], &[0.0; 2], &[0.0; 4], eps(100.0));
+        assert!(solved.iter().all(|v| v.is_finite()));
+        assert!(moved(0.5, [0.0; 3], &solved).is_finite());
+    }
+
+    /// The refined alpha of one rectangle of the busy picture, from the whole
+    /// render and from a window that holds the rectangle and `pad` pixels
+    /// around it.
+    fn whole_and_window(radius: f32, pad: u32) -> (Vec<f32>, Vec<f32>) {
+        let full = (640, 480);
+        let (pixels, alpha) = busy(full);
+        let refine = on(100.0, radius, 60.0);
+        let whole = refined(
+            &alpha,
+            &pixels,
+            &Geometry::full(full, full),
+            &refine,
+            IDENTITY,
+        );
+        // What is wanted, off the cell grid on purpose, across the rim.
+        let wanted = (401u32, 187u32, 60u32, 50u32);
+        let (x0, y0) = (wanted.0 - pad.min(wanted.0), wanted.1 - pad.min(wanted.1));
+        let x1 = (wanted.0 + wanted.2 + pad).min(full.0);
+        let y1 = (wanted.1 + wanted.3 + pad).min(full.1);
+        let size = (x1 - x0, y1 - y0);
+        let at = |i: u32| ((y0 + i / size.0) * full.0 + x0 + i % size.0) as usize;
+        let window_alpha: Vec<f32> = (0..size.0 * size.1).map(|i| alpha[at(i)]).collect();
+        let window_pixels: Vec<[f32; 3]> = (0..size.0 * size.1).map(|i| pixels[at(i)]).collect();
+        let geometry = Geometry {
+            window: CropRect {
+                x: x0 as f32 / full.0 as f32,
+                y: y0 as f32 / full.1 as f32,
+                width: size.0 as f32 / full.0 as f32,
+                height: size.1 as f32 / full.1 as f32,
+            },
+            size,
+            photo: full,
+        };
+        let plan = Plan::for_geometry(&refine, &geometry);
+        assert_eq!(
+            (plan.full, plan.origin),
+            (full, (x0, y0)),
+            "radius {radius}"
+        );
+        let window = refined(&window_alpha, &window_pixels, &geometry, &refine, IDENTITY);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for y in wanted.1..wanted.1 + wanted.3 {
+            for x in wanted.0..wanted.0 + wanted.2 {
+                a.push(whole[(y * full.0 + x) as usize]);
+                b.push(window[((y - y0) * size.0 + x - x0) as usize]);
+            }
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn a_window_padded_by_the_reach_gives_what_the_full_render_gives() {
+        for radius in [0.012, 0.03, 0.05] {
+            let refine = on(100.0, radius, 60.0);
+            let plan = Plan::new(&refine, (640, 480), (0, 0), (640, 480));
+            let (whole, window) = whole_and_window(radius, plan.reach());
+            assert!(
+                whole.iter().any(|v| *v != 0.0 && *v != 1.0),
+                "the mask has an edge in what is wanted"
+            );
+            assert!(same_bits(&whole, &window), "radius {radius}");
+            // One box less and the window cuts what the filter reads.
+            let short = plan.reach() - plan.cells * plan.step;
+            let (whole, window) = whole_and_window(radius, short);
+            assert!(
+                !same_bits(&whole, &window),
+                "radius {radius}, {short} pixels"
+            );
         }
     }
 
@@ -638,8 +977,7 @@ mod tests {
         let alpha: Vec<f32> = (0..40)
             .map(|i| if i % 10 >= 8 { 1.0 } else { 0.0 })
             .collect();
-        let guides = vec![[0.3; 3]; 40];
-        let moments = cell_moments(&alpha, &guides, &plan, IDENTITY);
+        let moments = cell_moments(&plan, &|i| [alpha[i]], IDENTITY);
         assert_eq!(moments.len(), 3);
         assert_eq!(moments[2][0], 1.0, "the mean of the two columns it holds");
         assert_eq!(moments[1][0], 0.0);
