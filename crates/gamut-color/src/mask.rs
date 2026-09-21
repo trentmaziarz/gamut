@@ -20,7 +20,7 @@ use gamut_core::{Adjustments, CropRect, EXPOSURE_LIMIT, PhotoEdit, SLIDER_LIMIT,
 
 use crate::basic::{self, Neighbourhood, Prepared};
 use crate::brush::{self, Dab, Proxy};
-use crate::{acescct, hue, wheels};
+use crate::{acescct, hue, refine, wheels};
 
 /// The chroma above `chroma_low` at which a colour range is fully on.
 pub const CHROMA_RAMP: f32 = 0.01;
@@ -248,7 +248,9 @@ pub fn alpha_image_with(
 }
 
 /// The alpha of a mask over every pixel of a render before the r8unorm
-/// store rounds it.
+/// store rounds it. With Refine edges on, that is the refined alpha, which
+/// the filter made from the stored alpha of the components: the GPU keeps
+/// both in r8unorm.
 pub fn alpha_image_before_the_store(
     mask: &Mask,
     pixels: &[[f32; 3]],
@@ -259,14 +261,19 @@ pub fn alpha_image_before_the_store(
     let mask = mask.sanitised();
     let stamped = StampedMask::new(&mask, geometry.aspect(), proxy);
     let width = geometry.size.0;
-    pixels
+    let alpha: Vec<f32> = pixels
         .iter()
         .enumerate()
         .map(|(i, px)| {
             let at = geometry.position(i as u32 % width, i as u32 / width);
             stamped.alpha(at, *px, layer_store)
         })
-        .collect()
+        .collect();
+    if mask.refine.is_off() {
+        return alpha;
+    }
+    let stored: Vec<f32> = alpha.into_iter().map(stored_alpha).collect();
+    refine::refined(&stored, pixels, geometry, &mask.refine, &|moment| moment)
 }
 
 fn add_wheel(global: Wheel, mask: Wheel) -> Wheel {
@@ -972,6 +979,59 @@ mod tests {
         };
         develop_image(&image, &edit, [1.0; 3], &counting);
         assert_eq!(count.get(), 3 * 3, "three channels, three stores");
+    }
+
+    #[test]
+    fn the_alpha_image_is_the_refined_one_when_the_mask_asks_for_it() {
+        use gamut_core::mask::Refine;
+        let size = (48, 32);
+        let geometry = Geometry::full(size, size);
+        // Dark on the left, bright on the right, under a radial gradient
+        // that lies across the edge.
+        let pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| if i % size.0 < 24 { [0.03; 3] } else { [0.5; 3] })
+            .collect();
+        // Centre at x 14.4, full to 6 pixels out and gone at 12: the fall
+        // runs from x 20.4 to 26.4, across the edge at 24.
+        let gradient = RadialGradient {
+            centre: [0.3, 0.5],
+            ..RadialGradient::default()
+        };
+        let mut mask = Mask::new("Across", MaskSource::Radial(gradient));
+        let plain = alpha_image(&mask, &pixels, &geometry);
+        // Off, whatever the radius says: bit for bit what it was.
+        mask.refine.radius = 0.05;
+        let off = alpha_image(&mask, &pixels, &geometry);
+        assert!(
+            plain
+                .iter()
+                .zip(&off)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        mask.refine = Refine {
+            amount: 100.0,
+            radius: 0.05,
+            sensitivity: 50.0,
+        };
+        let refined = alpha_image(&mask, &pixels, &geometry);
+        let want: Vec<f32> = refine::refined(&plain, &pixels, &geometry, &mask.refine, &|v| v)
+            .into_iter()
+            .map(stored_alpha)
+            .collect();
+        assert_eq!(
+            refined, want,
+            "the filter of the stored alpha, stored again"
+        );
+        let row = |alpha: &[f32], x: u32| alpha[(16 * size.0 + x) as usize];
+        let (before, after) = (
+            row(&plain, 23) - row(&plain, 24),
+            row(&refined, 23) - row(&refined, 24),
+        );
+        assert!(
+            (0.05..0.3).contains(&before),
+            "a fall across the edge: {before}"
+        );
+        assert!(after > before + 0.25, "{before} became {after}");
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! [`video`], the twin of the YCbCr pass with the provisional HLG decode.
 //! M3 adds [`acescct`] and the operators that run in it ([`curve`], [`hsl`]
 //! on the hue model of [`hue`], [`wheels`]), and the local operators
-//! [`local`] (texture and clarity) and [`dehaze`].
+//! [`local`] (texture and clarity) and [`dehaze`], the masks of [`mask`] with
+//! the painted ones of [`brush`], and [`refine`], the edge-aware filter of a
+//! mask's alpha.
 
 pub mod acescct;
 pub mod basic;
@@ -26,6 +28,7 @@ pub mod icc;
 pub mod local;
 pub mod mask;
 pub mod matrices;
+pub mod refine;
 pub mod transfer;
 pub mod video;
 pub mod wheels;
