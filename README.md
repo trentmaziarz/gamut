@@ -6,11 +6,26 @@ and DaVinci Resolve to post a 4:5 still and a 9:16 reel on Instagram, without a
 subscription. The photo editor and the video editor are the same program. Gamut
 runs on Windows only and is written in Rust.
 
-Gamut is pre-release, milestone 2: a phone photo or clip opens, the Basic
-sliders develop it, and it exports as a JPEG or a Reel for Instagram. With no
-photo open the window shows the test image, a red-to-blue gradient under a
-checkerboard. A milestone is a tagged release that adds something a user can do,
-and milestone 2 is the third of the nine, numbered 0 to 8, that make version
+Gamut is pre-release, now at milestone 3. A phone photo or clip opens, develops
+on the Basic sliders and exports as a JPEG or a Reel for Instagram. Milestone 3
+adds a tone curve for each colour channel, colour wheels for shadows, midtones
+and highlights, and texture, clarity and dehaze sliders. A colour mixer moves
+hue, saturation and luminance in eight hue ranges. An adjustment can also go to
+part of the picture through a mask. You paint one with a brush, drag out a
+linear or radial gradient, or pick a range of brightness or colour. Masks
+combine by add, subtract and intersect. Refine edges tidies a loosely drawn
+mask, moving its edge onto the nearest place where the colour changes sharply,
+such as a roof against the sky. A stroke run over a row of roofs and into the
+sky let go of the sky and kept the roofs. The look and the masks develop every
+frame of a video clip as they do a photo. Save a look as a preset file and apply
+it to another photo. One photo can carry any number of named versions of its
+edit, say a colour one and a black and white one, picked by name. Gamut never
+changes the photo file, and every edit lives in the small edit file it writes
+beside the photo.
+
+With no photo open the window shows the test image, a red-to-blue gradient under
+a checkerboard. A milestone is a tagged release that adds something a user can
+do, and milestone 3 is the fourth of the nine, numbered 0 to 8, that make version
 0.1. The design document at docs/design.md in this repository lists all nine.
 Bugs and questions go to the issues page at github.com/trentmaziarz/gamut.
 
