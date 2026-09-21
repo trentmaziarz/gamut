@@ -1134,10 +1134,7 @@ impl Develop {
             let window_uniform = [window.x, window.y, window.width, window.height];
             let (head_pipeline, head_label) = match &source.kind {
                 SourceKind::Photo { space, .. } => {
-                    let taps = (source.width as f32 * window.width / width as f32)
-                        .max(source.height as f32 * window.height / height as f32)
-                        .ceil()
-                        .clamp(1.0, MAX_TAPS as f32) as u32;
+                    let taps = input_taps((source.width, source.height), window, (width, height));
                     self.queue.write_buffer(
                         &self.input_uniform,
                         0,
@@ -2368,6 +2365,19 @@ fn scissor_for(crop: CropRect, size: (u32, u32), full_height: bool) -> (u32, u32
     (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
 }
 
+/// How many source pixels a side the input transform averages into one pixel
+/// of a render of `window`: the source pixels a render pixel covers, rounded
+/// up. The fractions of a window are f32, so a window at one source pixel a
+/// pixel can read a hair over 1 (586 of 1100 pixels reads 1.0000001), and a
+/// second tap there would soften that window and no other. A tap is added
+/// only past that noise.
+fn input_taps(source: (u32, u32), window: CropRect, render: (u32, u32)) -> u32 {
+    const NOISE: f32 = 1e-4;
+    let covered = (source.0 as f32 * window.width / render.0 as f32)
+        .max(source.1 as f32 * window.height / render.1 as f32);
+    (covered - NOISE).ceil().clamp(1.0, MAX_TAPS as f32) as u32
+}
+
 /// The size to render the whole photo at so that `crop` lands on an output
 /// of `output` pixels one to one.
 pub fn render_size_for_crop(crop: CropRect, output: (u32, u32)) -> (u32, u32) {
@@ -2667,12 +2677,37 @@ fn draw_loading(
 #[cfg(test)]
 mod tests {
     use super::{
-        DevelopUniform, FLAG_CURVES, Geometry, MaskComponentUniform, MaskUniform, MinimumUniform,
-        OutputUniform, scissor_for,
+        DevelopUniform, FLAG_CURVES, Geometry, MAX_TAPS, MaskComponentUniform, MaskUniform,
+        MinimumUniform, OutputUniform, input_taps, scissor_for,
     };
     use gamut_core::mask::{Component, LinearGradient, MaskOp, MaskSource, RadialGradient};
     use gamut_core::{Adjustments, CropRect, Mask};
     use std::mem::offset_of;
+
+    #[test]
+    fn a_window_at_one_source_pixel_a_pixel_takes_one_tap() {
+        // Every window of whole pixels of a photo 1100 wide, rendered one to
+        // one: 586 of them read 1.0000001 source pixels a pixel in f32.
+        for pixels in 1..=1100u32 {
+            let window = CropRect {
+                x: 0.0,
+                y: 0.0,
+                width: pixels as f32 / 1100.0,
+                height: 1.0,
+            };
+            assert_eq!(
+                input_taps((1100, 600), window, (pixels, 600)),
+                1,
+                "{pixels} pixels"
+            );
+        }
+        // A render at half the size takes two, at a third three, and one a
+        // little under the source's size two, as before.
+        assert_eq!(input_taps((1100, 600), CropRect::FULL, (550, 300)), 2);
+        assert_eq!(input_taps((1200, 600), CropRect::FULL, (400, 200)), 3);
+        assert_eq!(input_taps((1100, 600), CropRect::FULL, (1000, 545)), 2);
+        assert_eq!(input_taps((6000, 4000), CropRect::FULL, (60, 40)), MAX_TAPS);
+    }
     use wgpu::naga;
 
     /// The size of the struct named `Uniform` in a shader and the offset of
