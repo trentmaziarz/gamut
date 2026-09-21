@@ -77,6 +77,7 @@ impl BrushTool {
             feather: self.feather,
             flow: self.flow,
             erase,
+            ..Stroke::default()
         }
     }
 
@@ -336,7 +337,7 @@ impl Session {
         let Some(stroke) = brush.strokes.last_mut() else {
             return;
         };
-        if !stroke.push(at) {
+        if !stroke.push(at, None) {
             let (last, again) = (stroke.points.last().copied(), (**stroke).clone());
             if !brush.has_room() {
                 return;

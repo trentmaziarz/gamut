@@ -150,7 +150,7 @@ mod tests {
             size,
             feather,
             flow,
-            erase: false,
+            ..Stroke::default()
         }
     }
 

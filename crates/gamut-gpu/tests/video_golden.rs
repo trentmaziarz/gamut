@@ -289,6 +289,7 @@ fn a_brush_mask_on_a_frame_matches_the_twin() {
             flow,
             erase,
         })
+            ..Stroke::default()
     };
     let mut mask = Mask::new(
         "Brush",

@@ -558,6 +558,24 @@ mod tests {
 
     /// A sidecar exactly as version 3 wrote it before the brush: two masks
     /// of two components, one of each source, and a version holding them.
+    const VERSION_3_BRUSH: &str = include_str!("testdata/sidecar_version_3_brush_4c.json");
+
+    #[test]
+    fn a_sidecar_with_a_brush_from_before_the_auto_mask_saves_back_unchanged() {
+        let back = Sidecar::from_json(VERSION_3_BRUSH).expect("parse");
+        assert_eq!(back.version, 3);
+        let MaskSource::Brush(brush) = &back.edit.masks[0].components[0].source else {
+            panic!("a brush");
+        };
+        assert_eq!(brush.strokes.len(), 3);
+        assert!(brush.strokes.iter().all(|s| !s.auto && !s.uses_pressure()));
+        assert!(brush.strokes[2].erase);
+        assert_eq!(
+            back.to_json().trim(),
+            VERSION_3_BRUSH.replace("\r\n", "\n").trim()
+        );
+    }
+
     const VERSION_3: &str = include_str!("testdata/sidecar_version_3.json");
 
     #[test]

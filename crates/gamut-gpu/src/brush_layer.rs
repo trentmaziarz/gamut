@@ -453,6 +453,7 @@ mod tests {
             feather: 40.0,
             flow: 50.0,
             erase,
+            ..Stroke::default()
         })
     }
 
@@ -555,7 +556,7 @@ mod tests {
         assert_eq!(change(&Brush::default(), 0, &held), Change::Grown(0, 0));
 
         let mut longer = held.clone();
-        longer.strokes[1].push([0.64, 0.3]);
+        longer.strokes[1].push([0.64, 0.3], None);
         assert_eq!(change(&held, 5, &longer), Change::Grown(1, 5));
         longer.strokes.push(stroke(&[[0.7, 0.3]], 0.01, true));
         assert_eq!(change(&held, 5, &longer), Change::Grown(1, 5));

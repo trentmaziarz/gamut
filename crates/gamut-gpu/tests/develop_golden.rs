@@ -1424,7 +1424,7 @@ fn stroke(points: &[[f32; 2]], size: f32, feather: f32, flow: f32) -> Stroke {
         size,
         feather,
         flow,
-        erase: false,
+        ..Stroke::default()
     }
 }
 

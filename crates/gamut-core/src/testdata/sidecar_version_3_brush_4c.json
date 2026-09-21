@@ -1,0 +1,312 @@
+{
+  "version": 3,
+  "edit": {
+    "white_balance_temperature": 0.0,
+    "white_balance_tint": 0.0,
+    "exposure": 0.0,
+    "contrast": 20.0,
+    "highlights": 0.0,
+    "shadows": 0.0,
+    "whites": 0.0,
+    "blacks": 0.0,
+    "vibrance": 0.0,
+    "saturation": 0.0,
+    "texture": 0.0,
+    "clarity": 0.0,
+    "dehaze": 0.0,
+    "look": {
+      "curves": {
+        "master": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "red": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "green": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        "blue": {
+          "points": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      },
+      "hsl": [
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        },
+        {
+          "hue": 0.0,
+          "saturation": 0.0,
+          "luminance": 0.0
+        }
+      ],
+      "wheels": {
+        "shadows": {
+          "x": 0.0,
+          "y": 0.0,
+          "luminance": 0.0
+        },
+        "midtones": {
+          "x": 0.0,
+          "y": 0.0,
+          "luminance": 0.0
+        },
+        "highlights": {
+          "x": 0.0,
+          "y": 0.0,
+          "luminance": 0.0
+        }
+      }
+    },
+    "masks": [
+      {
+        "name": "Hair",
+        "enabled": true,
+        "invert": false,
+        "opacity": 100.0,
+        "components": [
+          {
+            "op": "Add",
+            "source": {
+              "type": "Brush",
+              "strokes": [
+                {
+                  "points": "0.1,0.2 0.15,0.25 0.3,0.123457 0.42,0.18",
+                  "size": 0.02,
+                  "feather": 35.0,
+                  "flow": 60.0,
+                  "erase": false
+                },
+                {
+                  "points": "0.5,0.5",
+                  "size": 0.05,
+                  "feather": 0.0,
+                  "flow": 100.0,
+                  "erase": false
+                },
+                {
+                  "points": "0.2,0.22 0.26,0.2",
+                  "size": 0.01,
+                  "feather": 80.0,
+                  "flow": 25.0,
+                  "erase": true
+                }
+              ]
+            },
+            "invert": false
+          },
+          {
+            "op": "Subtract",
+            "source": {
+              "type": "Brush",
+              "strokes": []
+            },
+            "invert": false
+          }
+        ],
+        "adjust": {
+          "white_balance_temperature": 0.0,
+          "white_balance_tint": 0.0,
+          "exposure": 1.0,
+          "contrast": 0.0,
+          "highlights": 0.0,
+          "shadows": 0.0,
+          "whites": 0.0,
+          "blacks": 0.0,
+          "vibrance": 0.0,
+          "saturation": 0.0,
+          "texture": 0.0,
+          "clarity": 0.0,
+          "dehaze": 0.0,
+          "look": {
+            "curves": {
+              "master": {
+                "points": [
+                  [
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.0,
+                    1.0
+                  ]
+                ]
+              },
+              "red": {
+                "points": [
+                  [
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.0,
+                    1.0
+                  ]
+                ]
+              },
+              "green": {
+                "points": [
+                  [
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.0,
+                    1.0
+                  ]
+                ]
+              },
+              "blue": {
+                "points": [
+                  [
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.0,
+                    1.0
+                  ]
+                ]
+              }
+            },
+            "hsl": [
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              },
+              {
+                "hue": 0.0,
+                "saturation": 0.0,
+                "luminance": 0.0
+              }
+            ],
+            "wheels": {
+              "shadows": {
+                "x": 0.0,
+                "y": 0.0,
+                "luminance": 0.0
+              },
+              "midtones": {
+                "x": 0.0,
+                "y": 0.0,
+                "luminance": 0.0
+              },
+              "highlights": {
+                "x": 0.0,
+                "y": 0.0,
+                "luminance": 0.0
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "crop": {
+    "aspect": "Feed4x5",
+    "rect": {
+      "x": 0.0,
+      "y": 0.0,
+      "width": 1.0,
+      "height": 1.0
+    }
+  }
+}

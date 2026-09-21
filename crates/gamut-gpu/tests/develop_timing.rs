@@ -272,6 +272,7 @@ fn with_brush_mask(base: &PhotoEdit) -> PhotoEdit {
                 feather: 100.0 * next(&mut seed),
                 flow: 20.0 + 80.0 * next(&mut seed),
                 erase: k % 10 == 9,
+                ..Stroke::default()
             })
         })
         .collect();
@@ -321,7 +322,7 @@ fn painted_view(
             size,
             feather: 50.0,
             flow: 60.0,
-            erase: false,
+            ..Stroke::default()
         }));
     timed_view(gpu, develop, &edit, view);
     // A quarter radius of arc a frame.
@@ -335,7 +336,7 @@ fn painted_view(
                     centre[1] + orbit[1] * angle.sin(),
                 ];
                 let stroke = timed_brush(&mut edit).strokes.last_mut().expect("pressed");
-                assert!(stroke.push(at));
+                assert!(stroke.push(at, None));
                 timed_view(gpu, develop, &edit, view)
             })
             .collect(),

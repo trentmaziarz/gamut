@@ -965,7 +965,7 @@ mod tests {
                 size: 0.1,
                 feather: 100.0,
                 flow: 30.0,
-                erase: false,
+                ..Stroke::default()
             })],
         });
         let gradient = MaskSource::Linear(LinearGradient {
