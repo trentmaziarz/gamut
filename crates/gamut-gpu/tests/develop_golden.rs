@@ -218,6 +218,7 @@ fn cpu_reference(
         texture: &texture,
         transmission: &transmission,
         geometry: Geometry::full((width, height), (width, height)),
+        proxy: None,
     };
     // A brush layer is a half float the dabs blend into: a store a dab.
     mask_twin::develop_image_with(&image, edit, atmosphere, &store, &store)
@@ -1324,7 +1325,7 @@ fn check_overlay(idle: Mask) {
             .collect();
         let store = |v: f32| half(v, rounding);
         let alphas: Vec<f32> =
-            mask_twin::alpha_image_before_the_store(&idle, &stored, &geometry, &store)
+            mask_twin::alpha_image_before_the_store(&idle, &stored, &geometry, None, &store)
                 .into_iter()
                 .map(|alpha| mask_twin::stored_alpha_stepping(alpha, step))
                 .collect();
@@ -1337,6 +1338,7 @@ fn check_overlay(idle: Mask) {
             texture: &luma,
             transmission: &clear,
             geometry,
+            proxy: None,
         };
         mask_twin::develop_image_with(&image, &edit, [1.0; 3], &store, &store)
             .into_iter()

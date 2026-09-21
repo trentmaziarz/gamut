@@ -157,6 +157,7 @@ fn cpu_reference(
             texture: &luma,
             transmission: &clear,
             geometry: Geometry::full((SIZE, SIZE), (SIZE, SIZE)),
+            proxy: None,
         };
         return mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
             .into_iter()
@@ -288,8 +289,8 @@ fn a_brush_mask_on_a_frame_matches_the_twin() {
             feather,
             flow,
             erase,
-        })
             ..Stroke::default()
+        })
     };
     let mut mask = Mask::new(
         "Brush",

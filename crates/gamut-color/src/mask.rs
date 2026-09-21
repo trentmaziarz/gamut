@@ -19,7 +19,7 @@ use gamut_core::mask::{
 use gamut_core::{Adjustments, CropRect, EXPOSURE_LIMIT, PhotoEdit, SLIDER_LIMIT, Wheel};
 
 use crate::basic::{self, Neighbourhood, Prepared};
-use crate::brush::{self, Dab};
+use crate::brush::{self, Dab, Proxy};
 use crate::{acescct, hue, wheels};
 
 /// The chroma above `chroma_low` at which a colour range is fully on.
@@ -137,14 +137,16 @@ pub fn colour(range: &ColourRange, px: [f32; 3]) -> f32 {
     by_hue * by_chroma
 }
 
-/// The alpha of one source at a normalised position over a source pixel.
+/// The alpha of one source at a normalised position over a source pixel. A
+/// brush that holds an auto stroke needs the proxy of its source and goes
+/// through [`StampedMask`].
 pub fn source_alpha(source: &MaskSource, at: [f32; 2], aspect: [f32; 2], px: [f32; 3]) -> f32 {
     match source {
         MaskSource::Linear(gradient) => linear(gradient, at, aspect),
         MaskSource::Radial(gradient) => radial(gradient, at, aspect),
         MaskSource::Luminance(range) => luminance(range, px),
         MaskSource::Colour(range) => colour(range, px),
-        MaskSource::Brush(painted) => brush::brush_alpha(painted, at, aspect),
+        MaskSource::Brush(painted) => brush::brush_alpha(painted, at, aspect, px, None),
     }
 }
 
@@ -161,11 +163,12 @@ pub fn combine(a: f32, b: f32, op: MaskOp) -> f32 {
 /// pixel: its components combined in order from 0, then the mask's invert.
 /// The opacity is not part of it.
 pub fn alpha(mask: &Mask, at: [f32; 2], aspect: [f32; 2], px: [f32; 3]) -> f32 {
-    StampedMask::new(mask, aspect).alpha(at, px, &|layer| layer)
+    StampedMask::new(mask, aspect, None).alpha(at, px, &|layer| layer)
 }
 
-/// A sanitised mask with the dabs of its brushes stamped once, for the alpha
-/// of many positions.
+/// A sanitised mask with the dabs of its brushes stamped once, and the
+/// references of its auto strokes read once from the proxy of the source, for
+/// the alpha of many positions.
 pub struct StampedMask<'a> {
     mask: &'a Mask,
     aspect: [f32; 2],
@@ -174,12 +177,12 @@ pub struct StampedMask<'a> {
 }
 
 impl<'a> StampedMask<'a> {
-    pub fn new(mask: &'a Mask, aspect: [f32; 2]) -> Self {
+    pub fn new(mask: &'a Mask, aspect: [f32; 2], proxy: Option<&Proxy>) -> Self {
         let dabs = mask
             .components
             .iter()
             .map(|component| match &component.source {
-                MaskSource::Brush(painted) => Some(brush::dabs(painted, aspect)),
+                MaskSource::Brush(painted) => Some(brush::dabs(painted, aspect, proxy)),
                 _ => None,
             })
             .collect();
@@ -193,7 +196,7 @@ impl<'a> StampedMask<'a> {
         let components = self.mask.components.iter().zip(&self.dabs);
         let combined = components.fold(0.0, |a, (component, dabs)| {
             let b = match dabs {
-                Some(dabs) => brush::dabs_alpha(dabs, at, self.aspect, layer_store),
+                Some(dabs) => brush::dabs_alpha(dabs, at, self.aspect, px, layer_store),
                 None => source_alpha(&component.source, at, self.aspect, px),
             };
             combine(a, if component.invert { 1.0 - b } else { b }, component.op)
@@ -225,17 +228,20 @@ pub fn stored_alpha_stepping(alpha: f32, bias: f32) -> f32 {
 
 /// The alpha of a mask over every pixel of a render, as the GPU stores it.
 pub fn alpha_image(mask: &Mask, pixels: &[[f32; 3]], geometry: &Geometry) -> Vec<f32> {
-    alpha_image_with(mask, pixels, geometry, &|layer| layer)
+    alpha_image_with(mask, pixels, geometry, None, &|layer| layer)
 }
 
-/// [`alpha_image`] with the rounding of the layer a brush is stamped into.
+/// [`alpha_image`] with the proxy of the source, which an auto stroke reads
+/// its references from, and the rounding of the layer a brush is stamped
+/// into.
 pub fn alpha_image_with(
     mask: &Mask,
     pixels: &[[f32; 3]],
     geometry: &Geometry,
+    proxy: Option<&Proxy>,
     layer_store: &dyn Fn(f32) -> f32,
 ) -> Vec<f32> {
-    alpha_image_before_the_store(mask, pixels, geometry, layer_store)
+    alpha_image_before_the_store(mask, pixels, geometry, proxy, layer_store)
         .into_iter()
         .map(stored_alpha)
         .collect()
@@ -247,10 +253,11 @@ pub fn alpha_image_before_the_store(
     mask: &Mask,
     pixels: &[[f32; 3]],
     geometry: &Geometry,
+    proxy: Option<&Proxy>,
     layer_store: &dyn Fn(f32) -> f32,
 ) -> Vec<f32> {
     let mask = mask.sanitised();
-    let stamped = StampedMask::new(&mask, geometry.aspect());
+    let stamped = StampedMask::new(&mask, geometry.aspect(), proxy);
     let width = geometry.size.0;
     pixels
         .iter()
@@ -348,6 +355,8 @@ pub struct Image<'a> {
     pub texture: &'a [f32],
     pub transmission: &'a [f32],
     pub geometry: Geometry,
+    /// The proxy of the whole source. An edit with an auto stroke needs it.
+    pub proxy: Option<&'a Proxy>,
 }
 
 /// The develop of a whole render with its masks: the global develop of every
@@ -390,7 +399,13 @@ pub fn develop_image_with(
         .map(|(i, px)| basic::develop_pixel_with(*px, &around(i), edit, &prepared).map(store))
         .collect();
     for (_, mask) in active_masks(edit) {
-        let alphas = alpha_image_with(&mask, image.pixels, &image.geometry, layer_store);
+        let alphas = alpha_image_with(
+            &mask,
+            image.pixels,
+            &image.geometry,
+            image.proxy,
+            layer_store,
+        );
         let effective = PhotoEdit::from(effective_adjustments(&edit.adjust, &mask.adjust));
         let prepared = Prepared::composed(&edit.adjust, &mask.adjust, atmosphere);
         for (i, px) in image.pixels.iter().enumerate() {
@@ -868,6 +883,7 @@ mod tests {
             texture: &luma,
             transmission: &clear,
             geometry,
+            proxy: None,
         };
         let plain = PhotoEdit::from(busy_global());
         let mut masked = plain.clone();
@@ -891,6 +907,7 @@ mod tests {
             texture: &luma,
             transmission: &clear,
             geometry,
+            proxy: None,
         };
         let everywhere = || Mask {
             invert: true,
@@ -937,6 +954,7 @@ mod tests {
             texture: &luma,
             transmission: &clear,
             geometry,
+            proxy: None,
         };
         let mut mask = Mask {
             invert: true,
@@ -1008,5 +1026,57 @@ mod tests {
             stored_alpha(alpha(&mask, pixel, SQUARE, GREY))
         );
         assert!(image[4 * 8 + 5] > 0.0);
+    }
+
+    #[test]
+    fn an_auto_dab_reads_the_same_reference_in_a_window_that_leaves_its_centre_outside() {
+        use gamut_core::brush::{Brush, SharedStroke, Stroke};
+        const SKY: [f32; 3] = [0.2, 0.4, 0.8];
+        const ROOF: [f32; 3] = [0.4, 0.2, 0.1];
+        // 200 pixels square, sky left of 0.45 and roof right of it.
+        let source: Vec<[f32; 3]> = (0..200 * 200)
+            .map(|i| if i % 200 < 90 { SKY } else { ROOF })
+            .collect();
+        let proxy = Proxy::from_source(&source, (200, 200), &|v| v);
+        let mask = Mask::new(
+            "Sky",
+            MaskSource::Brush(Brush {
+                strokes: vec![SharedStroke::new(&Stroke {
+                    points: vec![[0.3, 0.5]],
+                    size: 0.2,
+                    feather: 40.0,
+                    auto: true,
+                    ..Stroke::default()
+                })],
+            }),
+        );
+        let full = Geometry::full((200, 200), (200, 200));
+        let whole = alpha_image_with(&mask, &source, &full, Some(&proxy), &|a| a);
+        // The same source pixels from 0.4 to 0.6: the centre at 0.3 is not
+        // among them, and the window alone holds no sky left of 0.4.
+        let window = Geometry {
+            window: CropRect {
+                x: 0.4,
+                y: 0.4,
+                width: 0.2,
+                height: 0.2,
+            },
+            size: (40, 40),
+            photo: (200, 200),
+        };
+        let seen: Vec<[f32; 3]> = (0..40 * 40)
+            .map(|i| source[(80 + i / 40) * 200 + 80 + i % 40])
+            .collect();
+        let part = alpha_image_with(&mask, &seen, &window, Some(&proxy), &|a| a);
+        for (i, alpha) in part.iter().enumerate() {
+            assert_eq!(
+                *alpha,
+                whole[(80 + i / 40) * 200 + 80 + i % 40],
+                "pixel {i}"
+            );
+        }
+        assert!(part[20 * 40 + 5] > 0.5, "sky inside the dab is painted");
+        assert_eq!(part[20 * 40 + 15], 0.0, "roof inside the dab is not");
+        assert_eq!(part[20 * 40 + 30], 0.0, "and past the dab nothing is");
     }
 }
