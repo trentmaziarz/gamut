@@ -295,8 +295,8 @@ pub const MAX_REFINE_RADIUS: f32 = 0.05;
 pub struct Refine {
     /// How much of the refined alpha is taken, 0 (off) to 100.
     pub amount: f32,
-    /// How far the filter looks for an edge, as a fraction of the longer
-    /// side of the photo.
+    /// How far off an edge the mask may be for the filter to move it there,
+    /// as a fraction of the longer side of the photo.
     pub radius: f32,
     /// How weak an edge still holds the mask, 0 (only strong edges) to 100.
     pub sensitivity: f32,
