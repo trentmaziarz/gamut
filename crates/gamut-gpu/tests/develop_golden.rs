@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use gamut_color::SourceSpace;
 use gamut_color::basic;
+use gamut_color::brush::Proxy;
 use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::{dehaze, local, matrices, transfer};
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
@@ -209,6 +210,9 @@ fn cpu_reference(
             .into_iter()
             .map(|t| half_steps(t, transmission_step))
             .collect();
+    // What an auto stroke reads its references from: the working pixels of
+    // the whole source under a box filter, kept in a half float texture.
+    let proxy = Proxy::from_source(&linear, (width, height), &store);
     // The global develop and the ordered blend of the masks live in
     // gamut-color; the developed texture is a half float store after the
     // global pass and after every blend.
@@ -218,7 +222,7 @@ fn cpu_reference(
         texture: &texture,
         transmission: &transmission,
         geometry: Geometry::full((width, height), (width, height)),
-        proxy: None,
+        proxy: Some(&proxy),
     };
     // A brush layer is a half float the dabs blend into: a store a dab.
     mask_twin::develop_image_with(&image, edit, atmosphere, &store, &store)
@@ -230,11 +234,12 @@ fn cpu_reference(
 fn gpu_render(gpu: &Headless, photo: &Photo, edit: &PhotoEdit) -> Vec<[u8; 3]> {
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_source(photo);
+    let size = (photo.width, photo.height);
     let view = develop
-        .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+        .render(edit, CropRect::FULL, size, size)
         .expect("a source is set");
     Readback::new(&gpu.device)
-        .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+        .read(&gpu.device, &gpu.queue, view, size.0, size.1)
         .as_chunks::<4>()
         .0
         .iter()
@@ -1835,4 +1840,446 @@ fn a_stroke_painted_in_ten_appended_pieces_equals_the_stroke_drawn_whole() {
         assert_eq!(develop.brush_layer_builds(), 3);
         assert!(max_difference(&undone, &pieces[9]) <= 1);
     }
+}
+
+fn auto(stroke: Stroke, sensitivity: f32) -> Stroke {
+    Stroke {
+        auto: true,
+        sensitivity,
+        ..stroke
+    }
+}
+
+/// Two auto strokes that run along an edge of the photo, where a gate shows:
+/// one down the colours beside the grey ramp of the first columns, one along
+/// the colours above the near-black band at the bottom, each wide enough to
+/// reach over its edge. A stroke across the smooth hues would show almost
+/// nothing: every dab takes the colour under its own centre.
+fn auto_strokes(sensitivity: f32) -> Vec<Stroke> {
+    vec![
+        auto(
+            stroke(&[[0.17, 0.1], [0.17, 0.8]], 0.12, 60.0, 100.0),
+            sensitivity,
+        ),
+        auto(
+            stroke(&[[0.25, 0.82], [0.9, 0.82]], 0.1, 30.0, 100.0),
+            sensitivity,
+        ),
+    ]
+}
+
+fn assert_the_gate_shows(edit: &PhotoEdit) {
+    let mut plain = edit.clone();
+    for mask in &mut plain.masks {
+        for component in &mut mask.components {
+            if let MaskSource::Brush(brush) = &mut component.source {
+                for stroke in &mut brush.strokes {
+                    *stroke = SharedStroke::new(&Stroke {
+                        auto: false,
+                        ..(**stroke).clone()
+                    });
+                }
+            }
+        }
+    }
+    let photo = synthetic_photo();
+    let gated = cpu_reference(&photo, edit, Rounding::Nearest, 0);
+    let ungated = cpu_reference(&photo, &plain, Rounding::Nearest, 0);
+    let moved = gated.iter().zip(&ungated).filter(|(a, b)| a != b).count();
+    assert!(
+        moved * 50 > gated.len(),
+        "the gate moves only {moved} of {} pixels",
+        gated.len()
+    );
+}
+
+#[test]
+fn an_auto_brush_mask_matches() {
+    let edit = masked(vec![exposure_mask(
+        "Auto",
+        brush_source(&auto_strokes(70.0)),
+    )]);
+    assert_the_gate_shows(&edit);
+    check_masks("auto brush mask", &edit);
+}
+
+#[test]
+fn an_auto_brush_at_a_sensitivity_of_0_and_of_100_matches() {
+    let at = |sensitivity: f32| {
+        masked(vec![exposure_mask(
+            "Auto",
+            brush_source(&auto_strokes(sensitivity)),
+        )])
+    };
+    let photo = synthetic_photo();
+    assert_ne!(
+        cpu_reference(&photo, &at(0.0), Rounding::Nearest, 0),
+        cpu_reference(&photo, &at(100.0), Rounding::Nearest, 0),
+        "the sensitivity shows"
+    );
+    check_masks("auto brush at sensitivity 0", &at(0.0));
+    assert_the_gate_shows(&at(100.0));
+    // At 100 the gate lets so little through that the mask moves under a
+    // twentieth of the photo, which check_masks asks for; the twin is held
+    // all the same.
+    check("auto brush at sensitivity 100", &at(100.0));
+}
+
+#[test]
+fn an_auto_erase_stroke_matches() {
+    // Painted over the grey columns and the colours beside them, then erased
+    // down the colours: the grey keeps its paint.
+    let strokes = [
+        stroke(&[[0.12, 0.1], [0.12, 0.8]], 0.12, 40.0, 100.0),
+        Stroke {
+            erase: true,
+            ..auto(
+                stroke(&[[0.17, 0.15], [0.17, 0.75]], 0.12, 50.0, 80.0),
+                70.0,
+            )
+        },
+    ];
+    let erased = masked(vec![exposure_mask("Erased", brush_source(&strokes))]);
+    assert_the_gate_shows(&erased);
+    check_masks("auto erase stroke", &erased);
+}
+
+#[test]
+fn an_auto_brush_subtracted_from_a_radial_gradient_matches() {
+    // A radial gradient over the grey columns and the colours beside them;
+    // the auto strokes take the colours out of it and leave the grey.
+    let over_the_edge = MaskSource::Radial(RadialGradient {
+        centre: [0.15, 0.45],
+        radius: [0.25, 0.35],
+        rotation: 0.0,
+        feather: 40.0,
+    });
+    let mut mask = exposure_mask("Both", over_the_edge);
+    mask.components.push(Component {
+        op: MaskOp::Subtract,
+        source: brush_source(&auto_strokes(60.0)),
+        invert: false,
+    });
+    let edit = masked(vec![mask]);
+    assert_the_gate_shows(&edit);
+    check_masks("auto brush subtracted from a radial gradient", &edit);
+}
+
+/// A stroke of a pen that pressed harder as it went, with the two flags.
+fn pen_strokes(size: bool, flow: bool) -> Vec<Stroke> {
+    let pen = |stroke: Stroke, pressure: &[f32]| Stroke {
+        pressure: pressure.to_vec(),
+        pressure_size: size,
+        pressure_flow: flow,
+        ..stroke
+    };
+    let [first, second] = painted_strokes().try_into().expect("two strokes");
+    vec![
+        pen(first, &[0.1, 0.55, 1.0]),
+        pen(second, &[1.0, 0.3, 0.05]),
+    ]
+}
+
+#[test]
+fn a_pressure_stroke_matches_with_the_flow_with_the_size_and_with_both() {
+    let photo = synthetic_photo();
+    let render = |size: bool, flow: bool| {
+        let edit = masked(vec![exposure_mask(
+            "Pen",
+            brush_source(&pen_strokes(size, flow)),
+        )]);
+        cpu_reference(&photo, &edit, Rounding::Nearest, 0)
+    };
+    let unpressed = render(false, false);
+    assert_eq!(
+        unpressed,
+        cpu_reference(
+            &photo,
+            &masked(vec![exposure_mask("Brush", painted_source())]),
+            Rounding::Nearest,
+            0
+        ),
+        "with both flags off the pressure changes nothing"
+    );
+    for (size, flow) in [(false, true), (true, false), (true, true)] {
+        assert_ne!(render(size, flow), unpressed, "the pressure shows");
+        check_masks(
+            &format!("pressure stroke, size {size}, flow {flow}"),
+            &masked(vec![exposure_mask(
+                "Pen",
+                brush_source(&pen_strokes(size, flow)),
+            )]),
+        );
+    }
+    let mut both = pen_strokes(true, true);
+    both[0] = auto(both[0].clone(), 50.0);
+    check_masks(
+        "auto pressure stroke",
+        &masked(vec![exposure_mask("Pen", brush_source(&both))]),
+    );
+}
+
+/// A photo wider than the proxy. At 1536 by 48 the proxy is 1024 by 32 and
+/// each of its pixels covers one and a half source pixels each way. Blocks
+/// of hue across, brighter down, under stripes three pixels wide, so a proxy
+/// that sampled a point and one that averaged a box read different colours.
+fn wide_photo(width: u32, height: u32) -> Photo {
+    let mut rgba8 = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let fy = y as f32 / (height - 1) as f32;
+            let (r, g, b) = match (x / 128) % 6 {
+                0 => (1.0, 0.25, 0.1),
+                1 => (0.9, 0.85, 0.1),
+                2 => (0.15, 0.9, 0.2),
+                3 => (0.1, 0.8, 0.9),
+                4 => (0.2, 0.25, 1.0),
+                _ => (0.9, 0.15, 0.85),
+            };
+            let stripe = if x % 3 == 0 { 0.55 } else { 1.0 };
+            let level = (0.35 + 0.6 * fy) * stripe;
+            for c in [r, g, b] {
+                rgba8.push((c * level * 255.0_f32).round() as u8);
+            }
+            rgba8.push(255);
+        }
+    }
+    Photo {
+        width,
+        height,
+        rgba8,
+        source: SourceSpace::Srgb,
+        bit_depth: 8,
+        has_alpha: false,
+    }
+}
+
+/// The proxy of a source larger than it is a real reduction: the tiles, the
+/// box filter of `proxy.wgsl` and the bilinear read of `brush.wgsl` against
+/// `Proxy::from_source` and `Proxy::sample`.
+#[test]
+fn an_auto_brush_on_a_photo_wider_than_the_proxy_matches() {
+    let photo = wide_photo(1536, 48);
+    // The radius is a share of the longer side: 0.012 is 18 pixels.
+    let strokes = [
+        auto(
+            stroke(&[[0.03, 0.5], [0.97, 0.5]], 0.012, 40.0, 100.0),
+            60.0,
+        ),
+        auto(stroke(&[[0.2, 0.2], [0.6, 0.8]], 0.02, 70.0, 60.0), 20.0),
+    ];
+    let edit = masked(vec![exposure_mask("Auto", brush_source(&strokes))]);
+    let with = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+    let without = cpu_reference(&photo, &PhotoEdit::default(), Rounding::Nearest, 0);
+    let moved = with.iter().zip(&without).filter(|(a, b)| a != b).count();
+    assert!(
+        moved * 20 > with.len(),
+        "the mask moves only {moved} pixels"
+    );
+    check_on("auto brush on a photo wider than the proxy", &photo, &edit);
+}
+
+/// A photo wider than a tile: at 4608 by 24 the proxy is 1024 by 5, each of
+/// its pixels covers four and a half source pixels across, and the source is
+/// drawn in three tiles. A reference read across a seam is the one the twin
+/// reads, which has no tiles.
+#[test]
+fn an_auto_brush_on_a_photo_of_several_proxy_tiles_matches() {
+    let photo = wide_photo(4608, 24);
+    assert_eq!(Proxy::size_for((4608, 24)), (1024, 5));
+    // The radius is a share of the longer side: 0.002 is 9 pixels.
+    let strokes = [
+        auto(
+            stroke(&[[0.01, 0.5], [0.99, 0.5]], 0.002, 40.0, 100.0),
+            60.0,
+        ),
+        auto(stroke(&[[0.3, 0.2], [0.7, 0.8]], 0.004, 70.0, 60.0), 20.0),
+    ];
+    let edit = masked(vec![exposure_mask("Auto", brush_source(&strokes))]);
+    let with = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+    let without = cpu_reference(&photo, &PhotoEdit::default(), Rounding::Nearest, 0);
+    let moved = with.iter().zip(&without).filter(|(a, b)| a != b).count();
+    assert!(
+        moved * 20 > with.len(),
+        "the mask moves only {moved} pixels"
+    );
+    check_on(
+        "auto brush on a photo of several proxy tiles",
+        &photo,
+        &edit,
+    );
+}
+
+/// An auto brush lies on the photo and reads its references from the proxy
+/// of the whole source: under a crop window and under a zoomed window at 100
+/// and at 200 percent of the fit it is where the full render has it, the dab
+/// whose centre the window leaves outside included.
+#[test]
+fn an_auto_brush_under_a_crop_window_and_a_zoomed_window_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let mut strokes = auto_strokes(60.0);
+    strokes.extend(
+        painted_strokes()
+            .into_iter()
+            .map(|stroke| auto(stroke, 40.0)),
+    );
+    // Its centre is left of every window below and it reaches into what is
+    // seen. At a sensitivity of 0 the colours it reaches lie on the fall of
+    // its gate, where a reference read from anywhere else would show.
+    strokes.push(auto(stroke(&[[0.12, 0.45]], 0.3, 20.0, 80.0), 0.0));
+    let mut brush = exposure_mask("Auto", brush_source(&strokes));
+    brush.adjust.clarity = 30.0;
+    let masks = vec![brush, exposure_mask("Radial", radial_source())];
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+
+    let crop = CropRect {
+        x: 0.25,
+        y: 0.25,
+        width: 0.5,
+        height: 0.5,
+    };
+    let output = (32, 32);
+    let masks_only = masked(masks.clone());
+    let full = develop
+        .render(&masks_only, crop, (SIZE, SIZE), output)
+        .expect("a source is set");
+    let full = readback.read(&gpu.device, &gpu.queue, full, output.0, output.1);
+    let windowed = develop
+        .render_crop(&masks_only, crop, output)
+        .expect("a source is set");
+    let windowed = readback.read(&gpu.device, &gpu.queue, windowed, output.0, output.1);
+    let max = max_difference(&full, &windowed);
+    println!("auto brush under a crop window against the full render: max difference {max}");
+    assert!(max <= 1, "max difference {max}");
+
+    let mut edit = everything_global();
+    edit.masks = masks;
+    let mut without_the_far_dab = edit.clone();
+    let MaskSource::Brush(painted) = &mut without_the_far_dab.masks[0].components[0].source else {
+        panic!("a brush");
+    };
+    painted.strokes.pop();
+    for view in zoomed_views() {
+        let full = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let without = view_render_of(&mut develop, &gpu, &readback, &without_the_far_dab, &view);
+        let max = max_difference(&full, &zoomed);
+        println!(
+            "auto brush under a zoomed window at {:?} against the full render: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+        assert_ne!(
+            zoomed, without,
+            "the dab whose centre is outside shows inside the window"
+        );
+    }
+    assert_eq!(develop.proxy_builds(), 1, "one source, one proxy");
+}
+
+/// A layer with no auto stroke reads no source pixel and outlives a new
+/// content on the same frame; a layer with one does not. The proxy is built
+/// once a source content, by no window and by no slider.
+#[test]
+fn an_auto_layer_is_stamped_again_by_a_new_source_content_and_a_plain_one_is_not() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace};
+    use gamut_media::VideoFrame;
+    // A video is the source whose content changes under a frame that stays:
+    // two frames of one size.
+    let frame = |luma: u8| VideoFrame {
+        pts_seconds: 0.0,
+        format: PlaneFormat::Nv12,
+        width: SIZE,
+        height: SIZE,
+        y: (0..SIZE * SIZE)
+            .map(|i| luma.wrapping_add((i % SIZE) as u8))
+            .collect(),
+        uv: vec![128; (SIZE * SIZE / 2) as usize],
+        y_stride: SIZE as usize,
+        uv_stride: SIZE as usize,
+    };
+    let colour = VideoColour {
+        space: YuvSpace::Bt709,
+        transfer: Transfer::Sdr,
+        full_range: false,
+    };
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_video_frame(&frame(40), colour, 0);
+    let plain = masked(vec![exposure_mask("Plain", painted_source())]);
+    let gated = masked(vec![
+        exposure_mask("Plain", painted_source()),
+        exposure_mask("Auto", brush_source(&auto_strokes(50.0))),
+    ]);
+    let [view, _] = zoomed_views();
+    let counts_after = |develop: &mut Develop, edit: &PhotoEdit, view: &ViewWindow| {
+        develop.render_view(edit, view).expect("a source is set");
+        (develop.brush_layer_builds(), develop.proxy_builds())
+    };
+    assert_eq!(
+        counts_after(&mut develop, &plain, &view),
+        (1, 0),
+        "no auto stroke, no proxy"
+    );
+    develop.set_video_frame(&frame(90), colour, 0);
+    assert_eq!(
+        counts_after(&mut develop, &plain, &view),
+        (1, 0),
+        "a plain layer outlives a new content"
+    );
+
+    assert_eq!(
+        counts_after(&mut develop, &gated, &view),
+        (2, 1),
+        "the auto layer and its proxy"
+    );
+    assert_eq!(
+        counts_after(&mut develop, &gated, &view),
+        (2, 1),
+        "the same again"
+    );
+    let mut slid = gated.clone();
+    slid.masks[1].adjust.exposure = -0.5;
+    slid.exposure = 0.3;
+    assert_eq!(
+        counts_after(&mut develop, &slid, &view),
+        (2, 1),
+        "a slider draws neither"
+    );
+
+    develop.set_video_frame(&frame(140), colour, 0);
+    assert_eq!(
+        counts_after(&mut develop, &slid, &view),
+        (3, 2),
+        "a new content: the auto layer and the proxy, not the plain layer"
+    );
+
+    // A window replaced is a new frame: both layers again, the proxy not.
+    let elsewhere = ViewWindow {
+        window: (2, 2, 18, 20),
+        visible: (4, 4, 10, 12),
+        ..view
+    };
+    assert_eq!(
+        counts_after(&mut develop, &slid, &elsewhere),
+        (5, 2),
+        "a window replaced builds no proxy"
+    );
 }

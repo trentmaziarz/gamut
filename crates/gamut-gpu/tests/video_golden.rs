@@ -8,6 +8,7 @@
 use std::sync::Mutex;
 
 use gamut_color::basic;
+use gamut_color::brush::Proxy;
 use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
@@ -29,6 +30,16 @@ const MEAN_DIFFERENCE: f64 = 0.5;
 /// Luma across from below black to above white, Cb across the chroma
 /// plane, Cr down it, so every code range and both clips are covered.
 fn synthetic_frame(format: PlaneFormat) -> VideoFrame {
+    frame_with_luma(format, &|x| 8.0 + 237.0 * x as f32 / (SIZE - 1) as f32)
+}
+
+/// A frame of other colours under the same chroma: a flat mid grey luma, so
+/// what was a ramp of brightness across is even.
+fn second_frame(format: PlaneFormat) -> VideoFrame {
+    frame_with_luma(format, &|_| 120.0)
+}
+
+fn frame_with_luma(format: PlaneFormat, luma_at_column: &dyn Fn(u32) -> f32) -> VideoFrame {
     let scale = match format {
         PlaneFormat::Nv12 => 1u32,
         PlaneFormat::P010 => 4,
@@ -41,8 +52,7 @@ fn synthetic_frame(format: PlaneFormat) -> VideoFrame {
     let mut y = Vec::new();
     for _row in 0..SIZE {
         for x in 0..SIZE {
-            let luma = 8.0 + 237.0 * x as f32 / (SIZE - 1) as f32;
-            store(code(luma), &mut y);
+            store(code(luma_at_column(x)), &mut y);
         }
     }
     let half = SIZE / 2;
@@ -148,6 +158,9 @@ fn cpu_reference(
         // The masks of a frame blend as the masks of a photo do; the twin of
         // that blend is gamut-color's develop_image.
         let store = |v: f32| half(v, rounding);
+        // What an auto stroke reads its references from: the frame under
+        // the playhead, reduced as a photo is.
+        let proxy = Proxy::from_source(&linear, (SIZE, SIZE), &store);
         let base: Vec<f32> = base.iter().map(|b| store(*b)).collect();
         let luma: Vec<f32> = linear.iter().map(|px| basic::luma(*px)).collect();
         let clear = vec![1.0; linear.len()];
@@ -157,7 +170,7 @@ fn cpu_reference(
             texture: &luma,
             transmission: &clear,
             geometry: Geometry::full((SIZE, SIZE), (SIZE, SIZE)),
-            proxy: None,
+            proxy: Some(&proxy),
         };
         return mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
             .into_iter()
@@ -222,19 +235,27 @@ fn check_with(
         return;
     }
     let frame = synthetic_frame(format);
-    let nearest = cpu_reference(&frame, colour, rotation, Rounding::Nearest, edit);
-    let toward_zero = cpu_reference(&frame, colour, rotation, Rounding::TowardZero, edit);
     let gpu_pixels = gpu_render(&gpu, &frame, colour, rotation, edit);
+    hold_to_the_twin(name, &frame, colour, rotation, edit, &gpu_pixels);
+}
+
+/// Holds what the GPU drew of a frame to the twin, under either rounding of
+/// a half float store.
+fn hold_to_the_twin(
+    name: &str,
+    frame: &VideoFrame,
+    colour: VideoColour,
+    rotation: u32,
+    edit: &PhotoEdit,
+    gpu_pixels: &[[u8; 3]],
+) {
+    let nearest = cpu_reference(frame, colour, rotation, Rounding::Nearest, edit);
+    let toward_zero = cpu_reference(frame, colour, rotation, Rounding::TowardZero, edit);
     assert_eq!(nearest.len(), gpu_pixels.len());
     let mut max = 0;
     let mut sum = 0u64;
     let mut worst = (0usize, [0u8; 3], [0u8; 3]);
-    for (i, ((n, z), g)) in nearest
-        .iter()
-        .zip(&toward_zero)
-        .zip(&gpu_pixels)
-        .enumerate()
-    {
+    for (i, ((n, z), g)) in nearest.iter().zip(&toward_zero).zip(gpu_pixels).enumerate() {
         for k in 0..3 {
             let d = (i32::from(n[k]) - i32::from(g[k]))
                 .abs()
@@ -272,6 +293,94 @@ const HLG: VideoColour = VideoColour {
     transfer: Transfer::Hlg,
     full_range: false,
 };
+
+/// An auto brush on a video reads the frame under the playhead: the mask is
+/// fixed on the frame and its gate follows the colours of each frame. One
+/// graph is given two frames in turn. Its layer reads the source, so the
+/// second frame has it stamped again, and each render is held to the twin of
+/// its own frame.
+#[test]
+fn an_auto_brush_on_a_frame_matches_the_twin_and_follows_the_next_frame() {
+    let stroke = |points: &[[f32; 2]], size: f32, erase: bool| {
+        SharedStroke::new(&Stroke {
+            points: points.to_vec(),
+            size,
+            feather: 40.0,
+            flow: 100.0,
+            erase,
+            auto: true,
+            sensitivity: 85.0,
+            ..Stroke::default()
+        })
+    };
+    // Down the frame, across which the first frame runs from dark to bright:
+    // the gate keeps each dab to the columns of its own brightness.
+    let mut mask = Mask::new(
+        "Auto",
+        MaskSource::Brush(Brush {
+            strokes: vec![
+                stroke(&[[0.35, 0.15], [0.4, 0.85]], 0.2, false),
+                stroke(&[[0.7, 0.2], [0.65, 0.8]], 0.15, false),
+                stroke(&[[0.3, 0.5], [0.75, 0.5]], 0.06, true),
+            ],
+        }),
+    );
+    mask.adjust.exposure = 1.2;
+    let alpha_on = |frame: &VideoFrame| {
+        let linear: Vec<[f32; 3]> = (0..SIZE)
+            .flat_map(|dy| (0..SIZE).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| linear_at(frame, SDR, 0, dx, dy))
+            .collect();
+        let proxy = Proxy::from_source(&linear, (SIZE, SIZE), &|v| v);
+        let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+        mask_twin::alpha_image_with(&mask, &linear, &geometry, Some(&proxy), &|a| a)
+    };
+    let frames = [
+        synthetic_frame(PlaneFormat::Nv12),
+        second_frame(PlaneFormat::Nv12),
+    ];
+    let (first, second) = (alpha_on(&frames[0]), alpha_on(&frames[1]));
+    let differing = first.iter().zip(&second).filter(|(a, b)| a != b).count();
+    assert!(
+        differing * 20 > first.len(),
+        "the same strokes give another alpha on other colours: {differing} pixels differ"
+    );
+    let edit = PhotoEdit {
+        masks: vec![mask.clone()],
+        ..PhotoEdit::default()
+    };
+
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    let readback = Readback::new(&gpu.device);
+    for (index, frame) in frames.iter().enumerate() {
+        develop.set_video_frame(frame, SDR, 0);
+        let view = develop
+            .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        let gpu_pixels: Vec<[u8; 3]> = readback
+            .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect();
+        let name = format!("auto brush on nv12 frame {}", index + 1);
+        hold_to_the_twin(&name, frame, SDR, 0, &edit, &gpu_pixels);
+        assert_eq!(
+            (develop.brush_layer_builds(), develop.proxy_builds()),
+            (index as u64 + 1, index as u64 + 1),
+            "each frame stamps the auto layer and builds the proxy once"
+        );
+    }
+}
 
 #[test]
 fn an_nv12_bt709_frame_matches_the_twin() {
