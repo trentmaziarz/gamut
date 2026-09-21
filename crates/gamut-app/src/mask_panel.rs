@@ -1,7 +1,7 @@
 //! The Masks section of the Adjust tab: the list of masks, the buttons that
-//! make one of each source, and under the selected mask its opacity, invert
-//! and overlay, its components with their operators, and the numbers of each
-//! source. A brush component has a Paint button that arms it, the settings
+//! make one of each source, and under the selected mask its opacity, Refine
+//! edges, invert and overlay, its components with their operators, and the
+//! numbers of each source. A brush component has a Paint button that arms it, the settings
 //! of the brush, how many strokes it holds and Clear strokes.
 //!
 //! Selecting a mask is what points the Basic, Presence, Curve, Mixer and
@@ -12,7 +12,8 @@
 use gamut_core::brush::{Brush, MAX_BRUSH_SIZE, MIN_BRUSH_SIZE, MIN_FLOW};
 use gamut_core::mask::{
     ColourRange, Component, LinearGradient, LuminanceRange, MAX_COMPONENTS, MAX_MASKS, MAX_RADIUS,
-    MIN_RADIUS, Mask, MaskOp, MaskSource, RadialGradient, free_name,
+    MAX_REFINE_RADIUS, MIN_RADIUS, MIN_REFINE_RADIUS, Mask, MaskOp, MaskSource, RadialGradient,
+    Refine, free_name,
 };
 
 use crate::adjust::AdjustState;
@@ -404,6 +405,42 @@ fn mask_list(ui: &mut egui::Ui, masks: &mut Vec<Mask>, adjust: &mut AdjustState)
 
 /// What the selected mask holds apart from its adjustments. `can_pick` is
 /// false when no photo is open to pick a range from.
+/// The Radius of Refine edges as the slider shows it: percent of the longer
+/// side of the photo.
+const REFINE_RADIUS_PERCENT: std::ops::RangeInclusive<f32> =
+    MIN_REFINE_RADIUS * 100.0..=MAX_REFINE_RADIUS * 100.0;
+
+/// Refine edges of the selected mask: how much of it is taken, and while
+/// that is over 0 how far off an edge the mask may be and how weak an edge
+/// still holds it. They are edits, saved with the mask. Whether one changed.
+fn refine_fields(ui: &mut egui::Ui, refine: &mut Refine) -> bool {
+    let mut edited = ui
+        .add(egui::Slider::new(&mut refine.amount, 0.0..=100.0).text("Refine edges"))
+        .on_hover_text("Moves a loose edge of the mask onto the edge of the thing under it")
+        .changed();
+    if refine.amount > 0.0 {
+        let mut percent = refine.radius * 100.0;
+        let radius = egui::Slider::new(&mut percent, REFINE_RADIUS_PERCENT)
+            .logarithmic(true)
+            .fixed_decimals(2)
+            .suffix(" %")
+            .text("Radius");
+        if ui
+            .add(radius)
+            .on_hover_text("How far off the edge the mask may be, as a share of the longer side")
+            .changed()
+        {
+            refine.radius = percent / 100.0;
+            edited = true;
+        }
+        edited |= ui
+            .add(egui::Slider::new(&mut refine.sensitivity, 0.0..=100.0).text("Edge sensitivity"))
+            .on_hover_text("How weak an edge still holds the mask")
+            .changed();
+    }
+    edited
+}
+
 fn selected_mask(
     ui: &mut egui::Ui,
     mask: &mut Mask,
@@ -414,6 +451,7 @@ fn selected_mask(
     outcome.edited |= ui
         .add(egui::Slider::new(&mut mask.opacity, 0.0..=100.0).text("Opacity"))
         .changed();
+    outcome.edited |= refine_fields(ui, &mut mask.refine);
     ui.horizontal(|ui| {
         outcome.edited |= ui.checkbox(&mut mask.invert, "Invert").changed();
         outcome.view_changed |= ui
@@ -727,6 +765,128 @@ mod tests {
         // Unticked again, the checkbox is where it was.
         click(&ctx, &mut masks, &mut adjust, auto);
         assert!(!adjust.brush.auto);
+    }
+
+    /// A drag from a place of the section, 60 points to the right: the
+    /// pointer comes, presses, moves in two steps, lets go.
+    fn drag(
+        ctx: &egui::Context,
+        masks: &mut Vec<Mask>,
+        adjust: &mut AdjustState,
+        from: egui::Pos2,
+    ) -> Outcome {
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (half, to) = (
+            from + egui::Vec2::new(30.0, 0.0),
+            from + egui::Vec2::new(60.0, 0.0),
+        );
+        let mut whole = Outcome::default();
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![button(from, true)],
+            vec![egui::Event::PointerMoved(half)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![button(to, false)],
+            Vec::new(),
+        ] {
+            let part = panel_frame(ctx, masks, adjust, events);
+            whole.edited |= part.edited;
+            whole.view_changed |= part.view_changed;
+            whole.brush = part.brush.or(whole.brush);
+        }
+        whole
+    }
+
+    /// The first place, row by row, from which a drag makes `hit` true of
+    /// the selected mask, tried each time on a copy of the state.
+    fn drag_where(
+        ctx: &egui::Context,
+        masks: &[Mask],
+        adjust: &AdjustState,
+        rows: std::ops::Range<usize>,
+        hit: impl Fn(&Mask) -> bool,
+    ) -> Option<egui::Pos2> {
+        for y in rows.step_by(8) {
+            for x in (10..330).step_by(20) {
+                let at = egui::Pos2::new(x as f32, y as f32);
+                let (mut masks, mut adjust) = (masks.to_vec(), adjust.clone());
+                drag(ctx, &mut masks, &mut adjust, at);
+                if hit(&masks[1]) {
+                    return Some(at);
+                }
+            }
+        }
+        None
+    }
+
+    /// The Refine edges slider of the selected mask, dragged through egui:
+    /// Radius and Edge sensitivity show only while it is over 0, each drag
+    /// is an edit, and it is an edit of the selected mask alone.
+    #[test]
+    fn the_refine_edges_sliders_show_while_it_is_on_and_edit_the_selected_mask_alone() {
+        let ctx = egui::Context::default();
+        let mut masks = named(&["Other", "Chosen"]);
+        let mut adjust = AdjustState::default();
+        adjust.select_mask(Some(1));
+        let before = masks.clone();
+        // Warm up: egui tests a pointer against the widgets of the frame before.
+        panel_frame(&ctx, &mut masks, &mut adjust, Vec::new());
+        let default = Refine::default();
+        assert!(
+            drag_where(&ctx, &masks, &adjust, 0..1400, |mask| {
+                mask.refine.radius != default.radius
+                    || mask.refine.sensitivity != default.sensitivity
+            })
+            .is_none(),
+            "no Radius and no Edge sensitivity while Refine edges is at 0"
+        );
+        let amount = drag_where(&ctx, &masks, &adjust, 0..1400, |mask| {
+            mask.refine.amount > 0.0
+        })
+        .expect("a Refine edges slider to drag");
+        let outcome = drag(&ctx, &mut masks, &mut adjust, amount);
+        assert!(outcome.edited, "a drag of Refine edges is an edit");
+        assert!(masks[1].refine.amount > 0.0 && !masks[1].refine.is_off());
+        assert_eq!(masks[0], before[0], "the other mask stays as it was");
+        assert_eq!(
+            Mask {
+                refine: default,
+                ..masks[1].clone()
+            },
+            before[1],
+            "and nothing else of the chosen one moved"
+        );
+
+        // The two sliders it opens lie under it, Radius first.
+        let rows = amount.y as usize + 4..amount.y as usize + 80;
+        let radius = drag_where(&ctx, &masks, &adjust, rows.clone(), |mask| {
+            mask.refine.radius != default.radius
+        })
+        .expect("a Radius slider to drag");
+        let sensitivity = drag_where(&ctx, &masks, &adjust, rows, |mask| {
+            mask.refine.sensitivity != default.sensitivity
+        })
+        .expect("an Edge sensitivity slider to drag");
+        assert!(amount.y < radius.y && radius.y < sensitivity.y);
+        let held = masks[1].refine.amount;
+        assert!(drag(&ctx, &mut masks, &mut adjust, radius).edited);
+        assert!(drag(&ctx, &mut masks, &mut adjust, sensitivity).edited);
+        let refine = masks[1].refine;
+        assert_eq!(refine.amount, held);
+        assert!((MIN_REFINE_RADIUS..=MAX_REFINE_RADIUS).contains(&refine.radius));
+        assert_ne!(refine.radius, default.radius);
+        assert_ne!(refine.sensitivity, default.sensitivity);
+        assert_eq!(
+            refine,
+            refine.sanitised(),
+            "what the sliders give is in range"
+        );
+        assert_eq!(masks[0], before[0]);
     }
 
     #[test]
