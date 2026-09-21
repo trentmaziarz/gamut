@@ -101,27 +101,75 @@ bracket key or a click, and Alt, held while painting.
   0 is a hard edge, and 100 fades from the centre.
 - Flow runs from 1 to 100. It is how much one pass paints. Passes over the same
   place build up.
-- A stroke keeps the size, feather and flow it was painted with. Change a
-  setting afterwards and the change reaches the next stroke only.
-- The settings belong to the brush tool. They are not saved with the picture,
-  and undo does not change them.
+- Under Flow there is a checkbox named Auto mask. It is unticked when Gamut
+  starts.
+- The brush paints a stroke as a row of round marks laid close together, called
+  dabs. With Auto mask ticked, each dab paints only what is like the colour
+  under the centre of the brush at that dab.
+- The ring is the round pointer that shows the size of the brush over the
+  picture. Paint along the sky beside a tower and the stroke stops at the
+  tower's edge, even where the ring overlaps the tower.
+- The colour is read where the centre of the ring is. Keep the centre on the
+  thing you want painted. Move the centre onto the tower and the dabs there
+  paint the tower.
+- A stroke across an area whose colour changes slowly paints all of it, because
+  each dab takes the colour under its own centre. Everything the ring covers
+  there is close to the colour under its centre, so every dab paints all it
+  covers. Auto mask changes nothing you can see on such an area. The difference
+  appears where the brush crosses a clear edge, such as a roof against the sky.
+- While Auto mask is ticked, a Sensitivity slider shows under it. It runs from 0
+  to 100 and starts at 50.
+- A higher Sensitivity keeps the stroke to colours closer to the one under the
+  centre. At 100 a stroke over blue sky leaves thin white cloud unpainted. At 0
+  it takes in nearly everything the ring covers.
+- The colour compared is the colour of the picture before any edit. Moving a
+  slider never moves what an auto stroke covers.
+- Under Auto mask there is a row that reads "Pressure:" with two checkboxes,
+  Size and Flow. Flow is ticked and Size is unticked when Gamut starts.
+- The two Pressure checkboxes act with a pen that reports pressure.
+- With the Pressure checkbox Flow ticked, a lighter hand paints less and a
+  heavier hand paints more, up to the Flow setting. The lightest touch still
+  paints a twentieth of the Flow setting, so a light hand always leaves a mark.
+- With the Pressure checkbox Size ticked, a lighter hand paints a smaller dab.
+  The dab runs from a fifth of the Size setting at the lightest touch to the
+  full Size at full pressure.
+- Both Pressure checkboxes can be ticked together.
+- The ring shows the full Size, not the size at the current pressure.
+- A stroke keeps the size, feather, flow, Auto mask setting and Sensitivity it
+  was painted with. Change a setting afterwards and the change reaches the next
+  stroke only.
+- The settings belong to the brush tool, Auto mask, Sensitivity and the two
+  Pressure checkboxes included. They are not saved with the picture, undo does
+  not change them, and they are back at their starting values when Gamut starts
+  again.
 - A plain drag with the left button paints one stroke, anywhere on the picture.
   That includes inside the crop rectangle.
 - While you paint, the handles of the mask's other components are hidden.
-- A click without a move paints one dab, the single round mark the brush leaves.
+- A click without a move paints one dab.
 - Shift with a click paints a straight line from the end of the last stroke to
   the click. With nothing painted yet, it paints one dab.
+- A mouse and a finger on a touch screen paint at full pressure, whatever the
+  two Pressure checkboxes say.
+- One touch paints. A second finger on the screen ends the stroke where it is,
+  because two fingers are a pinch and a pinch zooms.
+- A stroke painted with a pen keeps the pressure of every point in the saved
+  file. It keeps which of the two Pressure checkboxes were ticked when it began.
 - Alt held during a drag makes that stroke erase. The Erase checkbox beside
   Paint does the same for every stroke until it is unticked.
 - An erase stroke takes away what was painted in that brush before it. It is an
   ordinary stroke, not an undo. Paint over the same place afterwards and there
   is paint there again.
+- Auto mask works with Erase and with Alt. An auto erase stroke takes paint away
+  only from what is like the colour under the centre.
 - Both pans and the wheel work as always while the brush is up. The pointer is
   the hand while Space is held. Painting works at every zoom.
 - [ makes the brush smaller and ] makes it larger. Each press is a factor of
   1.1.
 - Shift+[ lowers the feather by 5. Shift+] raises it by 5.
 - O shows and hides the overlay. The Show overlay checkbox does the same.
+- A is the key for Auto mask while the brush is in your hand. A alone ticks and
+  unticks the checkbox. With Shift or Ctrl held, A does not tick the checkbox.
+  Ctrl+A keeps its usual job in a text field, where it selects the text.
 - The overlay is red where the mask applies. Pressing Paint turns it on, so you
   see what you paint.
 - Putting the brush down returns the overlay to what it was before.
@@ -129,7 +177,10 @@ bracket key or a click, and Alt, held while painting.
   zoom. It shows what a dab will cover.
 - An inner ring marks where the feather starts.
 - A short dash in the middle of the ring means the next stroke erases.
-- A brush too small to draw as a ring shows as a small cross.
+- With Auto mask on, the ring has a small cross at its centre. The cross marks
+  where the colour is read.
+- A brush too small to draw as a ring shows as a small cross in place of the
+  ring.
 - The section shows how many strokes the brush holds, beside a Clear strokes
   button, which removes them all.
 - One brush holds up to 2,000 strokes. At 2,000 Gamut shows a message and the
@@ -137,8 +188,11 @@ bracket key or a click, and Alt, held while painting.
   component row and paint in that one.
 - A stroke is kept as the path the pointer took rather than as pixels, so
   strokes stay sharp at every zoom and in the export.
-- On a video the brush paints the frame under the playhead. The mask stays where
-  it was painted and does not follow motion.
+- On a video the brush paints the frame under the playhead. The strokes stay
+  where they were painted and do not follow motion.
+- With Auto mask, every frame is checked again inside those strokes. The part of
+  each stroke that is covered can change from frame to frame as colours move
+  under it. The strokes themselves do not move.
 
 ## Tone curve and sliders
 
@@ -226,11 +280,11 @@ bracket key or a click, and Alt, held while painting.
 - While you type in a text field, such as a preset or version name, the keys go
   to the text. F and Space are typed as characters, and the zoom keys do nothing
   to the picture.
-- The brush keys [, ], O and Esc go to the text as well, and leave the brush
+- The brush keys [, ], O, A and Esc go to the text as well, and leave the brush
   alone.
 - Ctrl+Z in a text field undoes your typing and leaves the picture alone.
-- With Paint off, [, ] and O do nothing.
-- Ctrl with [, ] or O is not a brush key. It does nothing to the brush.
+- With Paint off, [, ], O and A do nothing.
+- Ctrl with [, ], O or A is not a brush key. It does nothing to the brush.
 - The Save, Discard, Cancel question appears when you press Switch to in the
   Versions section while the picture has changes that were not saved into any
   version.
