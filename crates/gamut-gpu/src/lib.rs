@@ -16,6 +16,7 @@ pub mod develop;
 pub mod headless;
 mod proxy;
 pub mod readback;
+mod refine;
 pub mod test_image;
 pub mod video;
 

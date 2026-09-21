@@ -36,6 +36,14 @@
 //!   and uploaded only when a curve changes. It is read with `textureLoad`,
 //!   two loads and a mix, so it needs no filtering.
 //!
+//! A mask is an alpha the masked develop pass reads: `mask.wgsl` draws it from
+//! the mask's components, a head-pass product. With Refine edges on,
+//! `refine.wgsl` filters it against the working texture into a second alpha,
+//! the refined one, and the develop pass and the overlay read that instead.
+//! It is drawn again whenever the alpha is and when its own setting changes,
+//! never by a slider of the develop chain, and an edit with no refined mask
+//! runs none of its passes and holds none of its float targets.
+//!
 //! M2 lets a decoded video frame stand in for the photo: the source is
 //! then the two plane textures of [`crate::video::VideoSource`] and pass 2
 //! is `yuv_to_working.wgsl`, which writes the same linear Rec.2020 working
@@ -53,16 +61,18 @@ use gamut_color::hsl::HslParams;
 use gamut_color::local;
 use gamut_color::mask::{self as mask_twin, Geometry};
 use gamut_color::matrices;
+use gamut_color::refine::{self as refine_twin, Plan};
 use gamut_color::video::VideoColour;
 use gamut_color::wheels::Cdl;
 use gamut_core::brush::Brush;
 use gamut_core::look::ToneCurves;
-use gamut_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource};
+use gamut_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource, Refine};
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
 use crate::brush_layer::{AutoInputs, BrushPass, Drawn, Layers, has_auto};
 use crate::proxy::{self, ProxyUniform, Tile};
+use crate::refine::{RefinePass, Refined, Scratch};
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
@@ -343,6 +353,14 @@ impl Damage {
     }
 }
 
+/// `rect` with `by` pixels more on every side, inside a render of `size`.
+fn grow(rect: PixelRect, by: u32, size: (u32, u32)) -> PixelRect {
+    let (x0, y0) = (rect.0.saturating_sub(by), rect.1.saturating_sub(by));
+    let x1 = (rect.0 + rect.2 + by).min(size.0).max(x0);
+    let y1 = (rect.1 + rect.3 + by).min(size.1).max(y0);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
 /// The part of `a` inside `b`, when there is any.
 fn intersect(a: PixelRect, b: PixelRect) -> Option<PixelRect> {
     let (x0, y0) = (a.0.max(b.0), a.1.max(b.1));
@@ -439,16 +457,29 @@ struct Frame {
     /// What each mask of the list has on this frame, by its index in the
     /// list; nothing until the mask first runs.
     masks: [Option<FrameMask>; MAX_MASKS],
+    /// The float targets Refine edges works in, shared by the masks; nothing
+    /// while no mask of the edit is refined.
+    refine_scratch: Option<Scratch>,
 }
 
 /// The head-pass product of one mask: its alpha, cached like the texture
 /// layer and the transmission map.
 struct FrameMask {
     alpha: Target,
-    /// The shape `alpha` holds, or `None` when it has to be drawn again: the
-    /// head passes reran or the scissor moved. A slider of the mask's
-    /// adjustments is no part of the shape, so it never redraws the alpha.
+    /// The shape `alpha` holds, with no Refine edges in it, or `None` when it
+    /// has to be drawn again: the head passes reran or the scissor moved. A
+    /// slider of the mask's adjustments is no part of the shape, so it never
+    /// redraws the alpha.
     shape: Option<MaskShape>,
+    /// The pixels `alpha` was last drawn over whole. A refined mask reads
+    /// its alpha a filter's reach beyond the products.
+    alpha_region: PixelRect,
+    /// The refined alpha, while the mask has Refine edges on, and the
+    /// setting it holds, or `None` when it has to be drawn again.
+    refined: Option<Refined>,
+    refine: Option<Refine>,
+    /// Whether `develop_binds` read the refined alpha.
+    binds_refined: bool,
     /// The layers of the mask's brush components, which `raster_bind` holds.
     layers: Layers,
     raster_bind: wgpu::BindGroup,
@@ -488,8 +519,9 @@ struct Output {
     target: Target,
     bind: wgpu::BindGroup,
     frame_generation: u64,
-    /// The mask whose alpha the bind group holds for the overlay.
-    overlay: Option<usize>,
+    /// The mask whose alpha the bind group holds for the overlay, and
+    /// whether that is its refined alpha.
+    overlay: Option<(usize, bool)>,
 }
 
 /// The develop graph on one device. Build it once, set a source, render as
@@ -508,6 +540,12 @@ pub struct Develop {
     brush: BrushPass,
     /// `proxy.wgsl`: reduces a tile of the source into the proxy.
     reduce: Pass,
+    /// `refine.wgsl`: filters the alpha of a mask into its refined alpha.
+    refine: RefinePass,
+    /// How many times a refined alpha was drawn whole, and how many times
+    /// over the reach of new dabs only, for the cache test.
+    refine_builds: u64,
+    refine_patches: u64,
     proxy: Option<ProxyProduct>,
     /// How many proxies have been set up, and how many times one was built,
     /// for the cache test.
@@ -699,6 +737,9 @@ impl Develop {
                 WORKING_FORMAT,
                 &[uniform_entry(0), texture_entry(1)],
             ),
+            refine: RefinePass::new(device, ALPHA_FORMAT),
+            refine_builds: 0,
+            refine_patches: 0,
             proxy: None,
             proxy_ids: 0,
             proxy_builds: 0,
@@ -906,6 +947,34 @@ impl Develop {
 
     /// How many times the reference proxy of an auto brush was built. It is
     /// built once a source content and by no window and no slider.
+    /// How many times a refined alpha was drawn whole, and how many times
+    /// over the reach of new dabs only.
+    pub fn refine_builds(&self) -> (u64, u64) {
+        (self.refine_builds, self.refine_patches)
+    }
+
+    /// How far Refine edges reads around a pixel at a render of `full`: the
+    /// widest reach among the masks this edit draws, and the margin of the
+    /// products with it. Above the reach of the head passes it goes up in
+    /// steps, so a Radius slider replaces the window of a zoomed viewer a few
+    /// times over its travel and not at every step.
+    fn refine_reach(&self, edit: &PhotoEdit, full: (u32, u32)) -> u32 {
+        const STEP: u32 = 64;
+        let shown = self.overlay.and_then(|index| edit.masks.get(index));
+        let reach = mask_twin::active_masks(edit)
+            .iter()
+            .map(|(_, mask)| mask)
+            .chain(shown)
+            .map(|mask| refine_twin::reach(&mask.refine.shape(), full))
+            .max()
+            .unwrap_or(0);
+        if reach == 0 {
+            0
+        } else {
+            (reach + PRODUCTS_MARGIN).div_ceil(STEP) * STEP
+        }
+    }
+
     pub fn proxy_builds(&self) -> u64 {
         self.proxy_builds
     }
@@ -950,7 +1019,8 @@ impl Develop {
     ) -> Option<&wgpu::TextureView> {
         let full = render_size_for_crop(crop, output_size);
         let (full_w, full_h) = (full.0 as f32, full.1 as f32);
-        let reach = basic::blur_radius(basic::base_sigma(full.0, full.1)) as f32;
+        let reach = (basic::blur_radius(basic::base_sigma(full.0, full.1)).max(0) as u32)
+            .max(self.refine_reach(edit, full)) as f32;
         let x0 = (crop.x * full_w - reach).floor().max(0.0);
         let y0 = (crop.y * full_h - reach).floor().max(0.0);
         let x1 = ((crop.x + crop.width) * full_w + reach).ceil().min(full_w);
@@ -978,8 +1048,8 @@ impl Develop {
     /// one to one. A pan that stays inside the window therefore runs no
     /// head pass, and a slider step develops only what is seen.
     /// The frame holds the window plus the reach of the widest head pass on
-    /// every side, so the picture is the one [`render`](Self::render) gives
-    /// at `view.full`.
+    /// every side, or of Refine edges when a mask's reaches further, so the
+    /// picture is the one [`render`](Self::render) gives at `view.full`.
     ///
     /// `view.full` must not pass the size of the source: above one source
     /// pixel per output pixel the blur radius meets its cap and the look
@@ -993,7 +1063,7 @@ impl Develop {
         let full = (view.full.0.max(1), view.full.1.max(1));
         let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
         let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
-        let reach = head_pass_reach(full);
+        let reach = head_pass_reach(full).max(self.refine_reach(edit, full));
         let (x0, y0) = (wx.saturating_sub(reach), wy.saturating_sub(reach));
         let (x1, y1) = ((wx + ww + reach).min(full.0), (wy + wh + reach).min(full.1));
         let frame = ((x1 - x0) as f32, (y1 - y0) as f32);
@@ -1141,6 +1211,7 @@ impl Develop {
             frame.developed_for = None;
             for mask in frame.masks.iter_mut().flatten() {
                 mask.shape = None;
+                mask.refine = None;
                 // A layer with an auto stroke reads the working texture: it
                 // is stamped again when the head passes ran. One without
                 // reads no source pixel and is kept.
@@ -1319,11 +1390,10 @@ impl Develop {
                     ],
                 })
             };
-            let slot = frame.masks[index].get_or_insert_with(|| {
-                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
-                let layers = Layers::new(&self.device, brushes.len(), width, height);
-                let raster_bind = raster_bind(&layers);
-                let develop_binds = [&frame.developed, &frame.developed_other].map(|before| {
+            // The mask pass reads this alpha: the mask's own, or its refined
+            // one.
+            let develop_binds = |alpha: &wgpu::TextureView| {
+                [&frame.developed, &frame.developed_other].map(|before| {
                     self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("masked develop bind group"),
                         layout: &self.masked.layout,
@@ -1334,14 +1404,24 @@ impl Develop {
                             texture_binding(3, &frame.texture_base.view),
                             texture_binding(4, &frame.transmission.view),
                             texture_binding(5, &self.curve_table_view),
-                            texture_binding(6, &alpha.view),
+                            texture_binding(6, alpha),
                             texture_binding(7, &before.view),
                         ],
                     })
-                });
+                })
+            };
+            let slot = frame.masks[index].get_or_insert_with(|| {
+                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
+                let layers = Layers::new(&self.device, brushes.len(), width, height);
+                let raster_bind = raster_bind(&layers);
+                let develop_binds = develop_binds(&alpha.view);
                 FrameMask {
                     alpha,
                     shape: None,
+                    alpha_region: (0, 0, 0, 0),
+                    refined: None,
+                    refine: None,
+                    binds_refined: false,
                     layers,
                     raster_bind,
                     develop_binds,
@@ -1388,8 +1468,27 @@ impl Develop {
                     }
                 }
             }
-            let shape = mask.shape();
-            if slot.shape.as_ref() != Some(&shape) {
+            // Refine edges is the last step of the shape. The alpha of the
+            // components is kept under the shape without it, so a Refine
+            // slider filters the alpha again and never redraws it.
+            let refine = mask.refine.shape();
+            let plan = (!refine.is_off()).then(|| {
+                let origin = (
+                    (window.x * sigma_size.0 as f32).round().max(0.0) as u32,
+                    (window.y * sigma_size.1 as f32).round().max(0.0) as u32,
+                );
+                Plan::new(&refine, sigma_size, origin, (width, height))
+            });
+            // The filter reads the alpha its reach beyond what it writes.
+            let alpha_region =
+                plan.map_or(region, |plan| grow(region, plan.reach(), (width, height)));
+            let shape = MaskShape {
+                refine: Refine::default(),
+                ..mask.shape()
+            };
+            // What of the alpha this render drew again.
+            let mut redrawn = Damage::Nothing;
+            if slot.shape.as_ref() != Some(&shape) || !holds(slot.alpha_region, alpha_region) {
                 self.queue.write_buffer(
                     &self.mask_uniforms[index],
                     0,
@@ -1399,13 +1498,14 @@ impl Develop {
                 // strokes stamped onto its layers is drawn again where those
                 // dabs reach; anything else is drawn again whole.
                 let grew = stamped != Damage::Whole
+                    && holds(slot.alpha_region, alpha_region)
                     && slot
                         .shape
                         .as_ref()
                         .is_some_and(|held| held.same_but_strokes(&shape));
                 if grew {
                     let reach = match stamped {
-                        Damage::Part(reach) => intersect(reach, region),
+                        Damage::Part(reach) => intersect(reach, alpha_region),
                         _ => None,
                     };
                     if let Some(reach) = reach {
@@ -1419,7 +1519,7 @@ impl Develop {
                         );
                         self.alpha_patches += 1;
                     }
-                    damage = damage.with(reach);
+                    redrawn = redrawn.with(reach);
                 } else {
                     draw(
                         &mut encoder,
@@ -1427,12 +1527,70 @@ impl Develop {
                         &self.mask.pipeline,
                         &slot.raster_bind,
                         &slot.alpha.view,
-                        Some(region),
+                        Some(alpha_region),
                     );
-                    damage = Damage::Whole;
+                    slot.alpha_region = alpha_region;
+                    redrawn = Damage::Whole;
                 }
                 slot.shape = Some(shape);
                 self.alpha_builds += 1;
+            }
+            match plan {
+                None => {
+                    slot.refined = None;
+                    slot.refine = None;
+                    damage = match redrawn {
+                        Damage::Part(reach) => damage.with(intersect(reach, region)),
+                        Damage::Whole => Damage::Whole,
+                        Damage::Nothing => damage,
+                    };
+                }
+                Some(plan) => {
+                    let refined = slot.refined.get_or_insert_with(|| {
+                        self.refine
+                            .refined(&self.device, ALPHA_FORMAT, width, height)
+                    });
+                    // New dabs change the refined alpha the filter's reach
+                    // further out than they change the alpha, and no
+                    // further.
+                    let over = match redrawn {
+                        _ if slot.refine != Some(refine) => Some(region),
+                        Damage::Whole => Some(region),
+                        Damage::Part(reach) => {
+                            intersect(grow(reach, plan.reach(), (width, height)), region)
+                        }
+                        Damage::Nothing => None,
+                    };
+                    if let Some(over) = over {
+                        self.refine.run(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            &mut frame.refine_scratch,
+                            refined,
+                            &frame.working.view,
+                            &slot.alpha.view,
+                            &plan,
+                            over,
+                        );
+                        if over == region {
+                            self.refine_builds += 1;
+                            damage = Damage::Whole;
+                        } else {
+                            self.refine_patches += 1;
+                            damage = damage.with(Some(over));
+                        }
+                    }
+                    slot.refine = Some(refine);
+                }
+            }
+            if slot.binds_refined != slot.refined.is_some() {
+                slot.develop_binds = develop_binds(
+                    slot.refined
+                        .as_ref()
+                        .map_or(&slot.alpha.view, |refined| &refined.alpha),
+                );
+                slot.binds_refined = slot.refined.is_some();
             }
             if !develops {
                 continue;
@@ -1457,6 +1615,14 @@ impl Develop {
             );
         }
         let frame = self.frame.as_mut().expect("frame built above");
+        if frame
+            .masks
+            .iter()
+            .flatten()
+            .all(|slot| slot.refined.is_none())
+        {
+            frame.refine_scratch = None;
+        }
 
         // The developed texture is kept while the edit and the scissor are
         // the ones it was drawn for: a pan changes neither.
@@ -1527,7 +1693,12 @@ impl Develop {
         let frame = self.frame.as_ref().expect("frame built above");
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
-        let overlay = overlaid.as_ref().map(|(index, _)| *index);
+        let overlay = overlaid.as_ref().map(|(index, _)| {
+            let refined = frame.masks[*index]
+                .as_ref()
+                .is_some_and(|slot| slot.refined.is_some());
+            (*index, refined)
+        });
         let out_stale = self.out.as_ref().is_none_or(|o| {
             (o.target.width, o.target.height) != (out_width, out_height)
                 || o.frame_generation != self.frame_generation
@@ -1542,8 +1713,12 @@ impl Develop {
                 out_height,
             );
             let overlay_alpha = overlay
-                .and_then(|index| frame.masks[index].as_ref())
-                .map_or(&self.no_overlay.view, |slot| &slot.alpha.view);
+                .and_then(|(index, _)| frame.masks[index].as_ref())
+                .map_or(&self.no_overlay.view, |slot| {
+                    slot.refined
+                        .as_ref()
+                        .map_or(&slot.alpha.view, |refined| &refined.alpha)
+                });
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("output bind group"),
                 layout: &self.output.layout,
@@ -1869,6 +2044,7 @@ impl Develop {
             smooth_v_bind,
             develop_bind,
             masks: Default::default(),
+            refine_scratch: None,
         }
     }
 }
@@ -2164,12 +2340,15 @@ fn clamp_rect(rect: (u32, u32, u32, u32), bounds: (u32, u32, u32, u32)) -> (u32,
     (x, y, w, h)
 }
 
+/// The margin of [`scissor_for`] in pixels.
+const PRODUCTS_MARGIN: u32 = 2;
+
 /// The pixels the blur must reach: the crop with a margin of two pixels
 /// for the output pass's sampling, over the whole height when
 /// `full_height` (the horizontal pass feeds every row the vertical pass
 /// reads). As x, y, width, height of a render of `size`.
 fn scissor_for(crop: CropRect, size: (u32, u32), full_height: bool) -> (u32, u32, u32, u32) {
-    const MARGIN: f32 = 2.0;
+    const MARGIN: f32 = PRODUCTS_MARGIN as f32;
     let (w, h) = (size.0 as f32, size.1 as f32);
     let x0 = (crop.x * w - MARGIN).floor().clamp(0.0, w - 1.0);
     let x1 = ((crop.x + crop.width) * w + MARGIN)
