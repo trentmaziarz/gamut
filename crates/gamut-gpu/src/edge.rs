@@ -281,6 +281,15 @@ pub(crate) struct EdgeWork {
     pub(crate) finish: Option<Rect>,
 }
 
+/// The products of a mask [`EdgePass::prepare`] made again: each holds
+/// nothing yet and is drawn whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Made {
+    pub(crate) shifted: bool,
+    pub(crate) cells: bool,
+    pub(crate) finished: bool,
+}
+
 /// How many passes of each kind an edge pass family has drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EdgePasses {
@@ -434,19 +443,23 @@ impl EdgePass {
 
     /// Makes and drops the textures of a mask and of the frame for `plan`:
     /// each product while its stage is on and none while it is at rest.
+    /// Returns the products it made again, which hold nothing yet. The
+    /// others keep what they hold: new cells of Feather leave the shifted
+    /// alpha as it is.
     pub(crate) fn prepare(
         &self,
         device: &wgpu::Device,
         scratch: &mut EdgeScratch,
         edged: &mut Edged,
         plan: &Plan,
-    ) {
+    ) -> Made {
         let frame = plan.size;
         let (_, grid) = plan.grid();
+        let mut made = Made::default();
         if plan.shifts() {
             if edged.shifted.as_ref().is_none_or(|t| t.size != frame) {
                 edged.shifted = Some(texture(device, "shifted alpha", RUN_FORMAT, frame));
-                edged.held = None;
+                made.shifted = true;
             }
             if scratch.runs.as_ref().is_none_or(|r| r[0].size != frame) {
                 scratch.runs =
@@ -459,7 +472,7 @@ impl EdgePass {
             let fits = |t: &Texture| t.size.0 >= grid.0 && t.size.1 >= grid.1;
             if edged.cells.as_ref().is_none_or(|t| !fits(t)) {
                 edged.cells = Some(texture(device, "feather cells", CELL_FORMAT, grid));
-                edged.held = None;
+                made.cells = true;
             }
             if scratch.cells.as_ref().is_none_or(|c| !fits(&c[0])) {
                 scratch.cells =
@@ -471,11 +484,12 @@ impl EdgePass {
         if plan.feathers() || plan.contrasts() {
             if edged.finished.as_ref().is_none_or(|t| t.size != frame) {
                 edged.finished = Some(texture(device, "finished alpha", RUN_FORMAT, frame));
-                edged.held = None;
+                made.finished = true;
             }
         } else {
             edged.finished = None;
         }
+        made
     }
 
     /// Draws what `work` asks of the edge products of one mask from `input`,

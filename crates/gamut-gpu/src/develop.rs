@@ -1743,22 +1743,28 @@ impl Develop {
                 let edged = slot
                     .edged
                     .get_or_insert_with(|| self.edge.edged(&self.device));
-                self.edge
-                    .prepare(&self.device, &mut frame.edge_scratch, edged, &edge_plan);
+                let made =
+                    self.edge
+                        .prepare(&self.device, &mut frame.edge_scratch, edged, &edge_plan);
                 let held = edged.held.filter(|held| {
                     held.refined == refined_input
                         && (held.plan.full, held.plan.origin, held.plan.size)
                             == (edge_plan.full, edge_plan.origin, edge_plan.size)
                 });
                 let p = &edge_plan;
-                let shift_changed = held.is_none_or(|h| {
-                    (h.plan.grow, h.plan.axis, h.plan.diagonal) != (p.grow, p.axis, p.diagonal)
-                });
-                let feather_changed = held.is_none_or(|h| {
-                    (h.plan.sigma, h.plan.step, h.plan.radius_cells)
-                        != (p.sigma, p.step, p.radius_cells)
-                });
-                let contrast_changed = held.is_none_or(|h| h.plan.contrast != p.contrast);
+                // A product made again is drawn whole; one kept is drawn
+                // again only where its setting or the stage before changed.
+                let shift_changed = made.shifted
+                    || held.is_none_or(|h| {
+                        (h.plan.grow, h.plan.axis, h.plan.diagonal) != (p.grow, p.axis, p.diagonal)
+                    });
+                let feather_changed = made.cells
+                    || held.is_none_or(|h| {
+                        (h.plan.sigma, h.plan.step, h.plan.radius_cells)
+                            != (p.sigma, p.step, p.radius_cells)
+                    });
+                let contrast_changed =
+                    made.finished || held.is_none_or(|h| h.plan.contrast != p.contrast);
                 let size = (width, height);
                 let grown = |damage: Damage, by: u32| match damage {
                     Damage::Part(rect) => Damage::Part(grow(rect, by, size)),

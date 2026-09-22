@@ -272,6 +272,13 @@ fn check_on(name: &str, photo: &Photo, edit: &PhotoEdit) {
         return;
     };
     println!("adapter: {}", gpu.describe());
+    let gpu_pixels = gpu_render(&gpu, photo, edit);
+    assert_matches_the_twin(name, photo, edit, &gpu_pixels);
+}
+
+/// Holds `gpu_pixels`, a render of `edit` on `photo`, to the twin within the
+/// golden tolerances.
+fn assert_matches_the_twin(name: &str, photo: &Photo, edit: &PhotoEdit, gpu_pixels: &[[u8; 3]]) {
     let references: Vec<Vec<[u8; 3]>> = transmission_steps(edit)
         .iter()
         .flat_map(|step| {
@@ -279,7 +286,6 @@ fn check_on(name: &str, photo: &Photo, edit: &PhotoEdit) {
                 .map(|rounding| cpu_reference(photo, edit, rounding, *step))
         })
         .collect();
-    let gpu_pixels = gpu_render(&gpu, photo, edit);
     assert_eq!(references[0].len(), gpu_pixels.len());
     let mut max = 0;
     let mut sum = 0u64;
@@ -3894,6 +3900,137 @@ fn a_develop_slider_draws_no_edge_pass_and_each_edge_slider_draws_its_own() {
     drawn(&mut develop, &edit);
     assert_eq!(develop.edge_textures(), 0);
     assert_eq!(drawn(&mut develop, &edit).2, [0, 0, 0]);
+}
+
+/// A Feather slider whose sigma crosses a cell step makes the cells of
+/// Feather again at the size of the new grid, and still draws Feather and the
+/// finished alpha of that mask alone: the shifted alpha does not depend on
+/// the cell grid and is kept. So does a Feather slider that comes on from 0
+/// and makes the cells again. On the photo 1101 pixels wide a feather of
+/// 0.015 is a sigma of 16.5 pixels in cells of 4, and one of 0.012 a sigma
+/// of 13.2 in cells of 3, a larger grid. Every render matches the twin.
+#[test]
+fn a_feather_slider_across_a_cell_step_draws_no_shift_pass_and_matches() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = blocky_photo(1101, 90);
+    let size = (photo.width, photo.height);
+    let edge_at = |feather: f32, contrast: f32| Edge {
+        shift: 0.005,
+        feather,
+        contrast,
+    };
+    let plan = |edge: Edge| gamut_color::edge::Plan::new(&edge, size, (0, 0), size);
+    let (four, three) = (plan(edge_at(0.015, 30.0)), plan(edge_at(0.012, 30.0)));
+    assert!(four.shifts() && three.shifts());
+    assert_eq!((four.step, three.step), (4, 3));
+    let (grid_four, grid_three) = (four.grid().1, three.grid().1);
+    assert!(
+        grid_three.0 > grid_four.0 && grid_three.1 > grid_four.1,
+        "cells of 3 take a larger cell texture: {grid_four:?} against {grid_three:?}"
+    );
+
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [0.4995, 0.5],
+        radius: [0.0309, 0.05],
+        rotation: 0.0,
+        feather: 15.0,
+    });
+    let brush = brush_source(&[stroke(&[[0.2543, 0.1], [0.2543, 0.9]], 0.012, 20.0, 100.0)]);
+    let mut radial = refined_at(exposure_mask("Radial", radial), 100.0, 0.015, 50.0);
+    radial.edge = edge_at(0.015, 30.0);
+    let mut brush = exposure_mask("Brush", brush);
+    brush.edge = edge_at(0.015, 30.0);
+    let mut edit = masked(vec![radial, brush]);
+    let moved = assert_the_edge_shows(&photo, &edit);
+    println!("the edge controls move {moved} pixels of the twin");
+
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    // What one render drew: the mask alphas whole and in part, the refined
+    // alphas whole and in part, the passes of Shift edge, of Feather's cells
+    // and of the finished alpha, and each of those three stages drawn whole
+    // and in part. The render is held to the twin.
+    type Drawn = ([u64; 2], [u64; 2], [u64; 3], [u64; 3], [u64; 3]);
+    let counts = |develop: &Develop| -> Drawn {
+        let passes = develop.edge_passes();
+        let (whole, parts) = develop.edge_builds();
+        let (refined, refine_parts) = develop.refine_builds();
+        (
+            [develop.mask_alpha_builds(), develop.brush_patches().0],
+            [refined, refine_parts],
+            [passes.shift, passes.feather, passes.finish],
+            whole,
+            parts,
+        )
+    };
+    let render = |develop: &mut Develop, edit: &PhotoEdit, name: &str| -> Drawn {
+        let before = counts(develop);
+        let view = develop
+            .render(edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        let pixels: Vec<[u8; 3]> = readback
+            .read(&gpu.device, &gpu.queue, view, size.0, size.1)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect();
+        assert_matches_the_twin(name, &photo, edit, &pixels);
+        let after = counts(develop);
+        let since = |now: &[u64], then: &[u64]| -> Vec<u64> {
+            now.iter().zip(then).map(|(now, then)| now - then).collect()
+        };
+        (
+            since(&after.0, &before.0).try_into().expect("two"),
+            since(&after.1, &before.1).try_into().expect("two"),
+            since(&after.2, &before.2).try_into().expect("three"),
+            since(&after.3, &before.3).try_into().expect("three"),
+            since(&after.4, &before.4).try_into().expect("three"),
+        )
+    };
+
+    let first = render(&mut develop, &edit, "the first render, cells of 4");
+    assert!(first.2[0] > 0, "Shift edge draws on the first render");
+    assert_eq!(first.3, [2, 2, 2], "each stage of both masks drawn whole");
+
+    // Only Feather and the finished alpha of the radial mask, whole, and no
+    // other pass: no alpha, no refine and no Shift edge.
+    let feather_alone = ([0, 0], [0, 0], [0, 3, 1], [0, 1, 1], [0, 0, 0]);
+    edit.masks[0].edge.feather = 0.012;
+    assert_eq!(
+        render(&mut develop, &edit, "Feather from cells of 4 to cells of 3"),
+        feather_alone,
+        "a Feather slider from cells of 4 to cells of 3"
+    );
+    edit.masks[0].edge.feather = 0.015;
+    assert_eq!(
+        render(&mut develop, &edit, "Feather from cells of 3 to cells of 4"),
+        feather_alone,
+        "a Feather slider from cells of 3 to cells of 4"
+    );
+
+    // Feather of the radial mask to 0 drops its cells and draws the finished
+    // alpha alone; back on, it makes the cells again.
+    edit.masks[0].edge.feather = 0.0;
+    assert_eq!(
+        render(&mut develop, &edit, "Feather to 0"),
+        ([0, 0], [0, 0], [0, 0, 1], [0, 0, 1], [0, 0, 0]),
+        "a Feather slider to 0"
+    );
+    edit.masks[0].edge.feather = 0.012;
+    assert_eq!(
+        render(&mut develop, &edit, "Feather from 0 to cells of 3"),
+        feather_alone,
+        "a Feather slider from 0 makes the cells again"
+    );
 }
 
 /// An edged mask under a crop window and under a zoomed window equals the
