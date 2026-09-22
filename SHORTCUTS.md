@@ -118,17 +118,65 @@ bracket key or a click, and Alt, held while painting.
   is refined. Any kind of component can be in that mask.
 - It reads the picture as it was before any edit. Change Exposure or any other
   slider and the refined mask holds the edge it already has.
+- Under Opacity, top to bottom, the controls of every mask are Refine edges,
+  then Radius and Edge sensitivity while Refine edges is over 0. Shift edge,
+  Feather and Contrast follow, in that order. These three are always shown,
+  whatever Refine edges is set to. Invert and the Show overlay checkbox sit side
+  by side below them.
+- Shift edge moves the edge of the mask outward or inward. Set it over 0 and the
+  mask gets larger. Set it under 0 and the mask gets smaller.
+- The value of Shift edge is how far the edge moves, shown as a percentage of
+  the longer side of the picture. It can be set anywhere between -5.00 % and
+  5.00 %. On a new mask it sits at 0, and at 0 the edge stays where it is.
+- Shift a soft edge and it stays soft. The fade moves with the edge and keeps
+  its width. Shift a hard edge and it stays hard.
+- A stroke along a row of roofs can spill into the sky in a thin strip that
+  Refine edges does not take back. Pull Shift edge under 0 by about the width of
+  the strip, and the strip goes. The rest of the edge of the mask moves in by
+  the same amount.
+- Feather is a slider of the mask, separate from the Feather setting under the
+  brush component.
+- The Feather slider of the mask softens every edge of the mask. That includes a
+  hard edge left by Refine edges. Its value is the width of the fade, as a
+  percentage of the longer side of the picture.
+- The Feather slider of the mask goes up to 5.00 %. Feather is off at 0, its
+  lowest setting and the one a new mask starts with.
+- Contrast makes a soft edge firmer. Raise it and the fade narrows about the
+  middle of the edge. At 100 the edge is hard.
+- Contrast is set on a scale of 0 to 100. A new mask starts with Contrast at 0,
+  and 0 changes nothing.
+- The edge is shifted first, then feathered, then its contrast is raised.
+  Feather a hard edge and then raise Contrast, and the fade comes back toward
+  hard at the setting you choose.
+- Shift edge, Feather and Contrast act on the whole mask, after its components
+  are combined, after Invert and after Refine edges. They act on any kind of
+  mask, whatever components it holds.
+- Moving Exposure or any other slider of the Adjust tab leaves a shifted,
+  feathered or contrasted edge where it is. The three work from the shape of the
+  mask alone. With all three at 0, the mask is exactly as drawn, or as Refine
+  edges left it.
+- Shift edge and Feather move in small steps near 0 and in larger steps toward
+  their ends. That makes a fine setting easy to pick. The smallest setting off 0
+  is 0.01 %.
+- Shift edge and Feather are a share of the picture's longer side. The edge of
+  the mask therefore looks the same in the fitted view, zoomed in, and in the
+  exported file.
 - The overlay is a red tint where the selected mask applies. The Show overlay
-  checkbox, beside Invert under those sliders, turns it on and off. With Refine
-  edges on, the overlay shows the mask as refined. Turn it on to watch the edge
-  move as you drag the three sliders.
-- Refine edges, Radius and Edge sensitivity are saved with the mask in the
-  picture's file. One drag of any of the three is one undo step. None of the
-  three has a key.
+  checkbox, beside Invert under Contrast, turns it on and off. With Refine edges
+  on, the overlay shows the mask as refined. With Shift edge, Feather or
+  Contrast set off 0, it shows the mask as shifted, feathered and contrasted, in
+  place of the mask as drawn. Turn it on to watch the edge move as you drag any
+  of these sliders.
+- Refine edges, Radius, Edge sensitivity, Shift edge, Feather and Contrast are
+  saved with the mask in the picture's file. One drag of any of the six is one
+  undo step. None of the six has a key.
 - Paint into a brush mask with Refine edges on and the new paint is refined as
-  you paint.
+  you paint. With Shift edge, Feather or Contrast set off 0, the new paint is
+  shifted, feathered and contrasted as you paint too.
 - On a video the mask is refined again on every frame. Its edge follows the
   colour edges of each frame.
+- Shift edge, Feather and Contrast are applied again on every frame of a video,
+  after Refine edges.
 - Zoomed in or out, the crop and a mask handle move exactly as far as the
   pointer moves.
 
