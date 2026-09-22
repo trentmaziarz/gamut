@@ -12,7 +12,7 @@ use gamut_color::brush::Proxy;
 use gamut_color::mask::{self as mask_twin, Geometry, Image};
 use gamut_color::video::{PlaneFormat, Transfer, VideoColour, YuvSpace, decode_video_pixel};
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
-use gamut_core::mask::{MaskSource, RadialGradient, Refine};
+use gamut_core::mask::{Edge, MaskSource, RadialGradient, Refine};
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use gamut_gpu::video::P010_FEATURE;
 use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
@@ -674,4 +674,118 @@ fn a_refined_mask_on_a_frame_matches_the_twin_and_is_refined_again_on_the_next()
             "each frame draws the alpha and refines it once, whole"
         );
     }
+}
+
+/// An edged mask on a video is drawn again on every frame, as the refined
+/// alpha under it is: Refine edges follows the edges of each frame and Shift
+/// edge, Feather and Contrast act on what it hands on. One graph is given the
+/// two frames of the refined test in turn, and each render is held to the twin
+/// of its own frame.
+#[test]
+fn an_edged_mask_on_a_frame_matches_the_twin_and_is_drawn_again_on_the_next() {
+    let mut mask = Mask::new(
+        "Edged",
+        MaskSource::Radial(RadialGradient {
+            centre: [0.414, 0.5],
+            radius: [0.117, 0.35],
+            rotation: 0.0,
+            feather: 15.0,
+        }),
+    );
+    mask.adjust.exposure = 1.2;
+    mask.refine = Refine {
+        amount: 100.0,
+        radius: 0.05,
+        sensitivity: 50.0,
+    };
+    mask.edge = Edge {
+        shift: 0.03,
+        feather: 0.02,
+        contrast: 40.0,
+    };
+    let frames = [
+        frame_with_luma(PlaneFormat::Nv12, &|x| if x < 32 { 50.0 } else { 190.0 }),
+        frame_with_luma(PlaneFormat::Nv12, &|x| if x < 21 { 200.0 } else { 70.0 }),
+    ];
+    let alphas_on = |frame: &VideoFrame, mask: &Mask| {
+        let linear: Vec<[f32; 3]> = (0..SIZE)
+            .flat_map(|dy| (0..SIZE).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| linear_at(frame, SDR, 0, dx, dy))
+            .collect();
+        let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+        mask_twin::alpha_image_with(mask, &linear, &geometry, None, &|a| a)
+    };
+    let mut plain = mask.clone();
+    plain.edge = Edge::default();
+    let (first, second) = (alphas_on(&frames[0], &mask), alphas_on(&frames[1], &mask));
+    let differing = first.iter().zip(&second).filter(|(a, b)| a != b).count();
+    println!("the same edged mask on the two frames: {differing} alphas differ");
+    assert!(
+        differing * 50 > first.len(),
+        "the same mask is finished on other edges: {differing} pixels differ"
+    );
+    let shows = first
+        .iter()
+        .zip(&alphas_on(&frames[0], &plain))
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("the edge controls move {shows} alphas of the first frame");
+    assert!(
+        shows * 100 > first.len(),
+        "the edge controls move {shows} pixels"
+    );
+    let edit = PhotoEdit {
+        masks: vec![mask.clone()],
+        ..PhotoEdit::default()
+    };
+
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    let readback = Readback::new(&gpu.device);
+    let mut finished = 0;
+    for (index, frame) in frames.iter().enumerate() {
+        develop.set_video_frame(frame, SDR, 0);
+        let before = develop.edge_passes();
+        let view = develop
+            .render(&edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        let gpu_pixels: Vec<[u8; 3]> = readback
+            .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect();
+        let name = format!("edged mask on nv12 frame {}", index + 1);
+        hold_to_the_twin(&name, frame, SDR, 0, &edit, &gpu_pixels);
+        let after = develop.edge_passes();
+        assert!(
+            after.shift > before.shift,
+            "Shift edge runs on frame {index}"
+        );
+        assert_eq!(
+            after.feather - before.feather,
+            3,
+            "Feather runs on frame {index}"
+        );
+        assert_eq!(
+            after.finish - before.finish,
+            1,
+            "the finished alpha, frame {index}"
+        );
+        finished += 1;
+        assert_eq!(
+            develop.refine_builds(),
+            (index as u64 + 1, 0),
+            "each frame refines the mask once, whole"
+        );
+    }
+    assert_eq!(finished, 2);
 }

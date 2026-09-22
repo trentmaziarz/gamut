@@ -14,11 +14,11 @@ use gamut_color::{dehaze, local, matrices, transfer};
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::look::{Curve, HslRange, Wheel};
 use gamut_core::mask::{
-    ColourRange, Component, LinearGradient, LuminanceRange, MaskOp, MaskSource, RadialGradient,
-    Refine,
+    ColourRange, Component, Edge, LinearGradient, LuminanceRange, MaskOp, MaskSource,
+    RadialGradient, Refine,
 };
 use gamut_core::{Adjustments, CropRect, ExportPreset, Mask, PhotoEdit};
-use gamut_gpu::{Develop, Headless, Readback, ViewWindow};
+use gamut_gpu::{Develop, EdgePasses, Headless, Readback, ViewWindow};
 use gamut_media::Photo;
 use half::f16;
 
@@ -3300,4 +3300,551 @@ fn a_refined_mask_under_a_crop_window_and_a_zoomed_window_matches_the_full_rende
         println!("refine edges moves {moved} pixels of the window");
         assert!(moved > 200, "refine edges shows inside the window");
     }
+}
+
+/// `mask` with Shift edge, Feather and Contrast at these values: shares of the
+/// longer side of the photo for the first two. On the 64 pixel photos a shift
+/// of 0.02 is one pixel a side along each axis and a feather of 0.01 a sigma
+/// of 0.64 pixels in cells of one pixel.
+fn edged_at(mut mask: Mask, shift: f32, feather: f32, contrast: f32) -> Mask {
+    mask.edge = Edge {
+        shift,
+        feather,
+        contrast,
+    };
+    mask
+}
+
+/// The edge controls have to move the picture for their golden test to mean
+/// anything. How many pixels of the twin they move.
+fn assert_the_edge_shows(photo: &Photo, edit: &PhotoEdit) -> usize {
+    let mut plain = edit.clone();
+    for mask in &mut plain.masks {
+        mask.edge = Edge::default();
+    }
+    let with = cpu_reference(photo, edit, Rounding::Nearest, 0);
+    let without = cpu_reference(photo, &plain, Rounding::Nearest, 0);
+    let moved = with.iter().zip(&without).filter(|(a, b)| a != b).count();
+    assert!(
+        moved * 100 > with.len(),
+        "the edge controls move only {moved} of {} pixels",
+        with.len()
+    );
+    moved
+}
+
+fn check_edged(name: &str, edit: &PhotoEdit) {
+    let moved = assert_the_edge_shows(&synthetic_photo(), edit);
+    println!("{name}: the edge controls move {moved} pixels of the twin");
+    check_masks(name, edit);
+}
+
+fn refined_radial_edged(shift: f32, feather: f32, contrast: f32) -> PhotoEdit {
+    masked(vec![edged_at(
+        refined(exposure_mask("Radial", radial_over_the_band())),
+        shift,
+        feather,
+        contrast,
+    )])
+}
+
+#[test]
+fn a_refined_mask_grown_by_shift_edge_matches() {
+    check_edged(
+        "refined mask, Shift edge 2 percent",
+        &refined_radial_edged(0.02, 0.0, 0.0),
+    );
+}
+
+#[test]
+fn a_refined_mask_shrunk_by_shift_edge_matches() {
+    check_edged(
+        "refined mask, Shift edge -2 percent",
+        &refined_radial_edged(-0.02, 0.0, 0.0),
+    );
+}
+
+#[test]
+fn a_refined_mask_under_feather_matches() {
+    check_edged(
+        "refined mask, Feather 1 percent",
+        &refined_radial_edged(0.0, 0.01, 0.0),
+    );
+}
+
+#[test]
+fn a_refined_mask_under_contrast_matches() {
+    check_edged(
+        "refined mask, Contrast 80",
+        &refined_radial_edged(0.0, 0.0, 80.0),
+    );
+}
+
+#[test]
+fn a_refined_mask_under_all_three_edge_controls_matches() {
+    check_edged(
+        "refined mask, the three together",
+        &refined_radial_edged(-0.02, 0.01, 50.0),
+    );
+    check_edged(
+        "refined mask, the three together, grown",
+        &refined_radial_edged(0.03, 0.02, 90.0),
+    );
+}
+
+/// With Refine edges off the chain reads the alpha of the components.
+#[test]
+fn the_edge_controls_on_an_unrefined_brush_mask_match() {
+    check_edged(
+        "unrefined brush mask, the three together",
+        &masked(vec![edged_at(
+            exposure_mask("Brush", stroke_along_the_grey_columns()),
+            0.02,
+            0.01,
+            50.0,
+        )]),
+    );
+}
+
+#[test]
+fn an_edged_mask_that_is_inverted_and_one_at_half_opacity_match() {
+    let mut inverted = edged_at(
+        refined(exposure_mask("Outside", radial_over_the_band())),
+        0.02,
+        0.01,
+        60.0,
+    );
+    inverted.invert = true;
+    check_edged("edged inverted mask", &masked(vec![inverted]));
+    let mut half = edged_at(
+        refined(exposure_mask("Half", radial_over_the_band())),
+        -0.02,
+        0.01,
+        60.0,
+    );
+    half.opacity = 50.0;
+    check_edged("edged mask at opacity 50", &masked(vec![half]));
+}
+
+#[test]
+fn an_edged_refined_auto_brush_matches() {
+    let auto = refined(exposure_mask("Auto", brush_source(&auto_strokes(70.0))));
+    // The gate of the auto brush shows under Refine edges, as it does in
+    // a_refined_auto_brush_matches, before the edge controls act on it.
+    assert_the_gate_shows(&masked(vec![auto.clone()]));
+    let edit = masked(vec![edged_at(auto, 0.02, 0.01, 60.0)]);
+    check_edged("edged refined auto brush", &edit);
+}
+
+#[test]
+fn two_edged_masks_and_a_plain_one_blend_in_list_order() {
+    let edit = masked(vec![
+        edged_at(
+            refined_at(
+                exposure_mask("Radial", radial_over_the_band()),
+                80.0,
+                0.03,
+                70.0,
+            ),
+            -0.02,
+            0.01,
+            40.0,
+        ),
+        exposure_mask("Linear", linear_source()),
+        edged_at(
+            exposure_mask("Brush", stroke_along_the_grey_columns()),
+            0.03,
+            0.0,
+            70.0,
+        ),
+    ]);
+    check_edged("two edged masks and a plain one", &edit);
+}
+
+/// The overlay shows the finished alpha, and an export never shows it.
+#[test]
+fn the_overlay_of_an_edged_mask_matches_and_stays_out_of_an_export() {
+    check_overlay(edged_at(
+        refined(Mask::new("Idle", radial_source())),
+        0.02,
+        0.01,
+        50.0,
+    ));
+    check_overlay(edged_at(
+        Mask::new("Idle", radial_source()),
+        -0.03,
+        0.0,
+        0.0,
+    ));
+}
+
+/// A mask whose three edge keys are in the file at 0, or at values sanitising
+/// takes to 0, draws byte for byte what the mask with no edge key draws, with
+/// Refine edges off and on, and runs no edge pass and holds no edge texture.
+#[test]
+fn edge_controls_at_0_draw_what_no_edge_draws_and_run_no_pass() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+        let view = develop
+            .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        readback.read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+    };
+    for refine in [false, true] {
+        let mut edit = everything_global();
+        edit.masks = vec![
+            exposure_mask("Radial", radial_over_the_band()),
+            exposure_mask("Brush", stroke_along_the_grey_columns()),
+        ];
+        if refine {
+            edit.masks = edit.masks.into_iter().map(refined).collect();
+        }
+        let plain = render(&mut develop, &edit);
+        // The same masks read back from a file that holds the three keys.
+        let text = gamut_core::Sidecar::new(edit.clone(), Default::default())
+            .to_json()
+            .replace(
+                "\"adjust\": {",
+                "\"edge\": {\"shift\": 0, \"feather\": 0, \"contrast\": 0},\n\"adjust\": {",
+            );
+        let keyed = gamut_core::Sidecar::from_json(&text).expect("parse").edit;
+        assert!(text.contains("\"edge\""));
+        assert_eq!(keyed, edit, "the keys at 0 are the default");
+        assert_eq!(render(&mut develop, &keyed), plain, "refine {refine}");
+        let mut sanitised = edit.clone();
+        for mask in &mut sanitised.masks {
+            mask.edge = Edge {
+                shift: -0.0,
+                feather: -0.3,
+                contrast: f32::NAN,
+            };
+        }
+        assert_eq!(render(&mut develop, &sanitised), plain, "refine {refine}");
+        assert_eq!(develop.edge_passes(), EdgePasses::default());
+        assert_eq!(develop.edge_textures(), 0);
+    }
+}
+
+/// The edge products are cached like the refined alpha under them: a develop
+/// slider draws none of their passes; a Shift edge slider draws Shift edge,
+/// Feather and the finished alpha of that mask and no alpha and no refine; a
+/// Feather slider draws Feather and the finished alpha; a Contrast slider the
+/// finished alpha alone; a new source content draws all of them.
+#[test]
+fn a_develop_slider_draws_no_edge_pass_and_each_edge_slider_draws_its_own() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    // The alphas drawn, the refined alphas drawn, and the passes of Shift
+    // edge, of Feather and of the finished alpha, since the render before.
+    let mut last = (0u64, 0u64, EdgePasses::default());
+    let mut drawn = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, [u64; 3]) {
+        develop
+            .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        let now = (
+            develop.mask_alpha_builds(),
+            develop.refine_builds().0,
+            develop.edge_passes(),
+        );
+        let step = (
+            now.0 - last.0,
+            now.1 - last.1,
+            [
+                now.2.shift - last.2.shift,
+                now.2.feather - last.2.feather,
+                now.2.finish - last.2.finish,
+            ],
+        );
+        last = now;
+        step
+    };
+    let mut edit = masked(vec![
+        edged_at(
+            refined(exposure_mask("Radial", radial_over_the_band())),
+            0.02,
+            0.01,
+            50.0,
+        ),
+        exposure_mask("Luminance", luminance_source()),
+    ]);
+    // Shift edge of one pixel: a run along x and one along y, each one pass
+    // forward and one back.
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (2, 1, [4, 3, 1]),
+        "the first render"
+    );
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 0, [0, 0, 0]),
+        "the same edit again"
+    );
+
+    edit.exposure = 0.7;
+    edit.masks[0].adjust.exposure = -0.5;
+    edit.masks[0].adjust.look.curves.master = s_curve();
+    edit.masks[0].opacity = 35.0;
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 0, [0, 0, 0]),
+        "sliders of the develop chain, global and of the mask"
+    );
+
+    edit.masks[0].edge.shift = -0.02;
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 0, [4, 3, 1]),
+        "a Shift edge slider: Shift edge, Feather and Contrast, no alpha and no refine"
+    );
+    edit.masks[0].edge.shift = -0.05;
+    let deeper = drawn(&mut develop, &edit);
+    assert_eq!((deeper.0, deeper.1, &deeper.2[1..]), (0, 0, &[3, 1][..]));
+    assert!(deeper.2[0] > 4, "a wider shift takes more doubling passes");
+    edit.masks[0].edge.feather = 0.03;
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 0, [0, 3, 1]),
+        "a Feather slider: Feather and Contrast"
+    );
+    edit.masks[0].edge.contrast = 80.0;
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 0, [0, 0, 1]),
+        "a Contrast slider: the finished alpha alone"
+    );
+    edit.masks[0].refine.amount = 70.0;
+    assert_eq!(
+        drawn(&mut develop, &edit),
+        (0, 1, [deeper.2[0], 3, 1]),
+        "a Refine slider refines again and runs the chain after it"
+    );
+
+    develop.set_source(&hazy_photo());
+    let fresh = drawn(&mut develop, &edit);
+    assert_eq!(
+        (fresh.0, fresh.1),
+        (2, 1),
+        "a new source content draws the alphas"
+    );
+    assert_eq!(fresh.2, [deeper.2[0], 3, 1], "and every edge pass");
+
+    // All three at rest again: the passes stop and the textures go.
+    edit.masks[0].edge = Edge::default();
+    drawn(&mut develop, &edit);
+    assert_eq!(develop.edge_textures(), 0);
+    assert_eq!(drawn(&mut develop, &edit).2, [0, 0, 0]);
+}
+
+/// An edged mask under a crop window and under a zoomed window equals the
+/// same region of the full render: the feather cells lie on the pixels of the
+/// whole picture and the window holds the reach of Refine edges and of the
+/// edge controls. The masks have an edge that crosses the border of each
+/// window, and the windows begin on odd pixels, off the cell grid.
+#[test]
+fn an_edged_mask_under_a_crop_window_and_a_zoomed_window_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let (width, height) = (1100, 600);
+    let photo = blocky_photo(width, height);
+    // The masks of the refined window test: a radial gradient whose rim
+    // crosses the left border of what the windows show, and a stroke that
+    // crosses their top and bottom borders.
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [0.393, 0.25],
+        radius: [0.049, 0.0327],
+        rotation: 0.0,
+        feather: 12.0,
+    });
+    let brush = brush_source(&[stroke(&[[0.425, 0.05], [0.425, 0.5]], 0.016, 20.0, 100.0)]);
+    let masks = vec![
+        edged_at(
+            refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
+            0.03,
+            0.02,
+            40.0,
+        ),
+        edged_at(exposure_mask("Brush", brush), -0.03, 0.02, 0.0),
+    ];
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+
+    let crop = CropRect {
+        x: 0.3,
+        y: 0.2,
+        width: 0.3,
+        height: 0.4,
+    };
+    let output = (330, 240);
+    let masks_only = masked(masks.clone());
+    let full = develop
+        .render(&masks_only, crop, (width, height), output)
+        .expect("a source is set");
+    let full = readback.read(&gpu.device, &gpu.queue, full, output.0, output.1);
+    let windowed = develop
+        .render_crop(&masks_only, crop, output)
+        .expect("a source is set");
+    let windowed = readback.read(&gpu.device, &gpu.queue, windowed, output.0, output.1);
+    let max = max_difference(&full, &windowed);
+    println!("edged masks under a crop window against the full render: max difference {max}");
+    assert!(max <= 1, "max difference {max}");
+
+    let mut edit = everything_global();
+    edit.masks = masks;
+    let mut plain = edit.clone();
+    for mask in &mut plain.masks {
+        mask.edge = Edge::default();
+    }
+    // 100 and 200 percent of a fit of 550 by 300: feather cells of two and
+    // of five pixels.
+    let views = [
+        ViewWindow {
+            full: (550, 300),
+            window: (181, 41, 130, 100),
+            visible: (201, 57, 90, 70),
+        },
+        ViewWindow {
+            full: (width, height),
+            window: (361, 81, 260, 200),
+            visible: (401, 113, 180, 140),
+        },
+    ];
+    for view in views {
+        let plan = gamut_color::edge::Plan::new(&edit.masks[0].edge, view.full, (0, 0), view.full);
+        println!("feather cells of {} pixels at {:?}", plan.step, view.full);
+        assert!(plan.step > 1);
+        let full = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let without = view_render_of(&mut develop, &gpu, &readback, &plain, &view);
+        let max = max_difference(&full, &zoomed);
+        println!(
+            "edged masks under a zoomed window at {:?} against the full render: max difference {max}",
+            view.full
+        );
+        assert!(max <= 1, "max difference {max} at {:?}", view.full);
+        let moved = zoomed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(without.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("the edge controls move {moved} pixels of the window");
+        assert!(moved > 200, "the edge controls show inside the window");
+    }
+}
+
+/// On a photo wider than 1024 pixels a feather of 0.01 is a sigma of 11
+/// pixels in cells of two and one of 0.02 a sigma of 22 in cells of five: the
+/// cell grid, the bilinear read and the odd last column are real.
+#[test]
+fn an_edged_mask_on_a_photo_wider_than_1024_pixels_matches() {
+    let photo = blocky_photo(1101, 90);
+    for (feather, step) in [(0.01, 2), (0.02, 5)] {
+        let edge = Edge {
+            shift: 0.005,
+            feather,
+            contrast: 30.0,
+        };
+        let plan = gamut_color::edge::Plan::new(&edge, (1101, 90), (0, 0), (1101, 90));
+        assert_eq!(plan.step, step);
+        let radial = MaskSource::Radial(RadialGradient {
+            centre: [0.4995, 0.5],
+            radius: [0.0309, 0.05],
+            rotation: 0.0,
+            feather: 15.0,
+        });
+        let brush = brush_source(&[stroke(&[[0.2543, 0.1], [0.2543, 0.9]], 0.012, 20.0, 100.0)]);
+        let mut radial = refined_at(exposure_mask("Radial", radial), 100.0, 0.015, 50.0);
+        radial.edge = edge;
+        let mut brush = exposure_mask("Brush", brush);
+        brush.edge = edge;
+        let edit = masked(vec![radial, brush]);
+        let moved = assert_the_edge_shows(&photo, &edit);
+        println!(
+            "edged masks on a wide photo, cells of {step}: the edge controls move {moved} pixels"
+        );
+        check_on(
+            &format!("edged masks on a photo wider than 1024 pixels, cells of {step}"),
+            &photo,
+            &edit,
+        );
+    }
+}
+
+/// A feathered alpha takes every value between two codes, so many land within
+/// a tenth of a half code, where a GPU may store either code. Under an
+/// exposure that is one output code at most; the overlay's reference alone
+/// accepts either code.
+#[test]
+fn an_edged_alpha_beside_a_half_code_matches() {
+    let mask = edged_at(
+        refined_at(
+            exposure_mask("Beside a half code", radial_over_the_middle_and_the_band()),
+            50.0,
+            0.05,
+            50.0,
+        ),
+        0.02,
+        0.02,
+        30.0,
+    );
+    let photo = synthetic_photo();
+    let linear: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    let store = |v: f32| half(v, Rounding::Nearest);
+    let alphas = mask_twin::alpha_image_before_the_store(&mask, &linear, &geometry, None, &store);
+    let beside = alphas
+        .iter()
+        .filter(|alpha| {
+            let codes = **alpha * 255.0;
+            codes > 1.0
+                && codes < 254.0
+                && (codes.fract() - 0.5).abs() < mask_twin::UNORM_STEP_TOLERANCE
+        })
+        .count();
+    println!("{beside} edged alphas lie within a tenth of a half code");
+    assert!(
+        beside >= REFINED_HALF_CODE_PIXELS,
+        "{beside} edged alphas lie beside a half code"
+    );
+    check_edged(
+        "edged alpha beside a half code",
+        &masked(vec![mask.clone()]),
+    );
+    let mut idle = mask;
+    idle.adjust = Adjustments::default();
+    check_overlay(idle);
 }
