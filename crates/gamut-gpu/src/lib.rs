@@ -21,7 +21,7 @@ mod refine;
 pub mod test_image;
 pub mod video;
 
-pub use develop::{Develop, ViewWindow};
+pub use develop::{Develop, ShapeRedrawn, ViewWindow};
 pub use edge::EdgePasses;
 pub use headless::Headless;
 pub use readback::{PendingReadback, Readback};

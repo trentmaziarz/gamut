@@ -386,6 +386,23 @@ fn product_view(slot: &FrameMask) -> &wgpu::TextureView {
 }
 
 /// `rect` with `by` pixels more on every side, inside a render of `size`.
+/// Where one render drew each stage of a mask's shape again, in pixels of
+/// its frame, for the cache test: the alpha, the refined alpha, the passes
+/// of Shift edge, Feather's cells and the finished alpha. `None` where a
+/// stage drew nothing.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShapeRedrawn {
+    /// The size of the frame, and the part of it the develop passes draw.
+    pub frame: (u32, u32),
+    pub region: PixelRect,
+    pub alpha: Option<PixelRect>,
+    pub refine: Option<PixelRect>,
+    pub shift: Option<PixelRect>,
+    pub feather: Option<PixelRect>,
+    pub finish: Option<PixelRect>,
+}
+
 fn grow(rect: PixelRect, by: u32, size: (u32, u32)) -> PixelRect {
     let (x0, y0) = (rect.0.saturating_sub(by), rect.1.saturating_sub(by));
     let x1 = (rect.0 + rect.2 + by).min(size.0).max(x0);
@@ -599,6 +616,13 @@ pub struct Develop {
     /// over the reach of new dabs only, for the cache test.
     refine_builds: u64,
     refine_patches: u64,
+    /// How many times Shift edge, Feather's cells and the finished alpha
+    /// were drawn over their whole frame, and how many times over the reach
+    /// of new dabs only, for the cache test.
+    edge_builds: [u64; 3],
+    edge_patches: [u64; 3],
+    /// Where the last render drew each stage of each mask's shape again.
+    shape_redrawn: [ShapeRedrawn; MAX_MASKS],
     proxy: Option<ProxyProduct>,
     /// How many proxies have been set up, and how many times one was built,
     /// for the cache test.
@@ -794,6 +818,9 @@ impl Develop {
             edge: EdgePass::new(device),
             refine_builds: 0,
             refine_patches: 0,
+            edge_builds: [0; 3],
+            edge_patches: [0; 3],
+            shape_redrawn: [ShapeRedrawn::default(); MAX_MASKS],
             proxy: None,
             proxy_ids: 0,
             proxy_builds: 0,
@@ -1017,6 +1044,22 @@ impl Develop {
     /// alpha this graph has drawn. A develop slider draws none of them.
     pub fn edge_passes(&self) -> EdgePasses {
         self.edge.passes
+    }
+
+    /// How many times Shift edge, Feather's cells and the finished alpha
+    /// were drawn over their whole frame, and how many times over the reach
+    /// of new dabs only. A test reads it to hold that a stroke appended into
+    /// an edged mask draws each stage over its own reach.
+    #[doc(hidden)]
+    pub fn edge_builds(&self) -> ([u64; 3], [u64; 3]) {
+        (self.edge_builds, self.edge_patches)
+    }
+
+    /// Where the last render drew each stage of the shape of mask `index`
+    /// again. Nothing for a mask that render did not draw.
+    #[doc(hidden)]
+    pub fn shape_redrawn(&self, index: usize) -> ShapeRedrawn {
+        self.shape_redrawn.get(index).copied().unwrap_or_default()
     }
 
     /// How many textures the edge controls hold on the frame: those of the
@@ -1455,6 +1498,7 @@ impl Develop {
         // What the masks changed of the picture in this render. A brush that
         // only grew changes what its new dabs reach and nothing else.
         let mut damage = Damage::Nothing;
+        self.shape_redrawn = [ShapeRedrawn::default(); MAX_MASKS];
         let only_shown = overlaid
             .iter()
             .filter(|(index, _)| masks.iter().all(|(active, _)| active != index));
@@ -1624,6 +1668,7 @@ impl Develop {
                         );
                         self.alpha_patches += 1;
                     }
+                    self.shape_redrawn[index].alpha = reach;
                     redrawn = redrawn.with(reach);
                 } else {
                     draw(
@@ -1635,6 +1680,7 @@ impl Develop {
                         Some(alpha_region),
                     );
                     slot.alpha_region = alpha_region;
+                    self.shape_redrawn[index].alpha = Some(alpha_region);
                     redrawn = Damage::Whole;
                 }
                 slot.shape = Some(shape);
@@ -1665,6 +1711,7 @@ impl Develop {
                         }
                         Damage::Nothing => None,
                     };
+                    self.shape_redrawn[index].refine = over;
                     if let Some(over) = over {
                         self.refine.run(
                             &self.device,
@@ -1742,6 +1789,21 @@ impl Develop {
                     feather: pixels(feathered, region).filter(|_| p.feathers()),
                     finish: pixels(finished, region).filter(|_| p.feathers() || p.contrasts()),
                 };
+                let stages = [
+                    (work.shift, frame_rect),
+                    (work.feather, region),
+                    (work.finish, region),
+                ];
+                for (stage, (drawn, whole)) in stages.into_iter().enumerate() {
+                    match drawn {
+                        Some(drawn) if drawn == whole => self.edge_builds[stage] += 1,
+                        Some(_) => self.edge_patches[stage] += 1,
+                        None => {}
+                    }
+                }
+                let traced = &mut self.shape_redrawn[index];
+                (traced.shift, traced.feather, traced.finish) =
+                    (work.shift, work.feather, work.finish);
                 let input = slot
                     .refined
                     .as_ref()
@@ -1769,6 +1831,8 @@ impl Develop {
                 slot.edged = None;
                 handed
             };
+            self.shape_redrawn[index].frame = (width, height);
+            self.shape_redrawn[index].region = region;
             damage = match changed {
                 Damage::Part(reach) => damage.with(intersect(reach, region)),
                 Damage::Whole => Damage::Whole,
