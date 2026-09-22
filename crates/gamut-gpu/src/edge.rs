@@ -232,6 +232,10 @@ pub(crate) struct Edged {
     /// The blurred cells of Feather.
     cells: Option<Texture>,
     finished: Option<Texture>,
+    /// Told apart from every id before it: a new one each time the shifted
+    /// or the finished alpha is made or dropped, for the bind groups that
+    /// hold the view of [`Edged::product`].
+    product_id: u64,
     uniform: wgpu::Buffer,
     /// How many passes the uniform buffer holds.
     slots: u32,
@@ -248,6 +252,11 @@ impl Edged {
             .as_ref()
             .or(self.shifted.as_ref())
             .map(|t| &t.view)
+    }
+
+    /// The id of the texture [`Edged::product`] names.
+    pub(crate) fn product_id(&self) -> u64 {
+        self.product_id
     }
 
     /// Whether it holds a shifted alpha: Shift edge is on.
@@ -309,6 +318,8 @@ pub(crate) struct EdgePass {
     /// The distance between two passes in a uniform buffer.
     stride: u32,
     pub(crate) passes: EdgePasses,
+    /// The last product id handed out.
+    product_ids: u64,
 }
 
 pub(crate) const SHADER: &str = include_str!("shaders/edge.wgsl");
@@ -417,6 +428,7 @@ impl EdgePass {
             layout,
             stride: (size as u32).div_ceil(alignment) * alignment,
             passes: EdgePasses::default(),
+            product_ids: 0,
         }
     }
 
@@ -426,6 +438,7 @@ impl EdgePass {
             shifted: None,
             cells: None,
             finished: None,
+            product_id: 0,
             uniform: self.uniform_buffer(device, 1),
             slots: 1,
             held: None,
@@ -445,9 +458,10 @@ impl EdgePass {
     /// each product while its stage is on and none while it is at rest.
     /// Returns the products it made again, which hold nothing yet. The
     /// others keep what they hold: new cells of Feather leave the shifted
-    /// alpha as it is.
+    /// alpha as it is. A shifted or finished alpha made or dropped gives the
+    /// mask a new product id.
     pub(crate) fn prepare(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         scratch: &mut EdgeScratch,
         edged: &mut Edged,
@@ -456,6 +470,7 @@ impl EdgePass {
         let frame = plan.size;
         let (_, grid) = plan.grid();
         let mut made = Made::default();
+        let had = (edged.shifted.is_some(), edged.finished.is_some());
         if plan.shifts() {
             if edged.shifted.as_ref().is_none_or(|t| t.size != frame) {
                 edged.shifted = Some(texture(device, "shifted alpha", RUN_FORMAT, frame));
@@ -488,6 +503,13 @@ impl EdgePass {
             }
         } else {
             edged.finished = None;
+        }
+        if made.shifted
+            || made.finished
+            || had != (edged.shifted.is_some(), edged.finished.is_some())
+        {
+            self.product_ids += 1;
+            edged.product_id = self.product_ids;
         }
         made
     }

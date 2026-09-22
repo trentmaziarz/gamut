@@ -367,12 +367,10 @@ impl Damage {
 /// alpha while an edge control is on, else the refined alpha while Refine
 /// edges is, else the alpha of the components.
 fn product_of(slot: &FrameMask) -> Product {
-    if slot.edged.as_ref().is_some_and(|e| e.product().is_some()) {
-        Product::Edged
-    } else if slot.refined.is_some() {
-        Product::Refined
-    } else {
-        Product::Alpha
+    match slot.edged.as_ref().filter(|e| e.product().is_some()) {
+        Some(edged) => Product::Edged(edged.product_id()),
+        None if slot.refined.is_some() => Product::Refined,
+        None => Product::Alpha,
     }
 }
 
@@ -522,8 +520,9 @@ enum Product {
     /// The refined alpha of Refine edges.
     Refined,
     /// The alpha of the edge controls: shifted, or finished by Feather and
-    /// Contrast.
-    Edged,
+    /// Contrast. It holds the product id, so a bind group made before the
+    /// shifted or the finished alpha was made or dropped is made again.
+    Edged(u64),
 }
 
 /// The head-pass product of one mask: its alpha, cached like the texture
