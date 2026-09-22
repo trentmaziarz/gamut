@@ -3040,6 +3040,247 @@ fn a_stroke_appended_into_a_refined_mask_equals_the_stroke_drawn_whole() {
     }
 }
 
+/// The synthetic photo drawn `by` times over on each side: each of its pixels
+/// a block of `by` by `by`.
+fn synthetic_photo_times(by: u32) -> Photo {
+    let small = synthetic_photo();
+    let side = SIZE * by;
+    let mut rgba8 = Vec::with_capacity((side * side * 4) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let at = (((y / by) * SIZE + x / by) * 4) as usize;
+            rgba8.extend_from_slice(&small.rgba8[at..at + 4]);
+        }
+    }
+    Photo {
+        width: side,
+        height: side,
+        rgba8,
+        ..small
+    }
+}
+
+/// `rect` with `by` more pixels on every side, inside a frame of `size`, as
+/// the render grows the reach of new dabs.
+fn grown_by(rect: (u32, u32, u32, u32), by: u32, size: (u32, u32)) -> (u32, u32, u32, u32) {
+    let (x0, y0) = (rect.0.saturating_sub(by), rect.1.saturating_sub(by));
+    let x1 = (rect.0 + rect.2 + by).min(size.0).max(x0);
+    let y1 = (rect.1 + rect.3 + by).min(size.1).max(y0);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+fn overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (x0, y0) = (a.0.max(b.0), a.1.max(b.1));
+    let (x1, y1) = ((a.0 + a.2).min(b.0 + b.2), (a.1 + a.3).min(b.1 + b.3));
+    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+}
+
+/// A stroke appended into a mask with Refine edges and the three edge
+/// controls on, then erased from, equals the strokes drawn whole: each stage
+/// of the shape is drawn again over the reach of the stage before it grown
+/// by its own reach, and none of them whole after the first render. On the
+/// 64 pixel photo a Shift edge of 1 percent lies under the octagon's first
+/// pixel and runs no pass, so this test draws the synthetic photo four times
+/// over, 256 pixels a side, where it grows the octagon one pixel along each
+/// axis and each diagonal.
+#[test]
+fn a_stroke_appended_into_an_edged_refined_mask_equals_the_stroke_drawn_whole() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    const BY: u32 = 4;
+    let side = SIZE * BY;
+    let photo = synthetic_photo_times(BY);
+    let readback = Readback::new(&gpu.device);
+    let edge = Edge {
+        shift: -0.01,
+        feather: 0.01,
+        contrast: 50.0,
+    };
+    let at = |full: u32| gamut_color::edge::Plan::new(&edge, (full, full), (0, 0), (full, full));
+    assert!(
+        !at(SIZE).shifts(),
+        "no Shift edge pass on the 64 pixel photo"
+    );
+    let plan = at(side);
+    assert!(plan.shifts() && plan.feathers() && plan.contrasts());
+    let refine = Refine {
+        amount: 100.0,
+        radius: 0.05,
+        sensitivity: 50.0,
+    };
+    let refine_reach = Plan::new(&refine, (side, side), (0, 0), (side, side)).reach();
+    let (shift_reach, feather_reach) = (plan.shift_reach(), plan.feather_reach());
+    println!(
+        "reach in pixels: refine {refine_reach}, shift {shift_reach}, feather {feather_reach}"
+    );
+    assert!(shift_reach > 0 && feather_reach > 0);
+
+    // Down column 7 of the small photo, two of its columns over the grey
+    // ramp, then across its row 56, two of its rows over the band.
+    let path: Vec<[f32; 2]> = (0..=40)
+        .map(|i| {
+            if i <= 20 {
+                [0.11, 0.1 + i as f32 / 20.0 * 0.775]
+            } else {
+                [0.11 + (i - 20) as f32 / 20.0 * 0.7, 0.875]
+            }
+        })
+        .collect();
+    let eraser: Vec<[f32; 2]> = (0..=20)
+        .map(|i| [0.5, 0.7 + i as f32 / 20.0 * 0.25])
+        .collect();
+    let edit_at = |painted: usize, erased: usize, edged: bool| -> PhotoEdit {
+        let mut strokes = vec![stroke(&path[..painted], 0.05, 20.0, 100.0)];
+        if erased > 0 {
+            strokes.push(Stroke {
+                erase: true,
+                ..stroke(&eraser[..erased], 0.04, 20.0, 100.0)
+            });
+        }
+        let mut edit = everything_global();
+        let mut growing = exposure_mask("Growing", brush_source(&strokes));
+        growing.adjust.clarity = 25.0;
+        growing.refine = refine;
+        if edged {
+            growing.edge = edge;
+        }
+        edit.masks = vec![growing, exposure_mask("Radial", radial_source())];
+        edit
+    };
+    // At 100 percent, the lower left of the photo, where the stroke turns:
+    // both of its edges and the eraser lie in what is seen.
+    let view = ViewWindow {
+        full: (side, side),
+        window: (0, 30 * BY, 52 * BY, 34 * BY),
+        visible: (0, 40 * BY, 40 * BY, 24 * BY),
+    };
+    for zoomed in [false, true] {
+        let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+            if zoomed {
+                view_render_of(develop, &gpu, &readback, edit, &view)
+            } else {
+                let drawn = develop
+                    .render(edit, CropRect::FULL, (side, side), (side, side))
+                    .expect("a source is set");
+                readback.read(&gpu.device, &gpu.queue, drawn, side, side)
+            }
+        };
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        let mut pieces = Vec::new();
+        let mut traces = Vec::new();
+        for piece in 1..=10 {
+            pieces.push(render(&mut develop, &edit_at(piece * 4 + 1, 0, true)));
+            traces.push(develop.shape_redrawn(0));
+        }
+        for piece in 1..=5 {
+            pieces.push(render(&mut develop, &edit_at(41, piece * 4 + 1, true)));
+            traces.push(develop.shape_redrawn(0));
+        }
+        assert!(pieces[0] != pieces[9], "the stroke grew on the picture");
+        assert!(
+            pieces[9] != pieces[14],
+            "and the eraser took some of it away"
+        );
+        assert_eq!(
+            develop.brush_layer_builds(),
+            1,
+            "the layer stamped whole once"
+        );
+        assert_eq!(develop.brush_layer_appends(), 14, "then new dabs only");
+        let (whole_refines, part_refines) = develop.refine_builds();
+        let (alphas, develops) = develop.brush_patches();
+        let (whole_edges, part_edges) = develop.edge_builds();
+        let passes = develop.edge_passes();
+        println!(
+            "zoomed {zoomed}: the alpha over a part {alphas}, the develop {develops}; the refined alpha whole {whole_refines} and over a part {part_refines}; shift, feather and finished alpha whole {whole_edges:?} and over a part {part_edges:?}; passes shift {}, feather {}, finish {}",
+            passes.shift, passes.feather, passes.finish
+        );
+        assert_eq!(whole_refines, 1, "no whole refine pass after the first");
+        assert_eq!(whole_edges, [1, 1, 1], "no whole edge pass after the first");
+        assert_eq!(develop.refine_source_builds(), 1, "the source taken once");
+        if zoomed {
+            assert!(alphas > 0 && alphas <= 14 && develops > 0 && develops <= alphas);
+            assert!(part_refines > 0 && part_refines <= alphas);
+            assert_eq!(part_edges[0], part_refines, "a shift after each refine");
+            assert!(part_edges[1] > 0 && part_edges[1] <= part_edges[0]);
+            assert_eq!(
+                part_edges[2], part_edges[1],
+                "the finished alpha after each"
+            );
+        } else {
+            assert_eq!((alphas, develops, part_refines), (14, 14, 14), "parts only");
+            assert_eq!(part_edges, [14, 14, 14], "parts only");
+        }
+
+        // Each stage drew again over the stage before it grown by its own
+        // reach, and nothing where the stage before drew nothing.
+        for (piece, trace) in traces.iter().enumerate().skip(1) {
+            let frame = (0, 0, trace.frame.0, trace.frame.1);
+            let Some(alpha) = trace.alpha else {
+                assert_eq!(
+                    (trace.refine, trace.shift, trace.feather, trace.finish),
+                    (None, None, None, None),
+                    "piece {piece}, zoomed {zoomed}"
+                );
+                continue;
+            };
+            assert_ne!(alpha, frame, "piece {piece}: the alpha over a part");
+            let refined = overlap(grown_by(alpha, refine_reach, trace.frame), frame);
+            assert_eq!(trace.refine, refined, "piece {piece}, zoomed {zoomed}");
+            let refined = refined.expect("the refine reach holds the new dabs");
+            assert_ne!(refined, frame, "piece {piece}: the refine over a part");
+            let shifted = overlap(grown_by(refined, shift_reach, trace.frame), frame);
+            assert_eq!(trace.shift, shifted, "piece {piece}, zoomed {zoomed}");
+            let shifted = shifted.expect("the shift reach holds the refine's");
+            assert_ne!(shifted, frame, "piece {piece}: the shift over a part");
+            let feathered = overlap(grown_by(shifted, feather_reach, trace.frame), trace.region);
+            assert_eq!(trace.feather, feathered, "piece {piece}, zoomed {zoomed}");
+            assert_eq!(trace.finish, feathered, "piece {piece}, zoomed {zoomed}");
+            assert_ne!(
+                feathered,
+                Some(trace.region),
+                "piece {piece}: the feather over a part"
+            );
+        }
+
+        let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+        fresh.set_source(&photo);
+        let whole = render(&mut fresh, &edit_at(41, 21, true));
+        assert_eq!(fresh.brush_layer_appends(), 0);
+        assert_eq!(fresh.refine_builds(), (1, 0));
+        assert_eq!(fresh.edge_builds(), ([1, 1, 1], [0, 0, 0]));
+        let max = max_difference(&pieces[14], &whole);
+        println!(
+            "a stroke appended into an edged refined mask against the stroke whole, zoomed {zoomed}: max difference {max}"
+        );
+        assert!(max <= 1, "max difference {max}, zoomed {zoomed}");
+
+        // The edge controls are in what was compared: without them the
+        // picture is another.
+        let plain = render(&mut fresh, &edit_at(41, 21, false));
+        let moved = whole
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(plain.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        let pixels = whole.len() / 4;
+        println!("the edge controls move {moved} of {pixels} pixels, zoomed {zoomed}");
+        assert!(
+            moved * 100 > pixels,
+            "the edge controls move {moved} pixels"
+        );
+    }
+}
+
 /// A tower of two tones against a sky: dark slate on its left half and pale
 /// stone on its right, columns 24 to 39 from row 10 down, with a little grain
 /// so no two cells are alike.
