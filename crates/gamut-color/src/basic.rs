@@ -341,7 +341,21 @@ pub fn gaussian_stored(
     sigma: f32,
     store: &dyn Fn(f32) -> f32,
 ) -> Vec<f32> {
-    let radius = blur_radius(sigma);
+    gaussian_stored_radius(source, width, height, sigma, blur_radius(sigma), store)
+}
+
+/// [`gaussian_stored`] over `2 radius + 1` taps with no cap on the radius: the
+/// same kernel arithmetic in the same order. Feather (edge.rs) blurs its cell
+/// grid through it, so at cells of one pixel its result is the one
+/// [`gaussian_stored`] gives, bit for bit.
+pub fn gaussian_stored_radius(
+    source: &[f32],
+    width: u32,
+    height: u32,
+    sigma: f32,
+    radius: i32,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
     let weights: Vec<f32> = (-radius..=radius)
         .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
         .collect();

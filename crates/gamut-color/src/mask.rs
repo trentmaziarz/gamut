@@ -20,7 +20,7 @@ use gamut_core::{Adjustments, CropRect, EXPOSURE_LIMIT, PhotoEdit, SLIDER_LIMIT,
 
 use crate::basic::{self, Neighbourhood, Prepared};
 use crate::brush::{self, Dab, Proxy};
-use crate::{acescct, hue, refine, wheels};
+use crate::{acescct, edge, hue, refine, wheels};
 
 /// The chroma above `chroma_low` at which a colour range is fully on.
 pub const CHROMA_RAMP: f32 = 0.01;
@@ -250,7 +250,9 @@ pub fn alpha_image_with(
 /// The alpha of a mask over every pixel of a render before the r8unorm
 /// store rounds it. With Refine edges on, that is the refined alpha, which
 /// the filter made from the stored alpha of the components: the GPU keeps
-/// both in r8unorm.
+/// both in r8unorm. With an edge control on, it is the finished alpha:
+/// Shift edge, Feather and Contrast applied to the stored alpha Refine edges
+/// hands on, which the GPU also keeps in r8unorm.
 pub fn alpha_image_before_the_store(
     mask: &Mask,
     pixels: &[[f32; 3]],
@@ -269,11 +271,20 @@ pub fn alpha_image_before_the_store(
             stamped.alpha(at, *px, layer_store)
         })
         .collect();
-    if mask.refine.is_off() {
+    if mask.refine.is_off() && mask.edge.is_off() {
         return alpha;
     }
     let stored: Vec<f32> = alpha.into_iter().map(stored_alpha).collect();
-    refine::refined(&stored, pixels, geometry, &mask.refine, &|moment| moment)
+    let refined = if mask.refine.is_off() {
+        stored
+    } else {
+        refine::refined(&stored, pixels, geometry, &mask.refine, &|moment| moment)
+    };
+    if mask.edge.is_off() {
+        return refined;
+    }
+    let held: Vec<f32> = refined.into_iter().map(stored_alpha).collect();
+    edge::finished(&held, geometry, &mask.edge, &|cell| cell)
 }
 
 fn add_wheel(global: Wheel, mask: Wheel) -> Wheel {
@@ -1031,6 +1042,194 @@ mod tests {
             "the spill is left at {}",
             row(&refined, 24)
         );
+    }
+
+    #[test]
+    fn the_alpha_image_is_the_finished_one_when_the_mask_has_edge_controls() {
+        use gamut_core::mask::{Edge, Refine};
+        let size = (48, 32);
+        let geometry = Geometry::full(size, size);
+        let pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| if i % size.0 < 24 { [0.03; 3] } else { [0.5; 3] })
+            .collect();
+        let gradient = RadialGradient {
+            centre: [0.3, 0.5],
+            feather: 15.0,
+            ..RadialGradient::default()
+        };
+        let plain_mask = Mask::new("Across", MaskSource::Radial(gradient));
+        let plain = alpha_image(&plain_mask, &pixels, &geometry);
+        let edged = Edge {
+            shift: 0.05,
+            feather: 0.04,
+            contrast: 30.0,
+        };
+        for refine in [
+            Refine::default(),
+            Refine {
+                amount: 100.0,
+                radius: 0.05,
+                sensitivity: 50.0,
+            },
+        ] {
+            let mut mask = plain_mask.clone();
+            mask.refine = refine;
+            let before = alpha_image(&mask, &pixels, &geometry);
+            // The three at 0, or at values sanitising takes to 0: bit for bit
+            // what no edge draws.
+            let mut at_rest = mask.clone();
+            at_rest.edge = Edge {
+                shift: 0.0,
+                feather: -1.0,
+                contrast: f32::NAN,
+            };
+            assert!(at_rest.edge.is_off());
+            let rest = alpha_image(&at_rest, &pixels, &geometry);
+            assert!(
+                before
+                    .iter()
+                    .zip(&rest)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+            mask.edge = edged;
+            let finished = alpha_image(&mask, &pixels, &geometry);
+            // The chain of the stored alpha Refine edges hands on, stored.
+            let held: Vec<f32> = if refine.is_off() {
+                plain.clone()
+            } else {
+                refine::refined(&plain, &pixels, &geometry, &refine, &|v| v)
+                    .into_iter()
+                    .map(stored_alpha)
+                    .collect()
+            };
+            assert_eq!(held, before);
+            let want: Vec<f32> = edge::finished(&held, &geometry, &edged, &|v| v)
+                .into_iter()
+                .map(stored_alpha)
+                .collect();
+            assert_eq!(finished, want, "refine {refine:?}");
+            assert_ne!(finished, before, "the controls show");
+        }
+    }
+
+    /// A picture of rolling light and dark, dark left of column 400 and
+    /// bright right of it, and a luminance range mask that is neither 0 nor 1
+    /// over much of it, so a window that cuts what a step reads shows it.
+    fn rolling(full: (u32, u32)) -> (Vec<[f32; 3]>, Mask) {
+        let pixels = (0..full.0 * full.1)
+            .map(|i| {
+                let (x, y) = ((i % full.0) as f32, (i / full.0) as f32);
+                let roll = 0.5 + 0.5 * (x * 0.05).sin() * (y * 0.07).cos();
+                let v = if x < 400.0 {
+                    0.02 + 0.1 * roll
+                } else {
+                    0.2 + 0.5 * roll
+                };
+                [v, v * 0.9, v * 0.8]
+            })
+            .collect();
+        let mask = Mask::new(
+            "Rolling",
+            MaskSource::Luminance(LuminanceRange {
+                low: 0.45,
+                high: 0.6,
+                falloff: 0.15,
+            }),
+        );
+        (pixels, mask)
+    }
+
+    /// The finished alpha of one rectangle before the store, from the whole
+    /// render and from a window that holds it and `pad` pixels around it.
+    fn whole_and_window(mask: &Mask, pad: u32) -> (Vec<f32>, Vec<f32>) {
+        let full = (640u32, 480u32);
+        let (pixels, _) = rolling(full);
+        let finished = |pixels: &[[f32; 3]], geometry: &Geometry| {
+            alpha_image_before_the_store(mask, pixels, geometry, None, &|a| a)
+        };
+        let whole = finished(&pixels, &Geometry::full(full, full));
+        let wanted = (401u32, 187u32, 60u32, 50u32);
+        let (x0, y0) = (wanted.0 - pad.min(wanted.0), wanted.1 - pad.min(wanted.1));
+        let x1 = (wanted.0 + wanted.2 + pad).min(full.0);
+        let y1 = (wanted.1 + wanted.3 + pad).min(full.1);
+        let size = (x1 - x0, y1 - y0);
+        let seen: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| pixels[((y0 + i / size.0) * full.0 + x0 + i % size.0) as usize])
+            .collect();
+        let geometry = Geometry {
+            window: CropRect {
+                x: x0 as f32 / full.0 as f32,
+                y: y0 as f32 / full.1 as f32,
+                width: size.0 as f32 / full.0 as f32,
+                height: size.1 as f32 / full.1 as f32,
+            },
+            size,
+            photo: full,
+        };
+        let window = finished(&seen, &geometry);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for y in wanted.1..wanted.1 + wanted.3 {
+            for x in wanted.0..wanted.0 + wanted.2 {
+                a.push(whole[(y * full.0 + x) as usize]);
+                b.push(window[((y - y0) * size.0 + x - x0) as usize]);
+            }
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn a_window_padded_by_the_reach_of_refine_and_the_edge_gives_what_the_full_render_gives() {
+        use gamut_core::mask::{Edge, Refine};
+        let full = (640, 480);
+        let (_, plain) = rolling(full);
+        let refined = Refine {
+            amount: 100.0,
+            radius: 0.012,
+            sensitivity: 50.0,
+        };
+        let off = Refine::default();
+        let edge = |shift: f32, feather: f32, contrast: f32| Edge {
+            shift,
+            feather,
+            contrast,
+        };
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
+        // Each case with the step it must fail by: one feather cell, or none
+        // where a step upstream reads less than its reach, so the chain holds
+        // with one step less. edge.rs holds Shift edge to one pixel less on a
+        // ramp, where the farthest sample is always the one that counts.
+        // Cells of an odd side hold with one step less (the reach counts the
+        // cell a window may cut whole), so the feather cases take cells of 4.
+        for (refine, edge, short) in [
+            (refined, edge(-0.01, 0.02, 40.0), false),
+            (refined, edge(0.01, 0.03, 0.0), false),
+            (off, edge(0.02, 0.02, 80.0), false),
+            (off, edge(0.0, 0.025, 0.0), true),
+            (off, edge(0.0, 0.03, 50.0), true),
+            (off, edge(0.02, 0.0, 0.0), false),
+            (off, edge(0.01, 0.0, 30.0), false),
+        ] {
+            let mut mask = plain.clone();
+            mask.refine = refine;
+            mask.edge = edge;
+            let plan = edge::Plan::new(&edge, full, (0, 0), full);
+            let pad = refine::reach(&refine, full) + edge::reach(&edge, full);
+            let (whole, window) = whole_and_window(&mask, pad);
+            assert!(
+                whole.iter().any(|v| *v != whole[0]),
+                "the mask is not flat in what is wanted: {edge:?}"
+            );
+            assert!(same(&whole, &window), "{refine:?} {edge:?}, pad {pad}");
+            // One step less and the window cuts what the step reads.
+            if !short {
+                continue;
+            }
+            assert_eq!(plan.step, 4, "{edge:?}");
+            let less = plan.step;
+            let (whole, window) = whole_and_window(&mask, pad - less);
+            assert!(!same(&whole, &window), "{edge:?}, pad {}", pad - less);
+        }
     }
 
     #[test]

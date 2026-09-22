@@ -22,6 +22,7 @@ pub mod brush;
 pub mod curve;
 pub mod daylight;
 pub mod dehaze;
+pub mod edge;
 pub mod hsl;
 pub mod hue;
 pub mod icc;
