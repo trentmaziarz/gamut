@@ -11,7 +11,9 @@
 //! frames plays the clip under an auto brush mask of 200 strokes of 50
 //! points: its layer reads the frame, so every frame builds the proxy of the
 //! source and stamps the layer again, and its p95 must stay inside a frame
-//! at 30 fps as well.
+//! at 30 fps as well. So must two more runs of 100 frames: the same mask
+//! with Refine edges at 100, and with Shift edge, Feather and Contrast on
+//! over that.
 
 use std::time::Instant;
 
@@ -302,7 +304,68 @@ fn playback_at_4k30_is_fast_enough() {
         refined[refined.len() - 1]
     );
 
+    // The same with Shift edge -1 percent, Feather 1 percent and Contrast 50
+    // on that mask: its refined alpha is new on every frame, so each edge
+    // stage is drawn again whole on every frame. On a CPU adapter that is
+    // seconds a frame and says nothing about a GPU, so it runs on a GPU alone.
+    let mut edged_p95 = None;
+    if gpu.adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        println!("the edged playback line skipped on a CPU adapter");
+    } else {
+        let mut edged_edit = refined_edit.clone();
+        for mask in &mut edged_edit.masks {
+            mask.edge = gamut_core::mask::Edge {
+                shift: -0.01,
+                feather: 0.01,
+                contrast: 50.0,
+            };
+        }
+        let (stages, _) = develop.edge_builds();
+        let mut edged = Vec::with_capacity(100);
+        for i in 0..=100 {
+            let started = Instant::now();
+            let Some(frame) = source.next_frame().expect("decode") else {
+                break;
+            };
+            develop.set_video_frame(&frame, colour, rotation);
+            develop
+                .render(&edged_edit, crop, render_size, OUTPUT)
+                .expect("the source is set");
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("wait for the render");
+            if i > 0 {
+                edged.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        assert!(
+            edged.len() >= 50,
+            "the clip is long enough for the edged run"
+        );
+        let frames = edged.len() as u64 + 1;
+        assert_eq!(
+            develop.edge_builds().0,
+            stages.map(|stage| stage + frames),
+            "every frame draws Shift edge, Feather and the finished alpha again whole"
+        );
+        edged.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        let p95 = edged[(edged.len() * 95 / 100).min(edged.len() - 1)];
+        println!(
+            "playback under a refined auto brush mask of {AUTO_STROKES} strokes, Radius 0.01, with Shift edge -1 percent, Feather 1 percent and Contrast 50, {} frames: p50 {:.2} ms, p95 {p95:.2} ms, max {:.2} ms (under the refined mask alone p95 {refined_p95:.2} ms)",
+            edged.len(),
+            edged[edged.len() / 2],
+            edged[edged.len() - 1]
+        );
+        edged_p95 = Some(p95);
+    }
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        if let Some(edged_p95) = edged_p95 {
+            assert!(
+                edged_p95 < GATE_P95_MS,
+                "p95 under a refined auto brush mask with the three edge controls on, {edged_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
+            );
+        }
         assert!(
             refined_p95 < GATE_P95_MS,
             "p95 under a refined auto brush mask, {refined_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
