@@ -1321,59 +1321,7 @@ fn check_overlay(idle: Mask) {
         exposure: 0.3,
         ..Adjustments::default()
     });
-    edit.masks = vec![exposure_mask("Linear", linear_source()), idle.clone()];
-
-    // The reference: the developed picture through the output transform
-    // with the overlay of the second mask between the clip and the curve.
-    let linear: Vec<[f32; 3]> = photo
-        .rgba8
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
-        .collect();
-    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
-    // The overlay shows the alpha itself, and near black one code of alpha
-    // is six of the output, so the reference takes the unorm store at every
-    // step the conversion is allowed.
-    let reference = |rounding: Rounding, step: f32| -> Vec<[u8; 3]> {
-        let stored: Vec<[f32; 3]> = linear
-            .iter()
-            .map(|px| px.map(|c| half(c, rounding)))
-            .collect();
-        let store = |v: f32| half(v, rounding);
-        let alphas: Vec<f32> =
-            mask_twin::alpha_image_before_the_store(&idle, &stored, &geometry, None, &store)
-                .into_iter()
-                .map(|alpha| mask_twin::stored_alpha_stepping(alpha, step))
-                .collect();
-        let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
-        let base = basic::gaussian_stored(&luma, SIZE, SIZE, basic::base_sigma(SIZE, SIZE), &store);
-        let clear = vec![1.0; stored.len()];
-        let image = Image {
-            pixels: &stored,
-            base: &base,
-            texture: &luma,
-            transmission: &clear,
-            geometry,
-            proxy: None,
-        };
-        mask_twin::develop_image_with(&image, &edit, [1.0; 3], &store, &store)
-            .into_iter()
-            .zip(alphas)
-            .map(|(px, alpha)| {
-                let srgb = matrices::rec2020_to_srgb()
-                    .apply(px)
-                    .map(|c| c.clamp(0.0, 1.0));
-                mask_twin::overlay(srgb, alpha).map(transfer::linear_to_srgb8)
-            })
-            .collect()
-    };
-    let tolerance = mask_twin::UNORM_STEP_TOLERANCE;
-    let references: Vec<Vec<[u8; 3]>> = [Rounding::Nearest, Rounding::TowardZero]
-        .into_iter()
-        .flat_map(|rounding| [-tolerance, 0.0, tolerance].map(|step| reference(rounding, step)))
-        .collect();
+    edit.masks = vec![exposure_mask("Linear", linear_source()), idle];
 
     let readback = Readback::new(&gpu.device);
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
@@ -1393,23 +1341,7 @@ fn check_overlay(idle: Mask) {
     let plain = render(&mut develop);
     develop.set_overlay(Some(1));
     let overlaid = render(&mut develop);
-    let mut max = 0;
-    let mut sum = 0u64;
-    for (i, g) in overlaid.iter().enumerate() {
-        for k in 0..3 {
-            let d = references
-                .iter()
-                .map(|r| (i32::from(r[i][k]) - i32::from(g[k])).abs())
-                .min()
-                .expect("six references");
-            max = max.max(d);
-            sum += d as u64;
-        }
-    }
-    let mean = sum as f64 / (overlaid.len() * 3) as f64;
-    println!("overlay: max {max}, mean {mean:.3}");
-    assert!(max <= MAX_DIFFERENCE, "overlay: max difference {max}");
-    assert!(mean <= MEAN_DIFFERENCE, "overlay: mean difference {mean}");
+    assert_the_overlay_matches("overlay", &photo, &edit, 1, &overlaid);
 
     // Red where the mask is, the plain picture where it is not.
     let centre = (SIZE * (SIZE * 45 / 100) + SIZE * 55 / 100) as usize;
@@ -1436,6 +1368,97 @@ fn check_overlay(idle: Mask) {
         .render_export(&edit, CropRect::FULL, ExportPreset::ALL[0])
         .expect("a source is set");
     assert_eq!(shown, hidden);
+}
+
+/// Holds `overlaid`, a render of `edit` on `photo` with the overlay of mask
+/// `shown` on, to the twin within the golden tolerances. The reference is the
+/// developed picture through the output transform, with the overlay of that
+/// mask between the clip and the curve.
+fn assert_the_overlay_matches(
+    name: &str,
+    photo: &Photo,
+    edit: &PhotoEdit,
+    shown: usize,
+    overlaid: &[[u8; 3]],
+) {
+    let linear: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
+        .collect();
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    // The overlay shows the alpha itself, and near black one code of alpha
+    // is six of the output, so the reference takes the unorm store at every
+    // step the conversion is allowed.
+    let reference = |rounding: Rounding, step: f32| -> Vec<[u8; 3]> {
+        let stored: Vec<[f32; 3]> = linear
+            .iter()
+            .map(|px| px.map(|c| half(c, rounding)))
+            .collect();
+        let store = |v: f32| half(v, rounding);
+        let alphas: Vec<f32> = mask_twin::alpha_image_before_the_store(
+            &edit.masks[shown],
+            &stored,
+            &geometry,
+            None,
+            &store,
+        )
+        .into_iter()
+        .map(|alpha| mask_twin::stored_alpha_stepping(alpha, step))
+        .collect();
+        let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
+        let base = basic::gaussian_stored(&luma, SIZE, SIZE, basic::base_sigma(SIZE, SIZE), &store);
+        let clear = vec![1.0; stored.len()];
+        let image = Image {
+            pixels: &stored,
+            base: &base,
+            texture: &luma,
+            transmission: &clear,
+            geometry,
+            proxy: None,
+        };
+        mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
+            .into_iter()
+            .zip(alphas)
+            .map(|(px, alpha)| {
+                let srgb = matrices::rec2020_to_srgb()
+                    .apply(px)
+                    .map(|c| c.clamp(0.0, 1.0));
+                mask_twin::overlay(srgb, alpha).map(transfer::linear_to_srgb8)
+            })
+            .collect()
+    };
+    let tolerance = mask_twin::UNORM_STEP_TOLERANCE;
+    let references: Vec<Vec<[u8; 3]>> = [Rounding::Nearest, Rounding::TowardZero]
+        .into_iter()
+        .flat_map(|rounding| [-tolerance, 0.0, tolerance].map(|step| reference(rounding, step)))
+        .collect();
+    let mut max = 0;
+    let mut sum = 0u64;
+    let mut worst = (0usize, [0u8; 3], [0u8; 3]);
+    for (i, g) in overlaid.iter().enumerate() {
+        for k in 0..3 {
+            let d = references
+                .iter()
+                .map(|r| (i32::from(r[i][k]) - i32::from(g[k])).abs())
+                .min()
+                .expect("six references");
+            if d > max {
+                max = d;
+                worst = (i, references[0][i], *g);
+            }
+            sum += d as u64;
+        }
+    }
+    let mean = sum as f64 / (overlaid.len() * 3) as f64;
+    println!(
+        "{name}: max {max} at pixel {} (cpu {:?}, gpu {:?}), mean {mean:.3}",
+        worst.0, worst.1, worst.2
+    );
+    assert!(max <= MAX_DIFFERENCE, "{name}: max difference {max}");
+    assert!(mean <= MEAN_DIFFERENCE, "{name}: mean difference {mean}");
 }
 
 fn stroke(points: &[[f32; 2]], size: f32, feather: f32, flow: f32) -> Stroke {
@@ -4031,6 +4054,100 @@ fn a_feather_slider_across_a_cell_step_draws_no_shift_pass_and_matches() {
         feather_alone,
         "a Feather slider from 0 makes the cells again"
     );
+}
+
+/// The blend and the overlay read the alpha the edge controls hand on, and
+/// follow it when a control comes on or goes to 0: the finished alpha, the
+/// shifted alpha, the finished alpha made again, and the alpha under the
+/// three. One Develop renders the steps in turn, first the picture and then
+/// the overlay of the mask held on, with Refine edges off and then on. Every
+/// render matches the twin.
+#[test]
+fn the_blend_and_the_overlay_follow_each_edge_control_on_and_off() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<[u8; 3]> {
+        let view = develop
+            .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
+            .expect("a source is set");
+        readback
+            .read(&gpu.device, &gpu.queue, view, SIZE, SIZE)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
+    };
+    // Shift edge, Feather and Contrast at each step, and the alpha the blend
+    // reads after it.
+    let steps = [
+        (0.02, 0.01, 50.0, "the three on, the finished alpha"),
+        (
+            0.02,
+            0.0,
+            0.0,
+            "Feather and Contrast to 0, the shifted alpha",
+        ),
+        (
+            0.02,
+            0.0,
+            50.0,
+            "Contrast on alone, the finished alpha made again",
+        ),
+        (
+            0.02,
+            0.01,
+            0.0,
+            "Feather on and Contrast to 0, the finished alpha",
+        ),
+        (0.0, 0.0, 0.0, "the three to 0, the alpha under them"),
+        (0.02, 0.0, 0.0, "Shift edge on again, the shifted alpha"),
+    ];
+    // A mask Refine edges moves, clear of the near-black band, where one code
+    // of alpha is six of the overlay.
+    for refine in [false, true] {
+        let mask = exposure_mask("Brush", stroke_along_the_grey_columns());
+        let mask = if refine { refined(mask) } else { mask };
+        if refine {
+            let moved = assert_the_refine_shows(&photo, &masked(vec![mask.clone()]));
+            println!("Refine edges moves {moved} pixels of the twin");
+        }
+        let edits: Vec<(String, PhotoEdit)> = steps
+            .iter()
+            .map(|&(shift, feather, contrast, step)| {
+                let edit = masked(vec![edged_at(mask.clone(), shift, feather, contrast)]);
+                (format!("refine {refine}, {step}"), edit)
+            })
+            .collect();
+        for (name, edit) in &edits {
+            if edit.masks[0].edge != Edge::default() {
+                let moved = assert_the_edge_shows(&photo, edit);
+                println!("{name}: the edge controls move {moved} pixels of the twin");
+            }
+        }
+        // The overlay stays on through its steps, so each change of the alpha
+        // reaches a bind made before it, as it does for the blend.
+        develop.set_overlay(None);
+        for (name, edit) in &edits {
+            let pixels = render(&mut develop, edit);
+            assert_matches_the_twin(name, &photo, edit, &pixels);
+        }
+        develop.set_overlay(Some(0));
+        for (name, edit) in &edits {
+            let overlaid = render(&mut develop, edit);
+            assert_the_overlay_matches(&format!("{name}, overlay"), &photo, edit, 0, &overlaid);
+        }
+    }
 }
 
 /// An edged mask under a crop window and under a zoomed window equals the
