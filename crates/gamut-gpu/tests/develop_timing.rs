@@ -540,18 +540,31 @@ impl Drawn {
     /// Holds that no mask alpha and no Refine edges pass was drawn since
     /// `self`, and no edge stage before `first`: 0 Shift edge, 1 Feather's
     /// cells, 2 the finished alpha, 3 none of them. A Feather slider whose
-    /// cell grid grows past the held cell texture allocates it again, which
-    /// draws every stage once, so it may draw Shift edge once.
+    /// cell grid grows past the held cell texture makes the cells again and
+    /// still draws no Shift edge pass.
     fn hold(&self, develop: &Develop, first: usize, what: &str) {
         let now = Drawn::of(develop);
         assert_eq!(now.alphas, self.alphas, "{what} drew a mask alpha again");
         assert_eq!(now.refines, self.refines, "{what} drew a Refine edges pass");
         for stage in 0..first.min(3) {
-            let allowed = u64::from(stage == 0 && first == 1);
-            assert!(
-                now.stages[stage] - self.stages[stage] <= allowed,
+            assert_eq!(
+                now.stages[stage],
+                self.stages[stage],
                 "{what} drew edge stage {stage} {} times",
                 now.stages[stage] - self.stages[stage]
+            );
+        }
+        let passes = [
+            (now.passes.shift, self.passes.shift),
+            (now.passes.feather, self.passes.feather),
+            (now.passes.finish, self.passes.finish),
+        ];
+        for (stage, (now, then)) in passes.into_iter().enumerate().take(first) {
+            assert_eq!(
+                now,
+                then,
+                "{what} drew {} passes of edge stage {stage}",
+                now - then
             );
         }
     }
