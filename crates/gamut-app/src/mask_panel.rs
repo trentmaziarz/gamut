@@ -1,8 +1,9 @@
 //! The Masks section of the Adjust tab: the list of masks, the buttons that
 //! make one of each source, and under the selected mask its opacity, Refine
-//! edges, invert and overlay, its components with their operators, and the
-//! numbers of each source. A brush component has a Paint button that arms it, the settings
-//! of the brush, how many strokes it holds and Clear strokes.
+//! edges, Shift edge, Feather and Contrast, invert and overlay, its
+//! components with their operators, and the numbers of each source. A brush
+//! component has a Paint button that arms it, the settings of the brush, how
+//! many strokes it holds and Clear strokes.
 //!
 //! Selecting a mask is what points the Basic, Presence, Curve, Mixer and
 //! Grading sections at it (see `adjust.rs`), and what shows its handles on
@@ -11,9 +12,9 @@
 
 use gamut_core::brush::{Brush, MAX_BRUSH_SIZE, MIN_BRUSH_SIZE, MIN_FLOW};
 use gamut_core::mask::{
-    ColourRange, Component, LinearGradient, LuminanceRange, MAX_COMPONENTS, MAX_MASKS, MAX_RADIUS,
-    MAX_REFINE_RADIUS, MIN_RADIUS, MIN_REFINE_RADIUS, Mask, MaskOp, MaskSource, RadialGradient,
-    Refine, free_name,
+    ColourRange, Component, Edge, LinearGradient, LuminanceRange, MAX_COMPONENTS,
+    MAX_EDGE_CONTRAST, MAX_EDGE_FEATHER, MAX_EDGE_SHIFT, MAX_MASKS, MAX_RADIUS, MAX_REFINE_RADIUS,
+    MIN_RADIUS, MIN_REFINE_RADIUS, Mask, MaskOp, MaskSource, RadialGradient, Refine, free_name,
 };
 
 use crate::adjust::AdjustState;
@@ -441,6 +442,64 @@ fn refine_fields(ui: &mut egui::Ui, refine: &mut Refine) -> bool {
     edited
 }
 
+/// Shift edge as the slider shows it: percent of the longer side of the
+/// photo, either way.
+const EDGE_SHIFT_PERCENT: std::ops::RangeInclusive<f32> =
+    -MAX_EDGE_SHIFT * 100.0..=MAX_EDGE_SHIFT * 100.0;
+
+/// Feather as the slider shows it: percent of the longer side of the photo.
+const EDGE_FEATHER_PERCENT: std::ops::RangeInclusive<f32> = 0.0..=MAX_EDGE_FEATHER * 100.0;
+
+/// The smallest step a logarithmic edge slider takes off 0, in percent.
+const EDGE_SMALLEST_PERCENT: f64 = 0.01;
+
+/// Shift edge, Feather and Contrast of the selected mask, always shown. They
+/// act in that order on the alpha Refine edges hands on. They are edits,
+/// saved with the mask. Whether one changed.
+fn edge_fields(ui: &mut egui::Ui, edge: &mut Edge) -> bool {
+    let mut edited = false;
+    let mut shift = edge.shift * 100.0;
+    let slider = egui::Slider::new(&mut shift, EDGE_SHIFT_PERCENT)
+        .logarithmic(true)
+        .smallest_positive(EDGE_SMALLEST_PERCENT)
+        .fixed_decimals(2)
+        .suffix(" %")
+        .text("Shift edge");
+    if ui
+        .add(slider)
+        .on_hover_text(
+            "Moves the edge of the mask out (over 0) or in (under 0), \
+             as a share of the longer side",
+        )
+        .changed()
+    {
+        edge.shift = shift / 100.0;
+        edited = true;
+    }
+    let mut feather = edge.feather * 100.0;
+    let slider = egui::Slider::new(&mut feather, EDGE_FEATHER_PERCENT)
+        .logarithmic(true)
+        .smallest_positive(EDGE_SMALLEST_PERCENT)
+        .fixed_decimals(2)
+        .suffix(" %")
+        .text("Feather");
+    if ui
+        .add(slider)
+        .on_hover_text(
+            "Softens the edge of the mask over this width, as a share of the longer side",
+        )
+        .changed()
+    {
+        edge.feather = feather / 100.0;
+        edited = true;
+    }
+    edited |= ui
+        .add(egui::Slider::new(&mut edge.contrast, 0.0..=MAX_EDGE_CONTRAST).text("Contrast"))
+        .on_hover_text("Makes a soft edge of the mask firmer; at 100 the edge is hard")
+        .changed();
+    edited
+}
+
 fn selected_mask(
     ui: &mut egui::Ui,
     mask: &mut Mask,
@@ -452,6 +511,7 @@ fn selected_mask(
         .add(egui::Slider::new(&mut mask.opacity, 0.0..=100.0).text("Opacity"))
         .changed();
     outcome.edited |= refine_fields(ui, &mut mask.refine);
+    outcome.edited |= edge_fields(ui, &mut mask.edge);
     ui.horizontal(|ui| {
         outcome.edited |= ui.checkbox(&mut mask.invert, "Invert").changed();
         outcome.view_changed |= ui
@@ -886,6 +946,127 @@ mod tests {
             refine.sanitised(),
             "what the sliders give is in range"
         );
+        assert_eq!(masks[0], before[0]);
+    }
+
+    /// The first place, row by row, where a click makes `hit` true of the
+    /// selected mask, tried each time on a copy of the state.
+    fn click_where(
+        ctx: &egui::Context,
+        masks: &[Mask],
+        adjust: &AdjustState,
+        rows: std::ops::Range<usize>,
+        hit: impl Fn(&Mask) -> bool,
+    ) -> Option<egui::Pos2> {
+        for y in rows.step_by(5) {
+            for x in (10..410).step_by(10) {
+                let at = egui::Pos2::new(x as f32, y as f32);
+                let (mut masks, mut adjust) = (masks.to_vec(), adjust.clone());
+                click(ctx, &mut masks, &mut adjust, at);
+                if hit(&masks[1]) {
+                    return Some(at);
+                }
+            }
+        }
+        None
+    }
+
+    /// Shift edge, Feather and Contrast of the selected mask, dragged through
+    /// egui: they show while Refine edges is at 0, they lie in that order
+    /// under Refine edges (and under its two sliders while they show) and
+    /// above Invert, and each drag is an edit of its own control of the
+    /// selected mask alone.
+    #[test]
+    fn the_three_edge_sliders_always_show_and_each_drag_edits_the_selected_mask_alone() {
+        let ctx = egui::Context::default();
+        let mut masks = named(&["Other", "Chosen"]);
+        let mut adjust = AdjustState::default();
+        adjust.select_mask(Some(1));
+        let before = masks.clone();
+        // Warm up: egui tests a pointer against the widgets of the frame before.
+        panel_frame(&ctx, &mut masks, &mut adjust, Vec::new());
+        assert!(masks[1].refine.is_off() && masks[1].edge.is_off());
+
+        let amount = drag_where(&ctx, &masks, &adjust, 0..1400, |mask| {
+            mask.refine.amount > 0.0
+        })
+        .expect("a Refine edges slider to drag");
+        let below = amount.y as usize + 4..amount.y as usize + 200;
+        let shift = drag_where(&ctx, &masks, &adjust, below.clone(), |mask| {
+            mask.edge.shift != 0.0
+        })
+        .expect("a Shift edge slider to drag while Refine edges is at 0");
+        let feather = drag_where(&ctx, &masks, &adjust, below.clone(), |mask| {
+            mask.edge.feather != 0.0
+        })
+        .expect("a Feather slider to drag while Refine edges is at 0");
+        let contrast = drag_where(&ctx, &masks, &adjust, below.clone(), |mask| {
+            mask.edge.contrast != 0.0
+        })
+        .expect("a Contrast slider to drag while Refine edges is at 0");
+        let invert = click_where(&ctx, &masks, &adjust, below, |mask| mask.invert)
+            .expect("an Invert checkbox to click");
+        assert!(
+            amount.y < shift.y && shift.y < feather.y && feather.y < contrast.y,
+            "under Refine edges: Shift edge, Feather, Contrast"
+        );
+        assert!(contrast.y < invert.y, "and above Invert");
+
+        // Each drag moves its own control and nothing else of either mask.
+        let outcome = drag(&ctx, &mut masks, &mut adjust, shift);
+        assert!(outcome.edited, "a drag of Shift edge is an edit");
+        let shifted = masks[1].edge;
+        assert!(shifted.shift != 0.0 && shifted.shift.abs() <= MAX_EDGE_SHIFT);
+        assert_eq!((shifted.feather, shifted.contrast), (0.0, 0.0));
+        let outcome = drag(&ctx, &mut masks, &mut adjust, feather);
+        assert!(outcome.edited, "a drag of Feather is an edit");
+        let feathered = masks[1].edge;
+        assert_eq!(feathered.shift, shifted.shift);
+        assert!(feathered.feather > 0.0 && feathered.feather <= MAX_EDGE_FEATHER);
+        assert_eq!(feathered.contrast, 0.0);
+        let outcome = drag(&ctx, &mut masks, &mut adjust, contrast);
+        assert!(outcome.edited, "a drag of Contrast is an edit");
+        let edge = masks[1].edge;
+        assert_eq!(
+            (edge.shift, edge.feather),
+            (shifted.shift, feathered.feather)
+        );
+        assert!(edge.contrast > 0.0 && edge.contrast <= MAX_EDGE_CONTRAST);
+        assert_eq!(edge, edge.sanitised(), "what the sliders give is in range");
+        assert!(!edge.is_off());
+        assert_eq!(masks[0], before[0], "the other mask stays as it was");
+        assert_eq!(
+            Mask {
+                edge: Edge::default(),
+                ..masks[1].clone()
+            },
+            before[1],
+            "and nothing else of the chosen one moved"
+        );
+
+        // With Refine edges on, its two sliders come between it and the three.
+        masks[1].refine.amount = 50.0;
+        panel_frame(&ctx, &mut masks, &mut adjust, Vec::new());
+        let default = Refine::default();
+        let rows = amount.y as usize + 4..amount.y as usize + 200;
+        let sensitivity = drag_where(&ctx, &masks, &adjust, rows.clone(), |mask| {
+            mask.refine.sensitivity != default.sensitivity
+        })
+        .expect("an Edge sensitivity slider to drag");
+        let held = masks[1].edge;
+        let moved = drag_where(&ctx, &masks, &adjust, rows, |mask| {
+            mask.edge.shift != held.shift
+        })
+        .expect("a Shift edge slider to drag while Refine edges is on");
+        assert!(sensitivity.y < moved.y, "under Edge sensitivity");
+        let outcome = drag(&ctx, &mut masks, &mut adjust, moved);
+        assert!(outcome.edited);
+        assert_ne!(masks[1].edge.shift, held.shift);
+        assert_eq!(
+            (masks[1].edge.feather, masks[1].edge.contrast),
+            (held.feather, held.contrast)
+        );
+        assert_eq!(masks[1].refine.amount, 50.0, "Refine edges stays as it was");
         assert_eq!(masks[0], before[0]);
     }
 
