@@ -44,6 +44,12 @@
 //! never by a slider of the develop chain, and an edit with no refined mask
 //! runs none of its passes and holds none of its float targets.
 //!
+//! After Refine edges come the three edge controls of `edge.wgsl`: Shift
+//! edge, Feather and Contrast, in that order. Each that is on keeps its
+//! output in its own texture, and the last of them is the finished alpha the
+//! develop pass and the overlay read. A mask with the three at rest runs
+//! none of their passes and holds none of their textures.
+//!
 //! M2 lets a decoded video frame stand in for the photo: the source is
 //! then the two plane textures of [`crate::video::VideoSource`] and pass 2
 //! is `yuv_to_working.wgsl`, which writes the same linear Rec.2020 working
@@ -57,6 +63,7 @@ use gamut_color::basic;
 use gamut_color::brush::Proxy as ProxyTwin;
 use gamut_color::curve::{self, TABLE_SIZE};
 use gamut_color::dehaze;
+use gamut_color::edge::{self as edge_twin, Plan as EdgePlan};
 use gamut_color::hsl::HslParams;
 use gamut_color::local;
 use gamut_color::mask::{self as mask_twin, Geometry};
@@ -66,11 +73,14 @@ use gamut_color::video::VideoColour;
 use gamut_color::wheels::Cdl;
 use gamut_core::brush::Brush;
 use gamut_core::look::ToneCurves;
-use gamut_core::mask::{MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource, Refine};
+use gamut_core::mask::{
+    Edge, MAX_COMPONENTS, MAX_MASKS, Mask, MaskOp, MaskShape, MaskSource, Refine,
+};
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
 use crate::brush_layer::{AutoInputs, BrushPass, Drawn, Layers, has_auto};
+use crate::edge::{EdgePass, EdgePasses, EdgeScratch, EdgeWork, Edged, Held as EdgeHeld};
 use crate::proxy::{self, ProxyUniform, Tile};
 use crate::refine::{RefinePass, Refined, Scratch};
 use crate::video::{VideoSource, VideoUniform};
@@ -353,6 +363,28 @@ impl Damage {
     }
 }
 
+/// Which alpha of a mask the develop pass and the overlay read: the edged
+/// alpha while an edge control is on, else the refined alpha while Refine
+/// edges is, else the alpha of the components.
+fn product_of(slot: &FrameMask) -> Product {
+    if slot.edged.as_ref().is_some_and(|e| e.product().is_some()) {
+        Product::Edged
+    } else if slot.refined.is_some() {
+        Product::Refined
+    } else {
+        Product::Alpha
+    }
+}
+
+/// The view of [`product_of`].
+fn product_view(slot: &FrameMask) -> &wgpu::TextureView {
+    slot.edged
+        .as_ref()
+        .and_then(Edged::product)
+        .or(slot.refined.as_ref().map(|refined| &refined.alpha))
+        .unwrap_or(&slot.alpha.view)
+}
+
 /// `rect` with `by` pixels more on every side, inside a render of `size`.
 fn grow(rect: PixelRect, by: u32, size: (u32, u32)) -> PixelRect {
     let (x0, y0) = (rect.0.saturating_sub(by), rect.1.saturating_sub(by));
@@ -460,6 +492,21 @@ struct Frame {
     /// The float targets Refine edges works in, shared by the masks; nothing
     /// while no mask of the edit is refined.
     refine_scratch: Option<Scratch>,
+    /// The textures the edge controls work in, shared by the masks; nothing
+    /// while no mask has Shift edge or Feather on.
+    edge_scratch: EdgeScratch,
+}
+
+/// Which alpha of a mask the develop pass and the overlay read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Product {
+    /// The alpha of the components.
+    Alpha,
+    /// The refined alpha of Refine edges.
+    Refined,
+    /// The alpha of the edge controls: shifted, or finished by Feather and
+    /// Contrast.
+    Edged,
 }
 
 /// The head-pass product of one mask: its alpha, cached like the texture
@@ -478,8 +525,12 @@ struct FrameMask {
     /// setting it holds, or `None` when it has to be drawn again.
     refined: Option<Refined>,
     refine: Option<Refine>,
-    /// Whether `develop_binds` read the refined alpha.
-    binds_refined: bool,
+    /// The pixels `refined` was last drawn over whole.
+    refined_region: PixelRect,
+    /// The products of the edge controls, while one of them is on.
+    edged: Option<Edged>,
+    /// Which alpha `develop_binds` read.
+    binds_product: Product,
     /// The layers of the mask's brush components, which `raster_bind` holds.
     layers: Layers,
     raster_bind: wgpu::BindGroup,
@@ -519,9 +570,9 @@ struct Output {
     target: Target,
     bind: wgpu::BindGroup,
     frame_generation: u64,
-    /// The mask whose alpha the bind group holds for the overlay, and
-    /// whether that is its refined alpha.
-    overlay: Option<(usize, bool)>,
+    /// The mask whose alpha the bind group holds for the overlay, and which
+    /// of its alphas that is.
+    overlay: Option<(usize, Product)>,
 }
 
 /// The develop graph on one device. Build it once, set a source, render as
@@ -542,6 +593,8 @@ pub struct Develop {
     reduce: Pass,
     /// `refine.wgsl`: filters the alpha of a mask into its refined alpha.
     refine: RefinePass,
+    /// `edge.wgsl`: Shift edge, Feather and Contrast after Refine edges.
+    edge: EdgePass,
     /// How many times a refined alpha was drawn whole, and how many times
     /// over the reach of new dabs only, for the cache test.
     refine_builds: u64,
@@ -738,6 +791,7 @@ impl Develop {
                 &[uniform_entry(0), texture_entry(1)],
             ),
             refine: RefinePass::new(device, ALPHA_FORMAT),
+            edge: EdgePass::new(device),
             refine_builds: 0,
             refine_patches: 0,
             proxy: None,
@@ -959,11 +1013,34 @@ impl Develop {
         self.refine.source_builds
     }
 
-    /// How far Refine edges reads around a pixel at a render of `full`: the
-    /// widest reach among the masks this edit draws, and the margin of the
-    /// products with it. Above the reach of the head passes it goes up in
-    /// steps, so a Radius slider replaces the window of a zoomed viewer a few
-    /// times over its travel and not at every step.
+    /// How many passes of Shift edge, of Feather's cells and of the finished
+    /// alpha this graph has drawn. A develop slider draws none of them.
+    pub fn edge_passes(&self) -> EdgePasses {
+        self.edge.passes
+    }
+
+    /// How many textures the edge controls hold on the frame: those of the
+    /// masks and those the masks share. None while every mask has the three
+    /// at rest.
+    pub fn edge_textures(&self) -> usize {
+        self.frame.as_ref().map_or(0, |frame| {
+            frame.edge_scratch.held()
+                + frame
+                    .masks
+                    .iter()
+                    .flatten()
+                    .filter_map(|slot| slot.edged.as_ref())
+                    .map(Edged::held_textures)
+                    .sum::<usize>()
+        })
+    }
+
+    /// How far Refine edges and the edge controls read around a pixel at a
+    /// render of `full`: the widest reach among the masks this edit draws,
+    /// each Refine edges' and its edge controls' together, and the margin of
+    /// the products with it. Above the reach of the head passes it goes up in
+    /// steps, so a Radius or an edge slider replaces the window of a zoomed
+    /// viewer a few times over its travel and not at every step.
     fn refine_reach(&self, edit: &PhotoEdit, full: (u32, u32)) -> u32 {
         const STEP: u32 = 64;
         let shown = self.overlay.and_then(|index| edit.masks.get(index));
@@ -971,7 +1048,9 @@ impl Develop {
             .iter()
             .map(|(_, mask)| mask)
             .chain(shown)
-            .map(|mask| refine_twin::reach(&mask.refine.shape(), full))
+            .map(|mask| {
+                refine_twin::reach(&mask.refine.shape(), full) + edge_twin::reach(&mask.edge, full)
+            })
             .max()
             .unwrap_or(0);
         if reach == 0 {
@@ -1222,6 +1301,9 @@ impl Develop {
             for mask in frame.masks.iter_mut().flatten() {
                 mask.shape = None;
                 mask.refine = None;
+                if let Some(edged) = mask.edged.as_mut() {
+                    edged.held = None;
+                }
                 // A layer with an auto stroke reads the working texture: it
                 // is stamped again when the head passes ran. One without
                 // reads no source pixel and is kept.
@@ -1431,7 +1513,9 @@ impl Develop {
                     alpha_region: (0, 0, 0, 0),
                     refined: None,
                     refine: None,
-                    binds_refined: false,
+                    refined_region: (0, 0, 0, 0),
+                    edged: None,
+                    binds_product: Product::Alpha,
                     layers,
                     raster_bind,
                     develop_binds,
@@ -1478,22 +1562,33 @@ impl Develop {
                     }
                 }
             }
-            // Refine edges is the last step of the shape. The alpha of the
-            // components is kept under the shape without it, so a Refine
-            // slider filters the alpha again and never redraws it.
+            // Refine edges, then the edge controls, are the last steps of the
+            // shape. The alpha of the components is kept under the shape
+            // without them, so a Refine or an edge slider filters the alpha
+            // again and never redraws it.
             let refine = mask.refine.shape();
-            let plan = (!refine.is_off()).then(|| {
-                let origin = (
-                    (window.x * sigma_size.0 as f32).round().max(0.0) as u32,
-                    (window.y * sigma_size.1 as f32).round().max(0.0) as u32,
-                );
-                Plan::new(&refine, sigma_size, origin, (width, height))
-            });
-            // The filter reads the alpha its reach beyond what it writes.
-            let alpha_region =
-                plan.map_or(region, |plan| grow(region, plan.reach(), (width, height)));
+            let origin = (
+                (window.x * sigma_size.0 as f32).round().max(0.0) as u32,
+                (window.y * sigma_size.1 as f32).round().max(0.0) as u32,
+            );
+            let plan =
+                (!refine.is_off()).then(|| Plan::new(&refine, sigma_size, origin, (width, height)));
+            let edge_plan = EdgePlan::new(&mask.edge, sigma_size, origin, (width, height));
+            let edged_on = !edge_plan.is_off();
+            let frame_rect = (0, 0, width, height);
+            // The filter reads the alpha its reach beyond what it writes. A
+            // mask with an edge control on keeps its alpha and its refined
+            // alpha over the whole frame, which is padded by both reaches, so
+            // an edge slider, whose reach moves, never draws them again.
+            let alpha_region = if edged_on {
+                frame_rect
+            } else {
+                plan.map_or(region, |plan| grow(region, plan.reach(), (width, height)))
+            };
+            let refined_region = if edged_on { frame_rect } else { region };
             let shape = MaskShape {
                 refine: Refine::default(),
+                edge: Edge::default(),
                 ..mask.shape()
             };
             // What of the alpha this render drew again.
@@ -1545,15 +1640,13 @@ impl Develop {
                 slot.shape = Some(shape);
                 self.alpha_builds += 1;
             }
+            // What of the alpha Refine edges hands on changed.
+            let mut handed = Damage::Nothing;
             match plan {
                 None => {
                     slot.refined = None;
                     slot.refine = None;
-                    damage = match redrawn {
-                        Damage::Part(reach) => damage.with(intersect(reach, region)),
-                        Damage::Whole => Damage::Whole,
-                        Damage::Nothing => damage,
-                    };
+                    handed = redrawn;
                 }
                 Some(plan) => {
                     let refined = slot.refined.get_or_insert_with(|| {
@@ -1564,10 +1657,11 @@ impl Develop {
                     // further out than they change the alpha, and no
                     // further.
                     let over = match redrawn {
-                        _ if slot.refine != Some(refine) => Some(region),
-                        Damage::Whole => Some(region),
+                        _ if slot.refine != Some(refine) => Some(refined_region),
+                        _ if !holds(slot.refined_region, refined_region) => Some(refined_region),
+                        Damage::Whole => Some(refined_region),
                         Damage::Part(reach) => {
-                            intersect(grow(reach, plan.reach(), (width, height)), region)
+                            intersect(grow(reach, plan.reach(), (width, height)), refined_region)
                         }
                         Damage::Nothing => None,
                     };
@@ -1583,24 +1677,107 @@ impl Develop {
                             &plan,
                             over,
                         );
-                        if over == region {
+                        if over == refined_region {
                             self.refine_builds += 1;
-                            damage = Damage::Whole;
+                            slot.refined_region = refined_region;
+                            handed = Damage::Whole;
                         } else {
                             self.refine_patches += 1;
-                            damage = damage.with(Some(over));
+                            handed = Damage::Part(over);
                         }
                     }
                     slot.refine = Some(refine);
                 }
             }
-            if slot.binds_refined != slot.refined.is_some() {
-                slot.develop_binds = develop_binds(
-                    slot.refined
-                        .as_ref()
-                        .map_or(&slot.alpha.view, |refined| &refined.alpha),
+            // The edge controls, each over the reach of what changed before
+            // it, or whole when its own setting changed.
+            let changed = if edged_on {
+                let refined_input = slot.refined.is_some();
+                let edged = slot
+                    .edged
+                    .get_or_insert_with(|| self.edge.edged(&self.device));
+                self.edge
+                    .prepare(&self.device, &mut frame.edge_scratch, edged, &edge_plan);
+                let held = edged.held.filter(|held| {
+                    held.refined == refined_input
+                        && (held.plan.full, held.plan.origin, held.plan.size)
+                            == (edge_plan.full, edge_plan.origin, edge_plan.size)
+                });
+                let p = &edge_plan;
+                let shift_changed = held.is_none_or(|h| {
+                    (h.plan.grow, h.plan.axis, h.plan.diagonal) != (p.grow, p.axis, p.diagonal)
+                });
+                let feather_changed = held.is_none_or(|h| {
+                    (h.plan.sigma, h.plan.step, h.plan.radius_cells)
+                        != (p.sigma, p.step, p.radius_cells)
+                });
+                let contrast_changed = held.is_none_or(|h| h.plan.contrast != p.contrast);
+                let size = (width, height);
+                let grown = |damage: Damage, by: u32| match damage {
+                    Damage::Part(rect) => Damage::Part(grow(rect, by, size)),
+                    other => other,
+                };
+                let shifted = if shift_changed {
+                    Damage::Whole
+                } else {
+                    grown(handed, p.shift_reach())
+                };
+                let feathered = if feather_changed {
+                    Damage::Whole
+                } else {
+                    grown(shifted, p.feather_reach())
+                };
+                let finished = if contrast_changed {
+                    Damage::Whole
+                } else {
+                    feathered
+                };
+                let pixels = |damage: Damage, whole: PixelRect| match damage {
+                    Damage::Whole => Some(whole),
+                    Damage::Part(rect) => intersect(rect, whole),
+                    Damage::Nothing => None,
+                };
+                let work = EdgeWork {
+                    shift: pixels(shifted, frame_rect).filter(|_| p.shifts()),
+                    feather: pixels(feathered, region).filter(|_| p.feathers()),
+                    finish: pixels(finished, region).filter(|_| p.feathers() || p.contrasts()),
+                };
+                let input = slot
+                    .refined
+                    .as_ref()
+                    .map_or(&slot.alpha.view, |refined| &refined.alpha);
+                self.edge.run(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &frame.edge_scratch,
+                    edged,
+                    input,
+                    p,
+                    &work,
                 );
-                slot.binds_refined = slot.refined.is_some();
+                edged.held = Some(EdgeHeld {
+                    plan: edge_plan,
+                    refined: refined_input,
+                });
+                if p.feathers() || p.contrasts() {
+                    finished
+                } else {
+                    shifted
+                }
+            } else {
+                slot.edged = None;
+                handed
+            };
+            damage = match changed {
+                Damage::Part(reach) => damage.with(intersect(reach, region)),
+                Damage::Whole => Damage::Whole,
+                Damage::Nothing => damage,
+            };
+            let product = product_of(slot);
+            if slot.binds_product != product {
+                slot.develop_binds = develop_binds(product_view(slot));
+                slot.binds_product = product;
             }
             if !develops {
                 continue;
@@ -1633,6 +1810,15 @@ impl Develop {
         {
             frame.refine_scratch = None;
         }
+        let (runs, cells) = frame
+            .masks
+            .iter()
+            .flatten()
+            .filter_map(|slot| slot.edged.as_ref())
+            .fold((false, false), |(runs, cells), edged| {
+                (runs || edged.shifts(), cells || edged.feathers())
+            });
+        frame.edge_scratch.keep(runs, cells);
 
         // The developed texture is kept while the edit and the scissor are
         // the ones it was drawn for: a pan changes neither.
@@ -1704,10 +1890,10 @@ impl Develop {
 
         let (out_width, out_height) = (output_size.0.max(1), output_size.1.max(1));
         let overlay = overlaid.as_ref().map(|(index, _)| {
-            let refined = frame.masks[*index]
+            let product = frame.masks[*index]
                 .as_ref()
-                .is_some_and(|slot| slot.refined.is_some());
-            (*index, refined)
+                .map_or(Product::Alpha, product_of);
+            (*index, product)
         });
         let out_stale = self.out.as_ref().is_none_or(|o| {
             (o.target.width, o.target.height) != (out_width, out_height)
@@ -1724,11 +1910,7 @@ impl Develop {
             );
             let overlay_alpha = overlay
                 .and_then(|(index, _)| frame.masks[index].as_ref())
-                .map_or(&self.no_overlay.view, |slot| {
-                    slot.refined
-                        .as_ref()
-                        .map_or(&slot.alpha.view, |refined| &refined.alpha)
-                });
+                .map_or(&self.no_overlay.view, product_view);
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("output bind group"),
                 layout: &self.output.layout,
@@ -2055,6 +2237,7 @@ impl Develop {
             develop_bind,
             masks: Default::default(),
             refine_scratch: None,
+            edge_scratch: EdgeScratch::default(),
         }
     }
 }

@@ -13,6 +13,7 @@
 
 mod brush_layer;
 pub mod develop;
+mod edge;
 pub mod headless;
 mod proxy;
 pub mod readback;
@@ -21,6 +22,7 @@ pub mod test_image;
 pub mod video;
 
 pub use develop::{Develop, ViewWindow};
+pub use edge::EdgePasses;
 pub use headless::Headless;
 pub use readback::{PendingReadback, Readback};
 pub use test_image::TestImage;
