@@ -364,6 +364,25 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_applied_to_a_mask_leaves_its_edge_as_it_was() {
+        use crate::mask::{Edge, Mask, MaskSource};
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        mask.edge = Edge {
+            shift: 0.02,
+            feather: 0.01,
+            contrast: 70.0,
+        };
+        let edge = mask.edge;
+        let shape = mask.shape();
+        let preset = LookPreset::from_edit("Busy", &busy_edit().adjust, Groups::ALL);
+        assert!(!preset.to_json().contains("edge"), "a preset holds no mask");
+        preset.apply(&mut mask.adjust);
+        assert_ne!(mask.adjust, Adjustments::default(), "the preset landed");
+        assert_eq!(mask.edge, edge);
+        assert_eq!(mask.shape(), shape);
+    }
+
+    #[test]
     fn a_hand_written_preset_with_one_field_parses() {
         let preset =
             LookPreset::from_json(r#"{"name": "Warm", "edit": {"white_balance_temperature": 25}}"#)

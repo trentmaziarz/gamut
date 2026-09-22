@@ -635,6 +635,59 @@ mod tests {
     }
 
     #[test]
+    fn edge_round_trips_in_the_working_edit_and_a_version_carries_its_own() {
+        use crate::mask::Edge;
+        let mut sidecar = Sidecar::default();
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        mask.adjust.exposure = 0.7;
+        mask.edge = Edge {
+            shift: -0.01,
+            feather: 0.01,
+            contrast: 50.0,
+        };
+        sidecar.edit.masks.push(mask);
+        sidecar.save_version("Edged").expect("save");
+        sidecar.edit.masks[0].edge.feather = 0.03;
+        assert!(sidecar.is_dirty(), "an edge change is a change");
+        let text = sidecar.to_json();
+        let back = Sidecar::from_json(&text).expect("parse");
+        assert_eq!(back, sidecar);
+        assert_eq!(back.version, 3);
+        assert_eq!(back.edit.masks[0].edge.feather, 0.03);
+        assert_eq!(back.versions[0].edit.masks[0].edge.feather, 0.01);
+        assert_eq!(back.versions[0].edit.masks[0].edge.shift, -0.01);
+        assert_eq!(back.versions[0].edit.masks[0].edge.contrast, 50.0);
+        assert!(
+            !text.contains("history") && !text.contains("undo"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_three_older_sidecars_hold_no_edge_and_save_back_unchanged() {
+        for (name, text) in [
+            ("version 2", VERSION_2),
+            ("version 3", VERSION_3),
+            ("version 3 brush", VERSION_3_BRUSH),
+        ] {
+            let back = Sidecar::from_json(text).expect("parse");
+            let mut masks = back
+                .edit
+                .masks
+                .iter()
+                .chain(back.versions.iter().flat_map(|v| v.edit.masks.iter()));
+            assert!(masks.all(|m| m.edge.is_off()), "{name}");
+            let saved = back.to_json();
+            assert!(!saved.contains("\"edge\""), "{name}");
+            assert_eq!(
+                saved.trim(),
+                text.replace("\r\n", "\n").trim(),
+                "{name} saves back byte for byte"
+            );
+        }
+    }
+
+    #[test]
     fn a_sidecar_with_an_unknown_mask_source_is_refused_by_name() {
         let text = r#"{"version": 4, "edit": {"masks": [{"name": "Hair",
             "components": [{"source": {"type": "Depth"}}]}]}}"#;

@@ -341,6 +341,50 @@ impl Refine {
     }
 }
 
+/// The widest Shift edge either way, as a fraction of the longer side of the
+/// photo.
+pub const MAX_EDGE_SHIFT: f32 = 0.05;
+
+/// The widest Feather, a Gaussian sigma as a fraction of the longer side of
+/// the photo.
+pub const MAX_EDGE_FEATHER: f32 = 0.05;
+
+/// The highest Contrast of an edge.
+pub const MAX_EDGE_CONTRAST: f32 = 100.0;
+
+/// The three edge controls: what is done to the alpha Refine edges hands to
+/// the blend, in this order. Each at 0 is at rest and does nothing. They are
+/// part of where the mask is, never of what it adjusts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Edge {
+    /// Shift edge: grows the mask (over 0) or shrinks it (under 0) by this
+    /// fraction of the longer side of the photo, -0.05 to 0.05.
+    pub shift: f32,
+    /// Feather: a Gaussian of this sigma, as a fraction of the longer side of
+    /// the photo, 0 to 0.05.
+    pub feather: f32,
+    /// Contrast: how much firmer a soft edge becomes, 0 to 100; at 100 the
+    /// edge is hard.
+    pub contrast: f32,
+}
+
+impl Edge {
+    /// Whether all three are at rest. A file leaves the key out then.
+    pub fn is_off(&self) -> bool {
+        self.sanitised() == Edge::default()
+    }
+
+    /// Every number finite and inside its range.
+    pub fn sanitised(&self) -> Edge {
+        Edge {
+            shift: finite_or(self.shift, 0.0).clamp(-MAX_EDGE_SHIFT, MAX_EDGE_SHIFT),
+            feather: finite_or(self.feather, 0.0).clamp(0.0, MAX_EDGE_FEATHER),
+            contrast: finite_or(self.contrast, 0.0).clamp(0.0, MAX_EDGE_CONTRAST),
+        }
+    }
+}
+
 /// One mask: where, and what it adjusts there. The adjustments are added to
 /// the global ones, so a mask whose `adjust` is the default changes nothing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -356,6 +400,10 @@ pub struct Mask {
     /// file written before it existed saves back unchanged.
     #[serde(skip_serializing_if = "Refine::is_off")]
     pub refine: Refine,
+    /// Shift edge, Feather and Contrast, after Refine edges. The key is left
+    /// out of a file while all three are at rest.
+    #[serde(skip_serializing_if = "Edge::is_off")]
+    pub edge: Edge,
     pub adjust: Adjustments,
 }
 
@@ -368,6 +416,7 @@ impl Default for Mask {
             opacity: 100.0,
             components: Vec::new(),
             refine: Refine::default(),
+            edge: Edge::default(),
             adjust: Adjustments::default(),
         }
     }
@@ -392,6 +441,7 @@ impl Mask {
             && self.invert == other.invert
             && self.opacity == other.opacity
             && self.refine == other.refine
+            && self.edge == other.edge
             && self.adjust == other.adjust
             && same_components_but_strokes(&self.components, &other.components)
     }
@@ -410,6 +460,7 @@ impl Mask {
             components: mask.components,
             invert: mask.invert,
             refine: mask.refine.shape(),
+            edge: mask.edge,
         }
     }
 
@@ -437,6 +488,7 @@ impl Mask {
                 })
                 .collect(),
             refine: self.refine.sanitised(),
+            edge: self.edge.sanitised(),
             adjust: self.adjust.clone(),
         }
     }
@@ -449,6 +501,8 @@ pub struct MaskShape {
     pub invert: bool,
     /// Refine edges as the alpha sees it: the default while it is off.
     pub refine: Refine,
+    /// The edge controls, sanitised: the default while all three are at rest.
+    pub edge: Edge,
 }
 
 impl MaskShape {
@@ -457,6 +511,7 @@ impl MaskShape {
     pub fn same_but_strokes(&self, other: &MaskShape) -> bool {
         self.invert == other.invert
             && self.refine == other.refine
+            && self.edge == other.edge
             && same_components_but_strokes(&self.components, &other.components)
     }
 }
@@ -763,6 +818,166 @@ mod tests {
         assert!(mask.same_but_strokes(&other));
         other.refine.amount = 60.0;
         assert!(!mask.same_but_strokes(&other));
+    }
+
+    #[test]
+    fn edge_round_trips_and_is_left_out_of_the_file_while_it_is_off() {
+        let mut mask = Mask::new("Roofs", MaskSource::default());
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(!text.contains("edge"), "{text}");
+        // The three keys at 0, or at a value sanitising takes to 0, are no
+        // key either.
+        mask.edge = Edge {
+            shift: 0.0,
+            feather: -0.02,
+            contrast: f32::NAN,
+        };
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(!text.contains("edge"), "{text}");
+        mask.edge = Edge {
+            shift: -0.01,
+            feather: 0.02,
+            contrast: 50.0,
+        };
+        let text = serde_json::to_string(&mask).expect("serialise");
+        assert!(
+            text.contains(r#""edge":{"shift":-0.01,"feather":0.02,"contrast":50.0}"#),
+            "{text}"
+        );
+        let back: Mask = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back, mask);
+        // Each of the three alone is worth the key.
+        for edge in [
+            Edge {
+                shift: 0.001,
+                ..Edge::default()
+            },
+            Edge {
+                feather: 0.001,
+                ..Edge::default()
+            },
+            Edge {
+                contrast: 1.0,
+                ..Edge::default()
+            },
+        ] {
+            mask.edge = edge;
+            assert!(!edge.is_off());
+            let text = serde_json::to_string(&mask).expect("serialise");
+            assert!(text.contains(r#""edge":"#), "{text}");
+            assert_eq!(serde_json::from_str::<Mask>(&text).expect("parse"), mask);
+        }
+    }
+
+    #[test]
+    fn missing_fields_of_edge_take_defaults() {
+        let mask: Mask =
+            serde_json::from_str(r#"{"name": "Roofs", "edge": {"feather": 0.01}}"#).expect("parse");
+        assert_eq!(
+            mask.edge,
+            Edge {
+                feather: 0.01,
+                ..Edge::default()
+            }
+        );
+        assert_eq!(
+            Edge::default(),
+            Edge {
+                shift: 0.0,
+                feather: 0.0,
+                contrast: 0.0,
+            }
+        );
+        let none: Mask = serde_json::from_str(r#"{"name": "Roofs"}"#).expect("parse");
+        assert_eq!(none.edge, Edge::default());
+        assert!(none.edge.is_off());
+    }
+
+    #[test]
+    fn sanitising_brings_edge_into_its_ranges() {
+        let wild = Edge {
+            shift: -0.4,
+            feather: 3.0,
+            contrast: 250.0,
+        };
+        assert_eq!(
+            wild.sanitised(),
+            Edge {
+                shift: -MAX_EDGE_SHIFT,
+                feather: MAX_EDGE_FEATHER,
+                contrast: MAX_EDGE_CONTRAST,
+            }
+        );
+        let other_way = Edge {
+            shift: 0.4,
+            feather: -1.0,
+            contrast: -5.0,
+        };
+        assert_eq!(
+            other_way.sanitised(),
+            Edge {
+                shift: MAX_EDGE_SHIFT,
+                feather: 0.0,
+                contrast: 0.0,
+            }
+        );
+        let broken = Edge {
+            shift: f32::NAN,
+            feather: f32::INFINITY,
+            contrast: f32::NEG_INFINITY,
+        };
+        assert_eq!(broken.sanitised(), Edge::default());
+        assert!(broken.is_off());
+        let mut mask = Mask::new("Loud", MaskSource::default());
+        mask.edge = wild;
+        assert_eq!(mask.sanitised().edge, wild.sanitised());
+    }
+
+    #[test]
+    fn edge_is_part_of_the_shape_and_a_mask_at_rest_has_the_shape_of_one_with_no_edge_key() {
+        let plain: Mask = serde_json::from_str(r#"{"name": "Roofs"}"#).expect("parse");
+        let at_rest: Mask = serde_json::from_str(
+            r#"{"name": "Roofs", "edge": {"shift": 0, "feather": 0, "contrast": 0}}"#,
+        )
+        .expect("parse");
+        assert_eq!(at_rest.shape(), plain.shape());
+        assert!(at_rest.same_but_strokes(&plain));
+        let mut mask = plain.clone();
+        let rest = mask.shape();
+        for edge in [
+            Edge {
+                shift: 0.02,
+                ..Edge::default()
+            },
+            Edge {
+                shift: -0.02,
+                ..Edge::default()
+            },
+            Edge {
+                feather: 0.01,
+                ..Edge::default()
+            },
+            Edge {
+                contrast: 40.0,
+                ..Edge::default()
+            },
+        ] {
+            mask.edge = edge;
+            let shape = mask.shape();
+            assert_ne!(shape, rest, "{edge:?}");
+            assert!(!shape.same_but_strokes(&rest));
+            assert!(!mask.same_but_strokes(&plain));
+            mask.adjust.exposure = 1.0;
+            assert_eq!(mask.shape(), shape, "what it adjusts is no part of it");
+            mask.adjust.exposure = 0.0;
+        }
+        // The shape holds the sanitised controls.
+        mask.edge = Edge {
+            shift: 0.3,
+            feather: f32::NAN,
+            contrast: 20.0,
+        };
+        assert_eq!(mask.shape().edge, mask.edge.sanitised());
     }
 
     #[test]
