@@ -32,17 +32,26 @@
 //! 100 and at 400 percent, are held to the gate. What the proxy of the source
 //! costs, built once, and what stamping the whole auto layer over the padded
 //! window costs are printed for the record.
+//!
+//! The edge controls come last: Shift edge -1 percent, Feather 1 percent and
+//! Contrast 50 on the two refined masks. A develop slider step, a Shift edge,
+//! a Feather and a Contrast slider step at the viewer size and at 100
+//! percent, and painting an auto stroke with a pen into such a mask at 100
+//! and at 400 percent, are held to the gate. What the shift passes alone and
+//! the feather passes alone cost over the padded window at 100 percent at 1
+//! and at 5 percent, and a Shift edge and a Feather slider step at 100
+//! percent at 5 percent, are printed for the record.
 
 use std::time::Instant;
 
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::look::{Curve, Wheel};
 use gamut_core::mask::{
-    ColourRange, LinearGradient, LuminanceRange, MaskSource, RadialGradient, Refine,
+    ColourRange, Edge, LinearGradient, LuminanceRange, MaskSource, RadialGradient, Refine,
 };
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
 use gamut_gpu::develop::{PixelRect, holds, padded_window};
-use gamut_gpu::{Develop, Headless, ViewWindow};
+use gamut_gpu::{Develop, EdgePasses, Headless, ViewWindow};
 use gamut_media::{fixtures, open_photo};
 
 /// The 4:5 fit of the viewer on the reference laptop, in pixels.
@@ -454,6 +463,242 @@ fn stepped_view_with(
             })
             .collect(),
     )
+}
+
+/// The edge controls of the timed lines, and what each slider line moves
+/// through on the auto brush mask. Shift edge moves in whole pixels, so its
+/// line alternates with a value at least a pixel away at the viewer size and
+/// at 100 percent; Feather runs through a range. Both keep the pad of the
+/// window at 100 percent, so no step replaces it.
+struct EdgeLine {
+    edge: Edge,
+    shift_to: f32,
+    feather: (f32, f32),
+    name: &'static str,
+}
+
+/// Shift edge -1 percent, Feather 1 percent and Contrast 50.
+const EDGED: EdgeLine = EdgeLine {
+    edge: Edge {
+        shift: -0.01,
+        feather: 0.01,
+        contrast: 50.0,
+    },
+    shift_to: -0.011,
+    feather: (0.009, 0.011),
+    name: "1 percent",
+};
+
+/// The same at 5 percent, the widest Shift edge and Feather.
+const EDGED_WIDE: EdgeLine = EdgeLine {
+    edge: Edge {
+        shift: -0.05,
+        feather: 0.05,
+        contrast: 50.0,
+    },
+    shift_to: -0.049,
+    feather: (0.049, 0.05),
+    name: "5 percent",
+};
+
+/// `base` with `edge` on its two refined masks.
+fn with_edged_masks(base: &PhotoEdit, edge: Edge) -> PhotoEdit {
+    let mut edit = base.clone();
+    for mask in [AUTO_BRUSH, RADIAL] {
+        edit.masks[mask].edge = edge;
+    }
+    edit
+}
+
+/// The value of a slider line at step `value`, which runs from -1 to 1:
+/// `from` on the even steps and `to` on the odd ones.
+fn alternating(value: f32, from: f32, to: f32) -> f32 {
+    let odd = ((value + 1.0) * (RENDERS - 1) as f32 / 2.0).round() as u32 % 2 == 1;
+    if odd { to } else { from }
+}
+
+/// What the develop graph has drawn so far, to hold which passes a run of
+/// renders drew.
+struct Drawn {
+    alphas: u64,
+    refines: (u64, u64),
+    stages: [u64; 3],
+    passes: EdgePasses,
+}
+
+impl Drawn {
+    fn of(develop: &Develop) -> Self {
+        let (whole, parts) = develop.edge_builds();
+        Drawn {
+            alphas: develop.mask_alpha_builds(),
+            refines: develop.refine_builds(),
+            stages: [0, 1, 2].map(|stage| whole[stage] + parts[stage]),
+            passes: develop.edge_passes(),
+        }
+    }
+
+    /// Holds that no mask alpha and no Refine edges pass was drawn since
+    /// `self`, and no edge stage before `first`: 0 Shift edge, 1 Feather's
+    /// cells, 2 the finished alpha, 3 none of them. A Feather slider whose
+    /// cell grid grows past the held cell texture allocates it again, which
+    /// draws every stage once, so it may draw Shift edge once.
+    fn hold(&self, develop: &Develop, first: usize, what: &str) {
+        let now = Drawn::of(develop);
+        assert_eq!(now.alphas, self.alphas, "{what} drew a mask alpha again");
+        assert_eq!(now.refines, self.refines, "{what} drew a Refine edges pass");
+        for stage in 0..first.min(3) {
+            let allowed = u64::from(stage == 0 && first == 1);
+            assert!(
+                now.stages[stage] - self.stages[stage] <= allowed,
+                "{what} drew edge stage {stage} {} times",
+                now.stages[stage] - self.stages[stage]
+            );
+        }
+    }
+
+    /// The edge passes drawn since `self`, on average a render, and how many
+    /// times each stage was drawn.
+    fn passes_since(&self, develop: &Develop, renders: usize) -> String {
+        let now = Drawn::of(develop);
+        let per = |now: u64, then: u64| (now - then) as f64 / renders as f64;
+        format!(
+            "{:.1} shift, {:.1} feather cell and {:.1} finishing passes a render; the stages drawn {}, {} and {} times",
+            per(now.passes.shift, self.passes.shift),
+            per(now.passes.feather, self.passes.feather),
+            per(now.passes.finish, self.passes.finish),
+            now.stages[0] - self.stages[0],
+            now.stages[1] - self.stages[1],
+            now.stages[2] - self.stages[2]
+        )
+    }
+}
+
+/// What a slider line puts into the edit at a value that runs from -1 to 1.
+type Step<'a> = &'a dyn Fn(&mut PhotoEdit, f32);
+
+/// `RENDERS` renders of `base` with `step` putting a value that runs from -1
+/// to 1 into the edit before each: at the viewer size when `view` is `None`,
+/// else through `view`.
+fn stepped_at(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: Option<&ViewWindow>,
+    step: impl Fn(&mut PhotoEdit, f32),
+) -> (f64, f64, f64) {
+    match view {
+        None => stepped_with(gpu, develop, base, step),
+        Some(view) => stepped_view_with(gpu, develop, base, view, step),
+    }
+}
+
+/// A Shift edge, a Feather and a Contrast slider step on the auto brush mask
+/// of `base`, whose edge controls are `line.edge`: at the viewer size when
+/// `view` is `None`, else through `view`, which `at` names. Each is printed
+/// with the edge passes a render draws, and held to drawing no mask alpha,
+/// no Refine edges pass and no edge stage before its own. Returns the three
+/// p95s in that order.
+fn edge_slider_steps(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: Option<&ViewWindow>,
+    line: &EdgeLine,
+    at: &str,
+    asserted: bool,
+) -> [f64; 3] {
+    let note = if asserted { "" } else { " (not asserted)" };
+    let (from, to) = (line.edge.shift, line.shift_to);
+    let (low, high) = line.feather;
+    let shift = |edit: &mut PhotoEdit, value: f32| {
+        edit.masks[AUTO_BRUSH].edge.shift = alternating(value, from, to);
+    };
+    let feather = |edit: &mut PhotoEdit, value: f32| {
+        edit.masks[AUTO_BRUSH].edge.feather = low + (high - low) * (value + 1.0) / 2.0;
+    };
+    let contrast = |edit: &mut PhotoEdit, value: f32| {
+        edit.masks[AUTO_BRUSH].edge.contrast = 50.0 + 49.0 * value;
+    };
+    let sliders: [(&str, usize, Step); 3] = [
+        ("Shift edge", 0, &shift),
+        ("Feather", 1, &feather),
+        ("Contrast", 2, &contrast),
+    ];
+    sliders.map(|(name, first, step)| {
+        // Back to `base` first: the line before left its own slider moved.
+        match view {
+            None => timed_render(gpu, develop, base, VIEWER_SIZE),
+            Some(view) => timed_view(gpu, develop, base, view),
+        };
+        let drawn = Drawn::of(develop);
+        let (p50, p95, max) = stepped_at(gpu, develop, base, view, step);
+        drawn.hold(develop, first, &format!("a {name} slider"));
+        println!(
+            "{name} slider step {at}, the three at {}{note}, {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {}",
+            line.name,
+            drawn.passes_since(develop, RENDERS)
+        );
+        p95
+    })
+}
+
+/// What the shift passes alone and the feather passes alone cost over the
+/// padded window of `view` at 100 percent, printed and not asserted. Each is
+/// the slider step of its control, with the other two at rest on the auto
+/// brush mask of `base`, against a develop slider step on the same edit,
+/// which draws no edge pass.
+fn edge_passes_alone(
+    gpu: &Headless,
+    develop: &mut Develop,
+    base: &PhotoEdit,
+    view: &ViewWindow,
+    line: &EdgeLine,
+) {
+    let (from, to) = (line.edge.shift, line.shift_to);
+    let (low, high) = line.feather;
+    let shift = |edit: &mut PhotoEdit, value: f32| {
+        edit.masks[AUTO_BRUSH].edge.shift = alternating(value, from, to);
+    };
+    let feather = |edit: &mut PhotoEdit, value: f32| {
+        edit.masks[AUTO_BRUSH].edge.feather = low + (high - low) * (value + 1.0) / 2.0;
+    };
+    let alone: [(&str, usize, Edge, Step); 2] = [
+        (
+            "shift",
+            0,
+            Edge {
+                shift: from,
+                ..Edge::default()
+            },
+            &shift,
+        ),
+        (
+            "feather",
+            1,
+            Edge {
+                feather: line.edge.feather,
+                ..Edge::default()
+            },
+            &feather,
+        ),
+    ];
+    for (name, first, edge, step) in alone {
+        let mut one = base.clone();
+        one.masks[AUTO_BRUSH].edge = edge;
+        timed_view(gpu, develop, &one, view);
+        let drawn = Drawn::of(develop);
+        let (held_p50, held_p95, _) = stepped_view(gpu, develop, &one, view);
+        drawn.hold(develop, 3, "a slider of the develop chain");
+        let drawn = Drawn::of(develop);
+        let (p50, p95, _) = stepped_view_with(gpu, develop, &one, view, step);
+        drawn.hold(develop, first, &format!("a {name} slider"));
+        println!(
+            "the {name} passes alone at 100 percent, {} (not asserted): develop slider step p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; {name} slider step p50 {p50:.2} ms, p95 {p95:.2} ms; so the {name} passes about {:.2} ms; {}",
+            line.name,
+            (p50 - held_p50).max(0.0),
+            drawn.passes_since(develop, RENDERS)
+        );
+    }
 }
 
 /// The median, the 95th percentile and the maximum of `RENDERS` renders of
@@ -979,7 +1224,166 @@ fn develop_at_viewer_size_is_fast_enough() {
         refined_view_p95 = Some((step_p95, paint_p95, deep_p95));
     }
 
+    // Shift edge -1 percent, Feather 1 percent and Contrast 50 on the two
+    // refined masks. An edge slider draws an edge stage over the whole frame
+    // on every render, so the edge lines run on a GPU alone.
+    let edged = with_edged_masks(&refined, EDGED.edge);
+    let mut edged_p95 = None;
+    if on_gpu {
+        let first = timed_render(&gpu, &mut develop, &edged, VIEWER_SIZE);
+        println!(
+            "first render with the three edge controls on the two refined masks at {VIEWER_SIZE:?} (Shift edge -1 percent, Feather 1 percent, Contrast 50): {first:.2} ms"
+        );
+        let drawn = Drawn::of(&develop);
+        let (p50, p95, max) = stepped(&gpu, &mut develop, &edged);
+        drawn.hold(&develop, 3, "a slider of the develop chain");
+        println!(
+            "slider step with two refined masks and the three edge controls on at {VIEWER_SIZE:?} over {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms"
+        );
+        let [shift_p95, feather_p95, contrast_p95] = edge_slider_steps(
+            &gpu,
+            &mut develop,
+            &edged,
+            None,
+            &EDGED,
+            &format!("at {VIEWER_SIZE:?}"),
+            true,
+        );
+        edged_p95 = Some([p95, shift_p95, feather_p95, contrast_p95]);
+    } else {
+        println!("edge lines at the viewer size skipped on a CPU adapter");
+    }
+    let mut edged_view_p95 = None;
+    if info.device_type == wgpu::DeviceType::Cpu {
+        println!("zoomed edge lines skipped on a CPU adapter");
+    } else {
+        let full = (photo.width, photo.height);
+        let (actual, _) = zoomed_view(full, 1);
+        let first = timed_view(&gpu, &mut develop, &edged, &actual);
+        println!(
+            "first render of the padded window at 100 percent with the three edge controls on the two refined masks: {first:.2} ms"
+        );
+        let drawn = Drawn::of(&develop);
+        let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &edged, &actual);
+        drawn.hold(&develop, 3, "a slider of the develop chain");
+        println!(
+            "slider step at 100 percent with two refined masks and the three edge controls on, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+        );
+        let [shift_p95, feather_p95, contrast_p95] = edge_slider_steps(
+            &gpu,
+            &mut develop,
+            &edged,
+            Some(&actual),
+            &EDGED,
+            "at 100 percent",
+            true,
+        );
+        let pen = Stroke {
+            auto: true,
+            sensitivity: 60.0,
+            pressure_size: true,
+            pressure_flow: true,
+            ..Stroke::default()
+        };
+        let mut paint = |view: &ViewWindow, zoom: &str| {
+            timed_view(&gpu, &mut develop, &edged, view);
+            let drawn = Drawn::of(&develop);
+            let shifted = develop.edge_builds().0[0];
+            let (p50, p95, max) =
+                painted_view_with(&gpu, &mut develop, &edged, view, AUTO_BRUSH, &pen);
+            println!(
+                "painting an auto stroke with a pen into a refined mask with the three edge controls on at {zoom} percent, one appended point a frame, {RENDERS} frames: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {}",
+                drawn.passes_since(&develop, RENDERS + 1)
+            );
+            assert_eq!(
+                (
+                    develop.refine_builds().0 - drawn.refines.0,
+                    develop.refine_builds().1 - drawn.refines.1
+                ),
+                (0, RENDERS as u64 + 1),
+                "painting refined the whole edged mask again"
+            );
+            assert_eq!(
+                develop.edge_builds().0[0],
+                shifted,
+                "painting shifted the whole edged mask again"
+            );
+            p95
+        };
+        let paint_p95 = paint(&actual, "100");
+        let (deep, _) = zoomed_view(full, 4);
+        let deep_p95 = paint(&deep, "400");
+
+        // For the record: each control's passes alone, and a Shift edge and a
+        // Feather slider step with the three at 5 percent.
+        edge_passes_alone(&gpu, &mut develop, &refined, &actual, &EDGED);
+        edge_passes_alone(&gpu, &mut develop, &refined, &actual, &EDGED_WIDE);
+        let wide = with_edged_masks(&refined, EDGED_WIDE.edge);
+        let first = timed_view(&gpu, &mut develop, &wide, &actual);
+        println!(
+            "first render of the padded window at 100 percent with the three edge controls at 5 percent on the two refined masks: {first:.2} ms"
+        );
+        edge_slider_steps(
+            &gpu,
+            &mut develop,
+            &wide,
+            Some(&actual),
+            &EDGED_WIDE,
+            "at 100 percent",
+            false,
+        );
+        edged_view_p95 = Some([
+            step_p95,
+            shift_p95,
+            feather_p95,
+            contrast_p95,
+            paint_p95,
+            deep_p95,
+        ]);
+    }
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        if let Some([develop_p95, shift_p95, feather_p95, contrast_p95]) = edged_p95 {
+            for (p95, what) in [
+                (develop_p95, "a slider step with two edged masks"),
+                (shift_p95, "a Shift edge slider step"),
+                (feather_p95, "a Feather slider step"),
+                (contrast_p95, "a Contrast slider step"),
+            ] {
+                assert!(
+                    p95 < GATE_MS,
+                    "p95 of {what} at {VIEWER_SIZE:?}, {p95:.2} ms, is not under {GATE_MS} ms"
+                );
+            }
+        }
+        if let Some(
+            [
+                step_p95,
+                shift_p95,
+                feather_p95,
+                contrast_p95,
+                paint_p95,
+                deep_p95,
+            ],
+        ) = edged_view_p95
+        {
+            for (p95, what) in [
+                (
+                    step_p95,
+                    "a slider step at 100 percent with two edged masks",
+                ),
+                (shift_p95, "a Shift edge slider step at 100 percent"),
+                (feather_p95, "a Feather slider step at 100 percent"),
+                (contrast_p95, "a Contrast slider step at 100 percent"),
+                (paint_p95, "painting into an edged mask at 100 percent"),
+                (deep_p95, "painting into an edged mask at 400 percent"),
+            ] {
+                assert!(
+                    p95 < GATE_MS,
+                    "p95 of {what}, {p95:.2} ms, is not under {GATE_MS} ms"
+                );
+            }
+        }
         assert!(
             refined_p95 < GATE_MS,
             "p95 of a slider step with two refined masks, {refined_p95:.2} ms, is not under {GATE_MS} ms"
