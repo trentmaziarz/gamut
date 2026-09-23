@@ -1106,6 +1106,18 @@ impl Develop {
         })
     }
 
+    /// The alpha the edge controls of mask `index` hand to the blend on the
+    /// frame of the last render, and the size of that frame: the shifted
+    /// alpha while Shift edge alone is on. `None` while the three are at
+    /// rest. A test reads its bytes to hold a schedule to the one before it.
+    #[doc(hidden)]
+    pub fn edge_product(&self, index: usize) -> Option<(&wgpu::TextureView, (u32, u32))> {
+        let frame = self.frame.as_ref()?;
+        let slot = frame.masks.get(index)?.as_ref()?;
+        let view = slot.edged.as_ref()?.product()?;
+        Some((view, (frame.width, frame.height)))
+    }
+
     /// How far Refine edges and the edge controls read around a pixel at a
     /// render of `full`: the widest reach among the masks this edit draws,
     /// each Refine edges' and its edge controls' together, and the margin of

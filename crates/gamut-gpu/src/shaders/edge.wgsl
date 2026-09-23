@@ -6,10 +6,10 @@
 // The passes, in order, each skipped while its control is at rest:
 //   Shift edge, for each of the four runs of the octagon (x, y, (1, 1),
 //   (1, -1)) that takes a step
-//     fs_run          a doubling pass of the forward run, then of the
-//                     backward run: the run so far here and `offset` steps on
-//     fs_run_last     the last backward pass, which also takes the forward
-//                     run in
+//     fs_run_level    a level of the run's sparse table: the entry of the
+//                     level before here and the one `offset` steps on
+//     fs_run_combine  the run: the two widest entries that cover its
+//                     samples, or near a frame edge the loop over them
 //   Feather
 //     fs_cells        the mean of the pixels of each cell of the whole
 //                     picture's grid
@@ -24,7 +24,8 @@
 // the developed picture.
 
 struct Uniform {
-    // A run: its direction and how many steps on the far sample lies.
+    // A run: its direction, and how many steps on the far entry of a level
+    // lies, or the half of the run in the combine pass.
     direction: vec2<i32>,
     offset: i32,
     // 1 while Shift edge grows the mask (a maximum), 0 while it shrinks it.
@@ -49,9 +50,9 @@ struct Uniform {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
-// The alpha a pass reads: the input of the chain, or the run so far.
+// The alpha a pass reads: the input of the chain, or a level of the table.
 @group(0) @binding(1) var source: texture_2d<f32>;
-// The forward run, which the last backward pass takes in.
+// The input of the run, which the combine pass loops over near an edge.
 @group(0) @binding(2) var other: texture_2d<f32>;
 // The cells a blur or the finished alpha reads.
 @group(0) @binding(3) var cells: texture_2d<f32>;
@@ -87,21 +88,61 @@ fn pick(a: f32, b: f32) -> f32 {
     return min(a, b);
 }
 
+// A level of the sparse table: an entry of 2j samples from the two entries
+// of j samples here and j steps on.
 @fragment
-fn fs_run(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_run_level(in: VertexOutput) -> @location(0) vec4<f32> {
     let at = vec2<i32>(in.position.xy);
     let here = alpha_at(source, at);
     let far = alpha_at(source, at + u.offset * u.direction);
     return vec4<f32>(pick(here, far), 0.0, 0.0, 1.0);
 }
 
+// Whether the two widest entries of the table, of `span` samples, hold
+// exactly the samples of the run of half `h` at `at`, each held inside the
+// render. They do where the first sample, h steps back, is inside the
+// render. Where it is not, the entry at the held place starts at the edge
+// and runs `span` steps on, not bent along the edge as the samples of a
+// diagonal run are, so it holds samples the run does not take. A run along
+// one axis is a line from the edge: the entry takes no sample the run does
+// not while the run reaches at least as far, or to the far edge.
+fn table_holds(at: vec2<i32>, h: i32, span: i32) -> bool {
+    let d = u.direction;
+    let limit = vec2<i32>(u.size) - vec2<i32>(1, 1);
+    let start = at - h * d;
+    if (all(start >= vec2<i32>(0, 0)) && all(start <= limit)) {
+        return true;
+    }
+    if (d.x == 0 || d.y == 0) {
+        let along = abs(d);
+        let n = dot(vec2<i32>(u.size), along);
+        let a = dot(at, along);
+        let from_edge = select(n - 1 - a, a, d.x + d.y > 0);
+        return from_edge + h >= min(span - 1, n - 1);
+    }
+    return false;
+}
+
+// The run of half `offset`: the maximum or minimum of the widest entries of
+// the table at h steps back and at h + 1 - span steps on, which together
+// hold its 2 h + 1 samples; where they would not, the loop over the samples
+// of the input.
 @fragment
-fn fs_run_last(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_run_combine(in: VertexOutput) -> @location(0) vec4<f32> {
     let at = vec2<i32>(in.position.xy);
-    let here = alpha_at(source, at);
-    let far = alpha_at(source, at + u.offset * u.direction);
-    let forward = alpha_at(other, at);
-    return vec4<f32>(pick(forward, pick(here, far)), 0.0, 0.0, 1.0);
+    let h = u.offset;
+    let d = u.direction;
+    let span = 1i << firstLeadingBit(u32(2 * h + 1));
+    if (table_holds(at, h, span)) {
+        let first = alpha_at(source, at - h * d);
+        let second = alpha_at(source, at + (h + 1 - span) * d);
+        return vec4<f32>(pick(first, second), 0.0, 0.0, 1.0);
+    }
+    var run = alpha_at(other, at - h * d);
+    for (var i = 1 - h; i <= h; i = i + 1) {
+        run = pick(run, alpha_at(other, at + i * d));
+    }
+    return vec4<f32>(run, 0.0, 0.0, 1.0);
 }
 
 // The mean of the pixels of one cell that the render holds.

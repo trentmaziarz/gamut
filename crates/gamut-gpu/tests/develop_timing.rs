@@ -705,10 +705,18 @@ fn edge_passes_alone(
         let drawn = Drawn::of(develop);
         let (p50, p95, _) = stepped_view_with(gpu, develop, &one, view, step);
         drawn.hold(develop, first, &format!("a {name} slider"));
+        // The count of Shift edge passes, whole, over the renders that drew
+        // Shift edge: the first step puts the value the edit holds and draws
+        // none, every other step of a Shift edge line draws the four runs,
+        // and a Feather step draws none.
+        let now = Drawn::of(develop);
+        let shift_passes = now.passes.shift - drawn.passes.shift;
+        let shift_renders = now.stages[0] - drawn.stages[0];
         println!(
-            "the {name} passes alone at 100 percent, {} (not asserted): develop slider step p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; {name} slider step p50 {p50:.2} ms, p95 {p95:.2} ms; so the {name} passes about {:.2} ms; {}",
+            "the {name} passes alone at 100 percent, {} (not asserted): develop slider step p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; {name} slider step p50 {p50:.2} ms, p95 {p95:.2} ms; so the {name} passes about {:.2} ms; edge_passes.shift {shift_passes} in the {shift_renders} renders that drew Shift edge, {} a render; {}",
             line.name,
             (p50 - held_p50).max(0.0),
+            shift_passes.checked_div(shift_renders).unwrap_or(0),
             drawn.passes_since(develop, RENDERS)
         );
     }
