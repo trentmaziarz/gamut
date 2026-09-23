@@ -1068,6 +1068,25 @@ impl Develop {
         self
     }
 
+    /// The same graph with the work textures of Shift edge held to at most
+    /// `side` pixels a side, below the device's limit, so a test can cut
+    /// their pad short of the runs' half the way a photo near the limit does
+    /// and hold the combine pass's loop over the samples to the twin.
+    #[doc(hidden)]
+    pub fn with_edge_pad_limit(mut self, side: u32) -> Self {
+        self.edge = self.edge.with_pad_limit(side);
+        self
+    }
+
+    /// How many pixels the work textures of Shift edge hold past the frame
+    /// on each side after the last render, or `None` while none are held.
+    #[doc(hidden)]
+    pub fn edge_pad(&self) -> Option<u32> {
+        self.frame
+            .as_ref()
+            .and_then(|frame| frame.edge_scratch.pad())
+    }
+
     /// How many passes of Shift edge, of Feather's cells and of the finished
     /// alpha this graph has drawn. A develop slider draws none of them.
     pub fn edge_passes(&self) -> EdgePasses {

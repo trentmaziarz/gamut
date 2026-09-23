@@ -3882,6 +3882,136 @@ fn a_refined_mask_shrunk_by_shift_edge_matches() {
     );
 }
 
+/// A render of `edit` on `photo` with the work textures of Shift edge held to
+/// `side` pixels a side, or to the device's limit for `None`, and the pad
+/// those textures took.
+fn gpu_render_at_pad_limit(
+    gpu: &Headless,
+    photo: &Photo,
+    edit: &PhotoEdit,
+    side: Option<u32>,
+) -> (Vec<[u8; 3]>, Option<u32>) {
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    if let Some(side) = side {
+        develop = develop.with_edge_pad_limit(side);
+    }
+    develop.set_source(photo);
+    let size = (photo.width, photo.height);
+    let view = develop
+        .render(edit, CropRect::FULL, size, size)
+        .expect("a source is set");
+    let pixels = Readback::new(&gpu.device)
+        .read(&gpu.device, &gpu.queue, view, size.0, size.1)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| [px[0], px[1], px[2]])
+        .collect();
+    (pixels, develop.edge_pad())
+}
+
+/// A radial gradient over the top left corner whose soft rim crosses the top
+/// and the left edge of the frame at a slant, so the runs near those edges
+/// read an alpha that changes along them and across them.
+fn radial_across_a_corner() -> MaskSource {
+    MaskSource::Radial(RadialGradient {
+        centre: [0.12, 0.18],
+        radius: [0.35, 0.3],
+        rotation: 0.4,
+        feather: 60.0,
+    })
+}
+
+/// Where the frame and two pads would pass the device's limit on a side, the
+/// pad of the work textures is cut to what fits, and a run whose half is
+/// wider takes its samples one by one at the pixels whose reads of the table
+/// would leave the padded texture. Each frame, with the pad cut to 0, to half
+/// the widest half and to one less than it, gives the render at the full pad
+/// byte for byte and matches the twin.
+///
+/// The frames: those of the grown and the shrunk golden (Shift edge 2
+/// percent of the 64 pixel photos, axis runs of half 1, so half of it is 0
+/// too), the same mask at 5 percent of the synthetic photo drawn 4 times
+/// over (256 pixels, halves of 5 and 4), and a mask across a corner at both
+/// sizes, whose rim meets the edges where the loop runs.
+#[test]
+fn a_shifted_mask_at_a_cut_pad_matches() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let corner = |shift: f32| {
+        masked(vec![edged_at(
+            refined(exposure_mask("Corner", radial_across_a_corner())),
+            shift,
+            0.0,
+            0.0,
+        )])
+    };
+    let mut cases: Vec<(String, Photo, PhotoEdit)> = Vec::new();
+    for shift in [0.02, -0.02] {
+        let edit = refined_radial_edged(shift, 0.0, 0.0);
+        cases.push((
+            format!("golden frame {shift}"),
+            synthetic_photo(),
+            edit.clone(),
+        ));
+        cases.push((
+            format!("golden frame {shift}, hazy photo"),
+            hazy_photo(),
+            edit,
+        ));
+    }
+    for shift in [0.05, -0.05] {
+        cases.push((
+            format!("golden mask {shift}, 256 pixels"),
+            synthetic_photo_times(4),
+            refined_radial_edged(shift, 0.0, 0.0),
+        ));
+        cases.push((format!("corner {shift}"), synthetic_photo(), corner(shift)));
+        cases.push((
+            format!("corner {shift}, 256 pixels"),
+            synthetic_photo_times(4),
+            corner(shift),
+        ));
+    }
+    for (case, photo, edit) in &cases {
+        let size = (photo.width, photo.height);
+        let moved = assert_the_edge_shows(photo, edit);
+        let plan = gamut_color::edge::Plan::new(&edit.masks[0].edge, size, (0, 0), size);
+        let widest = plan.axis.max(plan.diagonal);
+        assert!(widest > 0, "{case}: Shift edge takes a step");
+        let (full, full_pad) = gpu_render_at_pad_limit(&gpu, photo, edit, None);
+        assert_eq!(
+            full_pad,
+            Some(widest),
+            "{case}: the full pad is the widest half"
+        );
+        let mut pads = vec![0, widest / 2, widest - 1];
+        pads.dedup();
+        for pad in pads {
+            let name = format!(
+                "{case}, runs of {} and {}, pad cut to {pad} of {widest}",
+                plan.axis, plan.diagonal
+            );
+            let side = size.0.max(size.1) + 2 * pad;
+            let (cut, took) = gpu_render_at_pad_limit(&gpu, photo, edit, Some(side));
+            assert_eq!(took, Some(pad), "{name}: the pad is cut");
+            let differing = full.iter().zip(&cut).filter(|(a, b)| a != b).count();
+            println!(
+                "{name}: the edge controls move {moved} pixels of the twin; {differing} of {} pixels differ from the full pad",
+                full.len()
+            );
+            assert_eq!(differing, 0, "{name}: the render at the full pad");
+            assert_matches_the_twin(&name, photo, edit, &cut);
+        }
+    }
+}
+
 #[test]
 fn a_refined_mask_under_feather_matches() {
     check_edged(

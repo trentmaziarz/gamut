@@ -21,9 +21,11 @@
 //
 // The runs work in textures padded past the frame on every side, so a level
 // of the table holds entries in the pad too, and the combine pass loads two
-// of them at every pixel of the frame, the pixels near its edges included.
-// Where a pass reads and writes, `read_origin`, `read_reach` and
-// `write_origin` say.
+// of them at every pixel of the frame whose two reads lie in the padded
+// texture. Where the pad was cut short of a run's half to fit the device's
+// limit, a pixel whose read would leave the padded texture takes the run's
+// samples of its input one by one instead. Where a pass reads and writes,
+// `read_origin`, `read_reach`, `write_origin` and `input_origin` say.
 //
 // A maximum or a minimum makes no new value, so the runs keep the 8-bit codes
 // they read. The cells are 32 bit floats. Nothing here reads the source or
@@ -65,14 +67,21 @@ struct Uniform {
     // The combine pass: how many samples the widest entries of the table
     // hold, 2 to the power of its levels.
     span: i32,
+    // The combine pass: the texel of `other` that holds pixel (0, 0) of the
+    // frame, (pad, pad) for a work texture or (0, 0) for the input of the
+    // chain.
+    input_origin: vec2<i32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
 // The alpha a pass reads: the input of the chain, a level of the table, or
 // the alpha Feather and the finished alpha start from.
 @group(0) @binding(1) var source: texture_2d<f32>;
+// The input of the run, which the combine pass takes sample by sample where
+// a read of the table would leave the padded texture.
+@group(0) @binding(2) var other: texture_2d<f32>;
 // The cells a blur or the finished alpha reads.
-@group(0) @binding(2) var cells: texture_2d<f32>;
+@group(0) @binding(3) var cells: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -106,6 +115,21 @@ fn read_at(at: vec2<i32>) -> f32 {
     return textureLoad(source, held, 0).r;
 }
 
+// Whether pixel `at` of the frame lies within `read_reach` of the frame on
+// both axes: in the padded texture, for a read of the table.
+fn in_reach(at: vec2<i32>) -> bool {
+    let low = vec2<i32>(-u.read_reach, -u.read_reach);
+    let high = vec2<i32>(u.size) - vec2<i32>(1, 1) - low;
+    return all(at >= low) && all(at <= high);
+}
+
+// The alpha of the run's input, `other`, at pixel `at` of the frame, each
+// coordinate clamped to the frame as the twin clamps a sample.
+fn input_at(at: vec2<i32>) -> f32 {
+    let held = clamp(at, vec2<i32>(0, 0), vec2<i32>(u.size) - vec2<i32>(1, 1));
+    return textureLoad(other, held + u.input_origin, 0).r;
+}
+
 // The maximum while Shift edge grows the mask, the minimum while it shrinks
 // it.
 fn pick(a: f32, b: f32) -> f32 {
@@ -128,16 +152,28 @@ fn fs_run_level(in: VertexOutput) -> @location(0) vec4<f32> {
 
 // The run of half `offset` at a pixel of the frame: the maximum or minimum
 // of the widest entries of the table at h steps back and at h + 1 - span
-// steps on, which together hold its 2 h + 1 samples. Both lie in the padded
-// texture, since the pad is at least h.
+// steps on, which together hold its 2 h + 1 samples, where both lie in the
+// padded texture. Every entry there is exact, whatever the pad; a read past
+// it would land, clamped, on an entry that holds other samples. That can
+// happen only where the pad was cut short of h, and there the pass takes the
+// maximum or minimum over the 2 h + 1 samples of the run's input, each
+// clamped to the frame, as the twin does. With a pad of at least h no pixel
+// takes the loop.
 @fragment
 fn fs_run_combine(in: VertexOutput) -> @location(0) vec4<f32> {
     let at = frame_pixel(in);
     let h = u.offset;
     let d = u.direction;
-    let first = read_at(at - h * d);
-    let second = read_at(at + (h + 1 - u.span) * d);
-    return vec4<f32>(pick(first, second), 0.0, 0.0, 1.0);
+    let first_at = at - h * d;
+    let second_at = at + (h + 1 - u.span) * d;
+    if (in_reach(first_at) && in_reach(second_at)) {
+        return vec4<f32>(pick(read_at(first_at), read_at(second_at)), 0.0, 0.0, 1.0);
+    }
+    var run = input_at(first_at);
+    for (var i = 1 - h; i <= h; i = i + 1) {
+        run = pick(run, input_at(at + i * d));
+    }
+    return vec4<f32>(run, 0.0, 0.0, 1.0);
 }
 
 // The mean of the pixels of one cell that the render holds.
