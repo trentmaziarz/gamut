@@ -34,6 +34,13 @@
 //     fs_solve_a, fs_solve_b      the 15 numbers of each cell
 //     fs_move / fs_apply          q at full resolution; the last gather mixes
 //                                 it into p by amount and stores the alpha
+//
+// A box of BLOCK cells or more (2 cells + 1, from a radius of 4 cells) is
+// drawn in two passes: fs_block_h2, fs_block_v2, fs_block_h1 or fs_block_v1
+// sums BLOCK cells from every cell on along the axis, and the box then adds
+// those sums BLOCK cells apart and the cells left over. It sums the same
+// cells, each held as the direct loop holds it; only the order of the sum
+// changes. A box under BLOCK cells sums its cells in the direct loop.
 
 struct Uniform {
     // Where the render begins on the whole picture, in pixels, and its size.
@@ -54,6 +61,9 @@ struct Uniform {
     eps: f32,
     // How much of the refined alpha is taken, 0 to 1.
     amount: f32,
+    // How many blocks of BLOCK cells a box adds, and 0 when it sums every
+    // cell in the direct loop.
+    blocks: u32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -101,6 +111,9 @@ const IN_LOW: f32 = 0.6;
 const IN_HIGH: f32 = 0.85;
 const SHARE_FLOOR: f32 = 0.000001;
 const SEPARATION_FLOOR: f32 = 0.000000001;
+
+// The cells a block pass sums (refine.rs in gamut-gpu).
+const BLOCK: u32 = 8u;
 
 fn acescct_encode(lin: vec3<f32>) -> vec3<f32> {
     let linear_part = ACES_SLOPE * lin + vec3<f32>(ACES_OFFSET);
@@ -268,24 +281,149 @@ fn box_one(texel: vec2<u32>, direction: vec2<i32>) -> vec4<f32> {
     return a / f32(2 * radius + 1);
 }
 
+// The sum of the BLOCK cells from the one at `texel` on along `direction`,
+// each held by beside() as the direct loop holds it. Not divided: the box
+// divides.
+fn block_pair(texel: vec2<u32>, direction: vec2<i32>) -> Pair {
+    var a = vec4<f32>(0.0);
+    var b = vec4<f32>(0.0);
+    for (var k = 0; k < i32(BLOCK); k = k + 1) {
+        let at = beside(texel, direction, k);
+        a = a + textureLoad(tex_a, at, 0);
+        b = b + textureLoad(tex_b, at, 0);
+    }
+    var out: Pair;
+    out.one = a;
+    out.two = b;
+    return out;
+}
+
+fn block_one(texel: vec2<u32>, direction: vec2<i32>) -> vec4<f32> {
+    var a = vec4<f32>(0.0);
+    for (var k = 0; k < i32(BLOCK); k = k + 1) {
+        a = a + textureLoad(tex_a, beside(texel, direction, k), 0);
+    }
+    return a;
+}
+
+@fragment
+fn fs_block_h2(in: VertexOutput) -> Pair {
+    return block_pair(vec2<u32>(in.position.xy), vec2<i32>(1, 0));
+}
+
+@fragment
+fn fs_block_v2(in: VertexOutput) -> Pair {
+    return block_pair(vec2<u32>(in.position.xy), vec2<i32>(0, 1));
+}
+
+@fragment
+fn fs_block_h1(in: VertexOutput) -> @location(0) vec4<f32> {
+    return block_one(vec2<u32>(in.position.xy), vec2<i32>(1, 0));
+}
+
+@fragment
+fn fs_block_v1(in: VertexOutput) -> @location(0) vec4<f32> {
+    return block_one(vec2<u32>(in.position.xy), vec2<i32>(0, 1));
+}
+
+// Whether the block `offset` cells along `direction` from `texel` is the one
+// the block pass wrote at `at`, its first cell held by beside(). It is while
+// its first cell lies at or past the near end of what beside() holds, and
+// past the far end too, where the block pass summed the last cell BLOCK
+// times. Before the near end its cells are summed one at a time, so each is
+// still held as the direct loop holds it.
+fn block_written(texel: vec2<u32>, direction: vec2<i32>, offset: i32, at: vec2<i32>) -> bool {
+    let unheld = vec2<i32>(texel) + direction * offset;
+    return dot(at - unheld, direction) <= 0;
+}
+
+// The box of box_pair from the block sums of the block pass (tex_c, tex_d)
+// BLOCK cells apart from -cells, and the cells left over at the far end from
+// tex_a and tex_b.
+fn box_pair_blocks(texel: vec2<u32>, direction: vec2<i32>) -> Pair {
+    let radius = i32(u.cells);
+    var a = vec4<f32>(0.0);
+    var b = vec4<f32>(0.0);
+    for (var j = 0; j < i32(u.blocks); j = j + 1) {
+        let offset = -radius + j * i32(BLOCK);
+        let at = beside(texel, direction, offset);
+        if block_written(texel, direction, offset, at) {
+            a = a + textureLoad(tex_c, at, 0);
+            b = b + textureLoad(tex_d, at, 0);
+        } else {
+            for (var k = 0; k < i32(BLOCK); k = k + 1) {
+                let cell = beside(texel, direction, offset + k);
+                a = a + textureLoad(tex_a, cell, 0);
+                b = b + textureLoad(tex_b, cell, 0);
+            }
+        }
+    }
+    for (var i = -radius + i32(u.blocks * BLOCK); i <= radius; i = i + 1) {
+        let at = beside(texel, direction, i);
+        a = a + textureLoad(tex_a, at, 0);
+        b = b + textureLoad(tex_b, at, 0);
+    }
+    let count = f32(2 * radius + 1);
+    var out: Pair;
+    out.one = a / count;
+    out.two = b / count;
+    return out;
+}
+
+fn box_one_blocks(texel: vec2<u32>, direction: vec2<i32>) -> vec4<f32> {
+    let radius = i32(u.cells);
+    var a = vec4<f32>(0.0);
+    for (var j = 0; j < i32(u.blocks); j = j + 1) {
+        let offset = -radius + j * i32(BLOCK);
+        let at = beside(texel, direction, offset);
+        if block_written(texel, direction, offset, at) {
+            a = a + textureLoad(tex_c, at, 0);
+        } else {
+            for (var k = 0; k < i32(BLOCK); k = k + 1) {
+                a = a + textureLoad(tex_a, beside(texel, direction, offset + k), 0);
+            }
+        }
+    }
+    for (var i = -radius + i32(u.blocks * BLOCK); i <= radius; i = i + 1) {
+        a = a + textureLoad(tex_a, beside(texel, direction, i), 0);
+    }
+    return a / f32(2 * radius + 1);
+}
+
 @fragment
 fn fs_box_h2(in: VertexOutput) -> Pair {
-    return box_pair(vec2<u32>(in.position.xy), vec2<i32>(1, 0));
+    let texel = vec2<u32>(in.position.xy);
+    if u.blocks > 0u {
+        return box_pair_blocks(texel, vec2<i32>(1, 0));
+    }
+    return box_pair(texel, vec2<i32>(1, 0));
 }
 
 @fragment
 fn fs_box_v2(in: VertexOutput) -> Pair {
-    return box_pair(vec2<u32>(in.position.xy), vec2<i32>(0, 1));
+    let texel = vec2<u32>(in.position.xy);
+    if u.blocks > 0u {
+        return box_pair_blocks(texel, vec2<i32>(0, 1));
+    }
+    return box_pair(texel, vec2<i32>(0, 1));
 }
 
 @fragment
 fn fs_box_h1(in: VertexOutput) -> @location(0) vec4<f32> {
-    return box_one(vec2<u32>(in.position.xy), vec2<i32>(1, 0));
+    let texel = vec2<u32>(in.position.xy);
+    if u.blocks > 0u {
+        return box_one_blocks(texel, vec2<i32>(1, 0));
+    }
+    return box_one(texel, vec2<i32>(1, 0));
 }
 
 @fragment
 fn fs_box_v1(in: VertexOutput) -> @location(0) vec4<f32> {
-    return box_one(vec2<u32>(in.position.xy), vec2<i32>(0, 1));
+    let texel = vec2<u32>(in.position.xy);
+    if u.blocks > 0u {
+        return box_one_blocks(texel, vec2<i32>(0, 1));
+    }
+    return box_one(texel, vec2<i32>(0, 1));
 }
 
 // What one gather solves in one cell, in the order of refine.rs: a and s,

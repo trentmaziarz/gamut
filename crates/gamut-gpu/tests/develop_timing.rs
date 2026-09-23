@@ -1210,6 +1210,46 @@ fn develop_at_viewer_size_is_fast_enough() {
                 held_p50 / 3.0
             );
         }
+        // A step of each Refine edges slider at 100 percent, the mask refined
+        // whole each time, at each end of the radius; printed, not asserted
+        // yet. Each Radius pair keeps the pad of the window.
+        for (radius, other) in [(0.05, 0.049), (0.01, 0.011)] {
+            let mut one = gated.clone();
+            one.masks[AUTO_BRUSH].refine = Refine {
+                amount: 100.0,
+                radius,
+                sensitivity: 50.0,
+            };
+            let amount = |edit: &mut PhotoEdit, value: f32| {
+                edit.masks[AUTO_BRUSH].refine.amount = 50.0 + 49.0 * value;
+            };
+            let radius_step = |edit: &mut PhotoEdit, value: f32| {
+                let odd = ((value + 1.0) * (RENDERS - 1) as f32 / 2.0).round() as u32 % 2 == 1;
+                edit.masks[AUTO_BRUSH].refine.radius = if odd { other } else { radius };
+            };
+            let sensitivity = |edit: &mut PhotoEdit, value: f32| {
+                edit.masks[AUTO_BRUSH].refine.sensitivity = 50.0 + 40.0 * value;
+            };
+            // What a slider line puts into the edit for a value from -1 to 1.
+            type Step<'a> = &'a dyn Fn(&mut PhotoEdit, f32);
+            let sliders: [(&str, Step); 3] = [
+                ("Amount", &amount),
+                ("Radius", &radius_step),
+                ("Sensitivity", &sensitivity),
+            ];
+            for (slider, step) in sliders {
+                timed_view(&gpu, &mut develop, &one, &actual);
+                let (tiles, builds) = (develop.refine_tiles(), develop.refine_builds());
+                let (p50, p95, max) = stepped_view_with(&gpu, &mut develop, &one, &actual, step);
+                let refines =
+                    develop.refine_builds().0 - builds.0 + develop.refine_builds().1 - builds.1;
+                let tiles_a_refine =
+                    f64::from(develop.refine_tiles() - tiles) / refines.max(1) as f64;
+                println!(
+                    "Refine edges {slider} slider step at 100 percent, Radius {radius}, the mask refined whole each time, {RENDERS} renders (not asserted): p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; refine_tiles {tiles_a_refine:.2} a refine over {refines} refines"
+                );
+            }
+        }
         let pen = Stroke {
             auto: true,
             sensitivity: 60.0,

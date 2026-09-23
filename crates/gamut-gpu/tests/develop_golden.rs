@@ -2961,15 +2961,17 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
     }
 }
 
-/// A scratch budget too small for the grid of cells cuts a refine into tiles,
-/// and the tiles draw byte for byte what one tile draws. On the 1101 by 90
-/// photo of the test above, the grid is 551 by 45 cells of two pixels at a
-/// radius of 0.015 and 276 by 23 cells of four at 0.03, each with a margin of
-/// 20 cells. A tile of 203 cells a side writes 320 pixels a row, and one of
-/// 127 writes 336, so each cuts the 1101 pixels into 4 tiles; the default
-/// budget holds either grid in one. A cell costs the scratch 192 bytes at a
-/// step of 2 and 240 at a step of 4. A stroke along the whole photo, with a
-/// hard rim over the row edge at 60, crosses every cut between the tiles.
+/// A scratch budget under the bytes of the grid of cells cuts a refine into
+/// tiles, and the tiles draw byte for byte what one tile draws. On the 1101
+/// by 90 photo of the test above, the grid is 551 by 45 cells of two pixels
+/// at a radius of 0.015 (24,795 cells of 192 bytes) and 276 by 23 cells of
+/// four at 0.03 (6,348 cells of 240 bytes), each with a margin of 20 cells.
+/// A budget of 157 by 157 cells at a step of 2 gives tiles of 157 cells a
+/// side, which write 228 pixels a row. One of 79 by 79 cells at a step of 4
+/// gives tiles of 104 cells, the floor of two margins and 64, which write
+/// 244. Each cuts the 1101 pixels into 5 tiles; the default budget holds
+/// either grid in one. A stroke along the whole photo, with a hard rim over
+/// the row edge at 60, crosses every cut between the tiles.
 #[test]
 fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     let _turn = ONE_AT_A_TIME
@@ -2983,13 +2985,22 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     let photo = blocky_photo(1101, 90);
     let size = (photo.width, photo.height);
     let readback = Readback::new(&gpu.device);
-    for (radius, step, side, cell_bytes) in [(0.015, 2, 203u64, 192u64), (0.03, 4, 127, 240)] {
+    // The radius, the step, the cells a side of the budget, the bytes of a
+    // cell, and the side of a tile.
+    for (radius, step, budget_side, cell_bytes, side) in
+        [(0.015, 2, 157u64, 192u64, 157u32), (0.03, 4, 79, 240, 104)]
+    {
         let plan = Plan::for_geometry(
             &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
             &Geometry::full(size, size),
         );
         assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 20));
-        let budget = side * side * cell_bytes;
+        let budget = budget_side * budget_side * cell_bytes;
+        let (_, grid) = plan.grid();
+        assert!(
+            u64::from(grid.0 * grid.1) * cell_bytes > budget,
+            "the budget is under the bytes of the grid"
+        );
         // A stroke across the photo, its centre on row 52 and its hard rim
         // 5 pixels over the row edge at 60, refined alone; then with the
         // radial gradient and the stroke down the photo of the test above,
@@ -3038,8 +3049,8 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
             println!("{name}: refine_tiles {tiles} then {one_tile}; the twin moves {moved} pixels");
             assert_eq!(
                 (tiles, one_tile),
-                (4 * refined_masks, refined_masks),
-                "{name}: 4 tiles a mask at {budget} bytes, then 1"
+                (5 * refined_masks, refined_masks),
+                "{name}: 5 tiles a mask at {budget} bytes, then 1"
             );
             let differing = tiled.iter().zip(&whole).filter(|(a, b)| a != b).count();
             assert_eq!(tiled.len(), whole.len());
@@ -3055,6 +3066,126 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
                 .collect();
             assert_matches_the_twin(&name, &photo, &edit, &pixels);
         }
+    }
+}
+
+/// A box of 8 cells or more adds the sums of 8 cells a block pass wrote, and
+/// the cells left over. At Radius 0.05 a photo 1024 pixels wide has cells of
+/// 4 pixels and a box of 9 cells either side, 19 cells: 2 blocks and 3
+/// cells. One 2048 pixels wide has a box of 18, 37 cells: 4 blocks and 5. At
+/// 160 rows the grid is 40 cells down, so a box down is held at the edges of
+/// the grid in some cells and at neither edge in others. Each render matches
+/// the twin and is set beside the same render with every box summed in the
+/// direct loop.
+///
+/// A refine of one tile is 18 passes, and 6 more when it takes the moments
+/// of the source; each of the 6 boxes of the three gathers and of the 4
+/// boxes of the source has a block pass before it. Of the two masks here the
+/// first takes the moments of the source and the second holds them: 34 and
+/// 24 passes, 58 in all, against 24 and 18, 42, in the direct loop.
+#[test]
+fn a_refined_mask_whose_box_spans_blocks_matches() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let readback = Readback::new(&gpu.device);
+    // The width, the box in cells either side, its blocks and the cells left
+    // over, and the block edge the masks lie over.
+    for (width, cells, blocks, singles, edge) in [
+        (1024u32, 9u32, 2u32, 3u32, 576f32),
+        (2048, 18, 4, 5, 1152.0),
+    ] {
+        let photo = blocky_photo(width, 160);
+        let size = (photo.width, photo.height);
+        let plan = Plan::for_geometry(
+            &refined_at(Mask::default(), 100.0, 0.05, 50.0).refine,
+            &Geometry::full(size, size),
+        );
+        assert_eq!((plan.step, plan.cells), (4, cells));
+        assert_eq!(plan.grid().1, (width / 4, 40));
+        assert_eq!(
+            ((2 * cells + 1) / 8, (2 * cells + 1) % 8),
+            (blocks, singles)
+        );
+        let w = width as f32;
+        // A radial gradient 160 pixels across either side with a hard rim 8
+        // pixels over the block edge and across the row edges at 60 and 120,
+        // and a stroke with a hard rim 5 pixels over the block edge at
+        // column 288.
+        let radial = MaskSource::Radial(RadialGradient {
+            centre: [(edge + 8.0 - 160.0) / w, 0.5],
+            radius: [160.0 / w, 70.0 / w],
+            rotation: 0.0,
+            feather: 15.0,
+        });
+        let brush = brush_source(&[stroke(
+            &[[280.0 / w, 0.1], [280.0 / w, 0.9]],
+            13.0 / w,
+            20.0,
+            100.0,
+        )]);
+        let edit = masked(vec![
+            refined_at(exposure_mask("Radial", radial), 100.0, 0.05, 50.0),
+            refined_at(exposure_mask("Brush", brush), 100.0, 0.05, 60.0),
+        ]);
+        let name = format!(
+            "refined masks on a photo {width} pixels wide, a box of {} cells in {blocks} blocks and {singles} cells",
+            2 * cells + 1
+        );
+        let moved = assert_the_refine_shows(&photo, &edit);
+        // A graph of its own for each render, so its counters read that
+        // render alone: the passes, the refines and the moments of the
+        // source taken.
+        let render = |direct: bool| -> (Vec<u8>, u32, u64, u64) {
+            let mut develop = Develop::new(&gpu.device, &gpu.queue).with_refine_direct_box(direct);
+            develop.set_source(&photo);
+            let view = develop
+                .render(&edit, CropRect::FULL, size, size)
+                .expect("a source is set");
+            let pixels = readback.read(&gpu.device, &gpu.queue, view, size.0, size.1);
+            (
+                pixels,
+                develop.refine_passes(),
+                develop.refine_builds().0,
+                develop.refine_source_builds(),
+            )
+        };
+        let (summed, passes, refines, sources) = render(false);
+        let (direct, direct_passes, direct_refines, direct_sources) = render(true);
+        assert_eq!(
+            (refines, sources, direct_refines, direct_sources),
+            (2, 1, 2, 1),
+            "{name}: two refines of one tile, the moments of the source taken once"
+        );
+        println!(
+            "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop; the twin moves {moved} pixels"
+        );
+        assert_eq!(passes, (18 + 6) * 2 + (6 + 4), "{name}: with blocks");
+        assert_eq!(direct_passes, 18 * 2 + 6, "{name}: in the direct loop");
+        assert_eq!(summed.len(), direct.len());
+        let largest = summed
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        let differing = summed.iter().zip(&direct).filter(|(a, b)| a != b).count();
+        println!(
+            "{name}: the blocks against the direct loop: largest byte difference {largest}, {differing} of {} bytes differ",
+            summed.len()
+        );
+        let pixels: Vec<[u8; 3]> = summed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect();
+        assert_matches_the_twin(&name, &photo, &edit, &pixels);
     }
 }
 

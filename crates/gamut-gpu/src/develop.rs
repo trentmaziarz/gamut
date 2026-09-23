@@ -1059,6 +1059,15 @@ impl Develop {
         self
     }
 
+    /// The same graph with every box of Refine edges summed in the direct
+    /// loop when `on`, and no block pass, so a test can hold the block sums
+    /// to it.
+    #[doc(hidden)]
+    pub fn with_refine_direct_box(mut self, on: bool) -> Self {
+        self.refine = self.refine.with_direct_box(on);
+        self
+    }
+
     /// How many passes of Shift edge, of Feather's cells and of the finished
     /// alpha this graph has drawn. A develop slider draws none of them.
     pub fn edge_passes(&self) -> EdgePasses {
