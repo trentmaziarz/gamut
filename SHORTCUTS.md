@@ -137,8 +137,9 @@ bracket key or a click, and Alt, held while painting.
 - Feather is a slider of the mask, separate from the Feather setting under the
   brush component.
 - The Feather slider of the mask softens every edge of the mask. That includes a
-  hard edge left by Refine edges. Its value is the width of the fade, as a
-  percentage of the longer side of the picture.
+  hard edge left by Refine edges. Its value sets how soft the edge is, as a
+  percentage of the longer side of the picture. A higher value makes a wider
+  fade.
 - The Feather slider of the mask goes up to 5.00 %. Feather is off at 0, its
   lowest setting and the one a new mask starts with.
 - Contrast makes a soft edge firmer. Raise it and the fade narrows about the
