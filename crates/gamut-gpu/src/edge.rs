@@ -10,11 +10,12 @@
 //! shifted alpha (r8unorm, the frame's size), the blurred cells of Feather
 //! (r32float, the cell grid's size) and the finished alpha (r8unorm, the
 //! frame's size), which Feather and Contrast write in one pass. The runs of
-//! Shift edge work through three r8unorm textures of the frame's size and
-//! Feather through two r32float cell targets, all shared by the masks of the
-//! frame and held only while a mask needs them. The shifted alpha is written
-//! by the last pass of the last run alone and is never a place the runs work
-//! in, so what it holds outside the pixels a pass redraws stays valid.
+//! Shift edge work through three r8unorm textures of the frame's size grown
+//! by a pad on every side and Feather through two r32float cell targets, all
+//! shared by the masks of the frame and held only while a mask needs them.
+//! The shifted alpha is written by the last pass of the last run alone and
+//! is never a place the runs work in, so what it holds outside the pixels a
+//! pass redraws stays valid.
 
 use bytemuck::{Pod, Zeroable};
 use gamut_color::edge::{Plan, Run};
@@ -48,6 +49,15 @@ pub(crate) struct EdgeUniform {
     pub(crate) feathered: u32,
     pub(crate) contrast: f32,
     pub(crate) gain: f32,
+    /// A pass of Shift edge: the texel of the texture it reads that holds
+    /// pixel (0, 0) of the frame, how far past the frame a read may land
+    /// before it is held, and the texel of its target that holds pixel
+    /// (0, 0). See [`RunPass`].
+    pub(crate) read_origin: i32,
+    pub(crate) read_reach: i32,
+    pub(crate) write_origin: i32,
+    /// The combine pass: the samples the widest entries of the table hold.
+    pub(crate) span: i32,
 }
 
 impl EdgeUniform {
@@ -68,6 +78,10 @@ impl EdgeUniform {
             feathered: u32::from(plan.feathers()),
             contrast: plan.contrast,
             gain: plan.gain,
+            read_origin: 0,
+            read_reach: 0,
+            write_origin: 0,
+            span: 0,
         }
     }
 }
@@ -82,6 +96,17 @@ pub(crate) enum Place {
 }
 
 /// One pass of Shift edge.
+///
+/// How it reads and writes. The three work textures are the frame grown by
+/// the pad on every side, and pixel (0, 0) of the frame is their texel (pad,
+/// pad); the input of the chain and the shifted alpha are the frame alone. A
+/// level pass reads the run's input (the refined alpha, or the previous
+/// run's output) with each coordinate clamped to the frame, and reads a
+/// level of the table with each coordinate clamped to the padded texture;
+/// it draws its area grown into the pad. The combine pass reads the two
+/// widest entries, at x - h d and x + (h + 1 - span) d, with the same clamp
+/// to the padded texture, and writes the frame area of the run's output.
+/// The pad of an output is never written and never read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RunPass {
     /// The run it belongs to, by its place among the plan's runs.
@@ -90,12 +115,19 @@ pub(crate) struct RunPass {
     /// A level of the table: how many steps on its second entry lies. The
     /// combine pass: the half of the run.
     pub(crate) offset: u32,
-    /// The combine pass: it reads the widest entries of the table and, for
-    /// the loop at the frame's edges, the input of the run from `other`.
+    /// The combine pass: it reads the two widest entries of the table.
     pub(crate) combine: bool,
+    /// It reads a level of the table, held to the padded texture, and not
+    /// the run's input, held to the frame.
+    pub(crate) reads_table: bool,
     pub(crate) read: Place,
-    pub(crate) other: Option<Place>,
     pub(crate) write: Place,
+}
+
+/// How far the work textures of Shift edge reach past the frame on every
+/// side for these runs: the widest half among them.
+pub(crate) fn pad(runs: &[Run]) -> u32 {
+    runs.iter().map(|run| run.half).max().unwrap_or(0)
 }
 
 /// How many levels the sparse table of a run of half `half` takes:
@@ -118,8 +150,7 @@ pub(crate) fn schedule(runs: &[Run]) -> Vec<RunPass> {
     for (index, run) in runs.iter().enumerate() {
         // The work textures the input of this run is not in: the levels go
         // back and forth between the first two, and the combine pass writes
-        // the one the widest level is not in. The input stays whole for the
-        // loop of the combine pass.
+        // the one the widest level is not in.
         let free: Vec<usize> = (0..3).filter(|w| input != Place::Work(*w)).collect();
         let levels = levels(run.half) as usize;
         let mut read = input;
@@ -130,8 +161,8 @@ pub(crate) fn schedule(runs: &[Run]) -> Vec<RunPass> {
                 direction: run.direction,
                 offset: 1 << level,
                 combine: false,
+                reads_table: level > 0,
                 read,
-                other: None,
                 write,
             });
             read = write;
@@ -146,8 +177,8 @@ pub(crate) fn schedule(runs: &[Run]) -> Vec<RunPass> {
             direction: run.direction,
             offset: run.half,
             combine: true,
+            reads_table: true,
             read,
-            other: Some(input),
             write,
         });
         input = write;
@@ -189,8 +220,14 @@ fn texture(
 /// The textures of a frame the edge passes work in, shared by its masks.
 #[derive(Default)]
 pub(crate) struct EdgeScratch {
-    /// The three r8unorm textures the runs of Shift edge work in.
+    /// The three r8unorm textures the runs of Shift edge work in, each the
+    /// frame grown by `pad` on every side (see [`RunPass`]).
     runs: Option<[Texture; 3]>,
+    /// How many pixels the work textures hold past the frame on each side:
+    /// the entries of the table whose first sample lies beyond the frame,
+    /// each the maximum or minimum over samples clamped to the frame. At
+    /// least the widest half of the runs they were made for.
+    pad: u32,
     /// The means of the cells and the blur across, r32float.
     cells: Option<[Texture; 2]>,
 }
@@ -200,6 +237,7 @@ impl EdgeScratch {
     pub(crate) fn keep(&mut self, runs: bool, cells: bool) {
         if !runs {
             self.runs = None;
+            self.pad = 0;
         }
         if !cells {
             self.cells = None;
@@ -377,7 +415,6 @@ impl EdgePass {
                 },
                 texture_entry(1),
                 texture_entry(2),
-                texture_entry(3),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -470,9 +507,50 @@ impl EdgePass {
                 edged.shifted = Some(texture(device, "shifted alpha", RUN_FORMAT, frame));
                 made.shifted = true;
             }
-            if scratch.runs.as_ref().is_none_or(|r| r[0].size != frame) {
+            // The work textures are the frame grown by the pad on every side,
+            // the pad the widest half of the runs, so that the combine pass
+            // loads two entries of the table at every pixel of the frame.
+            //
+            // Why that is exact. The twin's run of half h along d at x takes
+            // the samples x + s d, s from -h to h, each clamped to the frame
+            // on each axis. Call E_L(p) the maximum or minimum over the
+            // samples p + s d, s from 0 to L - 1, each clamped to the frame:
+            // it is defined at any p, in the frame or past it. The first
+            // level writes E_2 over the padded texture from the input read
+            // with the clamp to the frame, so an entry at a pad position is
+            // the op over samples whose coordinates clamp to the frame,
+            // which is what the twin's run reads past the frame. A later
+            // level writes E_2L(p) from E_L(p) and E_L(p + L d). Where p + L
+            // d leaves the padded texture, it does so on an axis along which
+            // the ray moves away from the frame, and there the clamp to the
+            // padded texture composes with the clamp to the frame: every
+            // sample of the entry it lands on and of the entry it stands for
+            // clamps to the same edge of the frame on that axis, so the two
+            // are equal. The combine pass reads E_S at x - h d and at x + (h
+            // + 1 - S) d, with S = 2^k from h + 1 to 2 h + 1; with the pad at
+            // least h both lie in the padded texture, and together they hold
+            // s from -h to h, the twin's samples, some twice, which a
+            // maximum or a minimum does not count.
+            //
+            // The textures are kept while they hold the frame with a pad at
+            // least that wide, and made again when the frame or the pad
+            // grows. Where the frame and two pads would pass the device's
+            // limit on a side, the pad is cut to what fits; a run whose half
+            // is wider than that pad then reads a clamped first entry at the
+            // pixels within its half of the frame's near edges.
+            let limit = device.limits().max_texture_dimension_2d;
+            let room = limit.saturating_sub(frame.0.max(frame.1)) / 2;
+            let wanted = pad(&plan.runs()).min(room);
+            let holds = |r: &[Texture; 3], pad: u32| {
+                pad >= wanted
+                    && r[0].size.0 >= frame.0 + 2 * pad
+                    && r[0].size.1 >= frame.1 + 2 * pad
+            };
+            if scratch.runs.as_ref().is_none_or(|r| !holds(r, scratch.pad)) {
+                let padded = (frame.0 + 2 * wanted, frame.1 + 2 * wanted);
                 scratch.runs =
-                    Some([0; 3].map(|_| texture(device, "edge runs", RUN_FORMAT, frame)));
+                    Some([0; 3].map(|_| texture(device, "edge runs", RUN_FORMAT, padded)));
+                scratch.pad = wanted;
             }
         } else {
             edged.shifted = None;
@@ -526,12 +604,11 @@ impl EdgePass {
         let frame = plan.size;
         let base = EdgeUniform::of(plan);
         // Every pass: its pipeline, its uniform, what it reads (source,
-        // other, cells), what it writes, and where.
+        // cells), what it writes, and where.
         struct Draw<'a> {
             kind: Kind,
             uniform: EdgeUniform,
             source: &'a wgpu::TextureView,
-            other: &'a wgpu::TextureView,
             cells: &'a wgpu::TextureView,
             target: &'a wgpu::TextureView,
             area: Rect,
@@ -572,6 +649,15 @@ impl EdgePass {
                 Place::Work(w) => &runs[w].view,
                 Place::Shifted => shifted,
             };
+            // Where pixel (0, 0) of the frame lies in a place, and the
+            // padded texture the levels are drawn and held in.
+            let pad = scratch.pad;
+            let origin = |place: Place| match place {
+                Place::Work(_) => pad,
+                Place::Input | Place::Shifted => 0,
+            };
+            let padded = (frame.0 + 2 * pad, frame.1 + 2 * pad);
+            let moved = |rect: Rect, by: u32| (rect.0 + by, rect.1 + by, rect.2, rect.3);
             for pass in schedule(&runs_of_plan) {
                 let run = runs_of_plan[pass.run];
                 let (dx, dy) = run.direction;
@@ -579,16 +665,17 @@ impl EdgePass {
                 // reach the run has left after it: a level of the table by
                 // the half of the run, since the combine pass reads its
                 // entries up to half steps back and each level reads the one
-                // before at most half steps on; the combine pass, which
-                // reaches no further, over the pixels of its run and no more.
+                // before at most half steps on, held to the padded texture;
+                // the combine pass, which reaches no further, over the
+                // pixels of its run and no more, which lie in the frame.
                 let area = if pass.combine {
-                    rights[pass.run]
+                    moved(rights[pass.run], origin(pass.write))
                 } else {
                     grow_xy(
-                        rights[pass.run],
+                        moved(rights[pass.run], pad),
                         run.half * dx.unsigned_abs(),
                         run.half * dy.unsigned_abs(),
-                        frame,
+                        padded,
                     )
                 };
                 draws.push(Draw {
@@ -600,10 +687,13 @@ impl EdgePass {
                     uniform: EdgeUniform {
                         direction: [pass.direction.0, pass.direction.1],
                         offset: pass.offset as i32,
+                        read_origin: origin(pass.read) as i32,
+                        read_reach: if pass.reads_table { pad as i32 } else { 0 },
+                        write_origin: origin(pass.write) as i32,
+                        span: 1 << levels(run.half),
                         ..base
                     },
                     source: view(pass.read),
-                    other: view(pass.other.unwrap_or(pass.read)),
                     cells: view(pass.read),
                     target: view(pass.write),
                     area,
@@ -624,7 +714,6 @@ impl EdgePass {
                 kind: Kind::Cells,
                 uniform: base,
                 source: stage_input,
-                other: stage_input,
                 cells: stage_input,
                 target: &spare[0].view,
                 area: means,
@@ -636,7 +725,6 @@ impl EdgePass {
                     ..base
                 },
                 source: stage_input,
-                other: stage_input,
                 cells: &spare[0].view,
                 target: &spare[1].view,
                 area: across,
@@ -648,7 +736,6 @@ impl EdgePass {
                     ..base
                 },
                 source: stage_input,
-                other: stage_input,
                 cells: &spare[1].view,
                 target: &held.view,
                 area: down,
@@ -661,7 +748,6 @@ impl EdgePass {
                 kind: Kind::Finish,
                 uniform: base,
                 source: stage_input,
-                other: stage_input,
                 cells,
                 target: &finished.view,
                 area: over,
@@ -676,9 +762,8 @@ impl EdgePass {
             edged.uniform = self.uniform_buffer(device, edged.slots);
         }
         // One bind group for each set of textures a pass reads.
-        let mut groups: Vec<([usize; 3], wgpu::BindGroup)> = Vec::new();
-        let key =
-            |d: &Draw| [d.source, d.other, d.cells].map(|v| v as *const wgpu::TextureView as usize);
+        let mut groups: Vec<([usize; 2], wgpu::BindGroup)> = Vec::new();
+        let key = |d: &Draw| [d.source, d.cells].map(|v| v as *const wgpu::TextureView as usize);
         for d in &draws {
             let k = key(d);
             if groups.iter().any(|(held, _)| *held == k) {
@@ -702,10 +787,6 @@ impl EdgePass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(d.other),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: wgpu::BindingResource::TextureView(d.cells),
                     },
                 ],
@@ -819,7 +900,14 @@ mod tests {
         assert_eq!(offset("feathered"), offset_of!(EdgeUniform, feathered));
         assert_eq!(offset("contrast"), offset_of!(EdgeUniform, contrast));
         assert_eq!(offset("gain"), offset_of!(EdgeUniform, gain));
-        assert_eq!(members.len(), 13);
+        assert_eq!(offset("read_origin"), offset_of!(EdgeUniform, read_origin));
+        assert_eq!(offset("read_reach"), offset_of!(EdgeUniform, read_reach));
+        assert_eq!(
+            offset("write_origin"),
+            offset_of!(EdgeUniform, write_origin)
+        );
+        assert_eq!(offset("span"), offset_of!(EdgeUniform, span));
+        assert_eq!(members.len(), 17);
     }
 
     /// The value of `const NAME: f32 = value;` in the shader.
@@ -870,81 +958,85 @@ mod tests {
         assert_eq!((uniform.contrast, uniform.gain), (plan.contrast, plan.gain));
     }
 
-    /// `fs_run_combine`'s choice, on the CPU: whether the two widest entries
-    /// of the table hold exactly the samples of the run at `at`, or the
-    /// direct loop over them is taken.
-    fn table_holds(at: (i32, i32), size: (u32, u32), direction: (i32, i32), half: i32) -> bool {
-        let span = 1i32 << levels(half as u32);
-        let limit = (size.0 as i32 - 1, size.1 as i32 - 1);
-        let start = (at.0 - half * direction.0, at.1 - half * direction.1);
-        if (0..=limit.0).contains(&start.0) && (0..=limit.1).contains(&start.1) {
-            return true;
-        }
-        if direction.0 == 0 || direction.1 == 0 {
-            let (n, a) = if direction.1 == 0 {
-                (size.0 as i32, at.0)
-            } else {
-                (size.1 as i32, at.1)
-            };
-            let from_edge = if direction.0 + direction.1 > 0 {
-                a
-            } else {
-                n - 1 - a
-            };
-            return from_edge + half >= (span - 1).min(n - 1);
-        }
-        false
-    }
-
     /// `passes` run on the CPU texture by texture, as the GPU runs them,
-    /// over `input`: what lands in the shifted alpha. Holds that no pass
-    /// reads what it writes or a texture another pass spoiled, and that the
-    /// shifted alpha is written once, by the last pass.
-    fn run_on_cpu(passes: &[RunPass], input: &[f32], size: (u32, u32), grow: bool) -> Vec<f32> {
-        let at = |x: i32, y: i32| {
-            let x = x.clamp(0, size.0 as i32 - 1) as u32;
-            let y = y.clamp(0, size.1 as i32 - 1) as u32;
-            (y * size.0 + x) as usize
-        };
+    /// over `input`, the work textures padded by `pad` on every side: what
+    /// lands in the shifted alpha. A level pass draws the whole padded
+    /// texture and reads the run's input held to the frame or a level of
+    /// the table held to the padded texture; the combine pass reads the two
+    /// widest entries held to the padded texture and writes the frame of
+    /// its output, whose pad then holds nothing. Holds that no pass reads
+    /// what it writes, a texture another pass spoiled or a texel that holds
+    /// nothing, and that the shifted alpha is written once, by the last
+    /// pass.
+    fn run_on_cpu(
+        passes: &[RunPass],
+        input: &[f32],
+        size: (u32, u32),
+        pad: u32,
+        grow: bool,
+    ) -> Vec<f32> {
+        let (w, h, p) = (size.0 as i32, size.1 as i32, pad as i32);
+        let (pw, ph) = (w + 2 * p, h + 2 * p);
         let pick = |a: f32, b: f32| if grow { a.max(b) } else { a.min(b) };
         let mut work: [Vec<f32>; 3] = [vec![], vec![], vec![]];
         let mut shifted = vec![-1.0f32; input.len()];
         let mut writes_to_shifted = 0;
         for pass in passes {
-            assert_ne!(Some(pass.write), Some(pass.read));
-            assert_ne!(Some(pass.write), pass.other);
+            assert_ne!(pass.write, pass.read);
             assert_ne!(pass.write, Place::Input);
-            assert_eq!(pass.other.is_some(), pass.combine);
-            let read = |place: Place, work: &[Vec<f32>; 3]| match place {
-                Place::Input => input.to_vec(),
-                Place::Work(w) => work[w].clone(),
+            assert_eq!(pass.reads_table, pass.combine || pass.offset > 1);
+            // Where the frame lies in what the pass reads, how wide that
+            // texture is, and how far past the frame a read may land.
+            let (source, origin, width): (&[f32], i32, i32) = match pass.read {
+                Place::Input => (input, 0, w),
+                Place::Work(i) => (&work[i], p, pw),
                 Place::Shifted => panic!("the shifted alpha is never read"),
             };
-            let source = read(pass.read, &work);
-            assert_eq!(source.len(), input.len(), "{pass:?} reads what was written");
-            let other = pass.other.map(|o| read(o, &work));
+            assert_eq!(
+                source.len() as i32,
+                width * (h + 2 * origin),
+                "{pass:?} reads what was written"
+            );
+            let reach = if pass.reads_table { p } else { 0 };
+            let read = |x: i32, y: i32| {
+                let x = x.clamp(-reach, w - 1 + reach) + origin;
+                let y = y.clamp(-reach, h - 1 + reach) + origin;
+                let value = source[(y * width + x) as usize];
+                assert!(!value.is_nan(), "{pass:?} reads a texel that holds nothing");
+                value
+            };
             let (dx, dy) = pass.direction;
             let o = pass.offset as i32;
-            let out: Vec<f32> = (0..input.len())
-                .map(|i| {
-                    let (x, y) = ((i as u32 % size.0) as i32, (i as u32 / size.0) as i32);
-                    if !pass.combine {
-                        return pick(source[i], source[at(x + o * dx, y + o * dy)]);
-                    }
-                    if table_holds((x, y), size, pass.direction, o) {
-                        let span = 1i32 << levels(pass.offset);
-                        let first = source[at(x - o * dx, y - o * dy)];
-                        let second = source[at(x + (o + 1 - span) * dx, y + (o + 1 - span) * dy)];
-                        return pick(first, second);
-                    }
-                    let input = other.as_ref().expect("the combine reads the input");
-                    (1 - o..=o).fold(input[at(x - o * dx, y - o * dy)], |v, s| {
-                        pick(v, input[at(x + s * dx, y + s * dy)])
+            let out: Vec<f32> = if pass.combine {
+                let span = 1i32 << levels(pass.offset);
+                let frame: Vec<f32> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let first = read(x - o * dx, y - o * dy);
+                        let second = read(x + (o + 1 - span) * dx, y + (o + 1 - span) * dy);
+                        pick(first, second)
                     })
-                })
-                .collect();
+                    .collect();
+                if pass.write == Place::Shifted {
+                    frame
+                } else {
+                    let mut out = vec![f32::NAN; (pw * ph) as usize];
+                    for (i, value) in frame.into_iter().enumerate() {
+                        let (x, y) = (i as i32 % w, i as i32 / w);
+                        out[((y + p) * pw + x + p) as usize] = value;
+                    }
+                    out
+                }
+            } else {
+                (0..pw * ph)
+                    .map(|i| {
+                        let (x, y) = (i % pw - p, i / pw - p);
+                        pick(read(x, y), read(x + o * dx, y + o * dy))
+                    })
+                    .collect()
+            };
             match pass.write {
-                Place::Work(w) => work[w] = out,
+                Place::Work(i) => work[i] = out,
                 Place::Shifted => {
                     shifted = out;
                     writes_to_shifted += 1;
@@ -963,7 +1055,9 @@ mod tests {
     /// or a texture another pass spoiled. The frames hold runs longer than a
     /// side, and pixels whose run starts past an edge on one axis or two;
     /// the hashed codes keep the maximum and the minimum of a run off the
-    /// ends of the scale, so a sample too many at an edge shows.
+    /// ends of the scale, so a sample too many at an edge shows. The work
+    /// textures are padded by the widest half, and by 3 more, as textures
+    /// kept from a wider plan are.
     #[test]
     fn the_schedule_of_the_runs_gives_the_twin_and_keeps_its_textures_apart() {
         let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
@@ -998,11 +1092,13 @@ mod tests {
                         };
                         let runs = plan.runs();
                         let passes = schedule(&runs);
-                        let shifted = run_on_cpu(&passes, input, size, grow);
-                        assert!(
-                            bits(&shifted, &twin::shift(input, &plan)),
-                            "{size:?} {axis} {diagonal} {grow}"
-                        );
+                        for more in [0, 3] {
+                            let shifted = run_on_cpu(&passes, input, size, pad(&runs) + more, grow);
+                            assert!(
+                                bits(&shifted, &twin::shift(input, &plan)),
+                                "{size:?} {axis} {diagonal} {grow} {more}"
+                            );
+                        }
                         // A pass for each level of the table after the
                         // input, and the combine pass, for each run.
                         let count: usize = runs
@@ -1011,11 +1107,19 @@ mod tests {
                             .sum();
                         assert_eq!(passes.len(), count);
                         for run in &runs {
-                            let alone = run_on_cpu(&schedule(&[*run]), input, size, grow);
-                            assert!(
-                                bits(&alone, &twin::run(input, size, *run, grow)),
-                                "{size:?} {run:?} {grow}"
-                            );
+                            for more in [0, 3] {
+                                let alone = run_on_cpu(
+                                    &schedule(&[*run]),
+                                    input,
+                                    size,
+                                    run.half + more,
+                                    grow,
+                                );
+                                assert!(
+                                    bits(&alone, &twin::run(input, size, *run, grow)),
+                                    "{size:?} {run:?} {grow} {more}"
+                                );
+                            }
                         }
                     }
                 }

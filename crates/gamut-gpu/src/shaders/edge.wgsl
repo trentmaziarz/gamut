@@ -9,7 +9,7 @@
 //     fs_run_level    a level of the run's sparse table: the entry of the
 //                     level before here and the one `offset` steps on
 //     fs_run_combine  the run: the two widest entries that cover its
-//                     samples, or near a frame edge the loop over them
+//                     samples
 //   Feather
 //     fs_cells        the mean of the pixels of each cell of the whole
 //                     picture's grid
@@ -18,6 +18,12 @@
 //     fs_finish       the four cells around each pixel mixed bilinearly (or
 //                     the alpha as it is while Feather is at rest), then
 //                     Contrast: the finished alpha
+//
+// The runs work in textures padded past the frame on every side, so a level
+// of the table holds entries in the pad too, and the combine pass loads two
+// of them at every pixel of the frame, the pixels near its edges included.
+// Where a pass reads and writes, `read_origin`, `read_reach` and
+// `write_origin` say.
 //
 // A maximum or a minimum makes no new value, so the runs keep the 8-bit codes
 // they read. The cells are 32 bit floats. Nothing here reads the source or
@@ -47,15 +53,26 @@ struct Uniform {
     // Contrast, 0 to 100, and its gain below 100.
     contrast: f32,
     gain: f32,
+    // A pass of Shift edge. The texel of `source` that holds pixel (0, 0) of
+    // the frame is (read_origin, read_origin): the pad of a work texture, or
+    // 0 for the input of the chain. A read is held within `read_reach` pixels
+    // of the frame: 0 for the input of a run, which holds the frame alone,
+    // and the pad for a level of the table. The pixel (0, 0) of the frame is
+    // texel (write_origin, write_origin) of the target.
+    read_origin: i32,
+    read_reach: i32,
+    write_origin: i32,
+    // The combine pass: how many samples the widest entries of the table
+    // hold, 2 to the power of its levels.
+    span: i32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
-// The alpha a pass reads: the input of the chain, or a level of the table.
+// The alpha a pass reads: the input of the chain, a level of the table, or
+// the alpha Feather and the finished alpha start from.
 @group(0) @binding(1) var source: texture_2d<f32>;
-// The input of the run, which the combine pass loops over near an edge.
-@group(0) @binding(2) var other: texture_2d<f32>;
 // The cells a blur or the finished alpha reads.
-@group(0) @binding(3) var cells: texture_2d<f32>;
+@group(0) @binding(2) var cells: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -73,10 +90,20 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 const CONTRAST_MIDDLE: f32 = 0.5;
 const MAX_CONTRAST: f32 = 100.0;
 
-// An alpha of the render, its place held inside the render.
-fn alpha_at(t: texture_2d<f32>, at: vec2<i32>) -> f32 {
-    let limit = vec2<i32>(u.size) - vec2<i32>(1, 1);
-    return textureLoad(t, clamp(at, vec2<i32>(0, 0), limit), 0).r;
+// The pixel of the frame a pass of Shift edge draws: the place of the
+// fragment less the origin of the frame in the target.
+fn frame_pixel(in: VertexOutput) -> vec2<i32> {
+    return vec2<i32>(in.position.xy) - vec2<i32>(u.write_origin, u.write_origin);
+}
+
+// The alpha of `source` at pixel `at` of the frame, each coordinate held
+// within `read_reach` of the frame: to the frame for the input of a run, to
+// the padded texture for a level of the table.
+fn read_at(at: vec2<i32>) -> f32 {
+    let low = vec2<i32>(-u.read_reach, -u.read_reach);
+    let high = vec2<i32>(u.size) - vec2<i32>(1, 1) - low;
+    let held = clamp(at, low, high) + vec2<i32>(u.read_origin, u.read_origin);
+    return textureLoad(source, held, 0).r;
 }
 
 // The maximum while Shift edge grows the mask, the minimum while it shrinks
@@ -89,60 +116,28 @@ fn pick(a: f32, b: f32) -> f32 {
 }
 
 // A level of the sparse table: an entry of 2j samples from the two entries
-// of j samples here and j steps on.
+// of j samples here and j steps on. It draws the pixels of the frame and of
+// the pad around it.
 @fragment
 fn fs_run_level(in: VertexOutput) -> @location(0) vec4<f32> {
-    let at = vec2<i32>(in.position.xy);
-    let here = alpha_at(source, at);
-    let far = alpha_at(source, at + u.offset * u.direction);
+    let at = frame_pixel(in);
+    let here = read_at(at);
+    let far = read_at(at + u.offset * u.direction);
     return vec4<f32>(pick(here, far), 0.0, 0.0, 1.0);
 }
 
-// Whether the two widest entries of the table, of `span` samples, hold
-// exactly the samples of the run of half `h` at `at`, each held inside the
-// render. They do where the first sample, h steps back, is inside the
-// render. Where it is not, the entry at the held place starts at the edge
-// and runs `span` steps on, not bent along the edge as the samples of a
-// diagonal run are, so it holds samples the run does not take. A run along
-// one axis is a line from the edge: the entry takes no sample the run does
-// not while the run reaches at least as far, or to the far edge.
-fn table_holds(at: vec2<i32>, h: i32, span: i32) -> bool {
-    let d = u.direction;
-    let limit = vec2<i32>(u.size) - vec2<i32>(1, 1);
-    let start = at - h * d;
-    if (all(start >= vec2<i32>(0, 0)) && all(start <= limit)) {
-        return true;
-    }
-    if (d.x == 0 || d.y == 0) {
-        let along = abs(d);
-        let n = dot(vec2<i32>(u.size), along);
-        let a = dot(at, along);
-        let from_edge = select(n - 1 - a, a, d.x + d.y > 0);
-        return from_edge + h >= min(span - 1, n - 1);
-    }
-    return false;
-}
-
-// The run of half `offset`: the maximum or minimum of the widest entries of
-// the table at h steps back and at h + 1 - span steps on, which together
-// hold its 2 h + 1 samples; where they would not, the loop over the samples
-// of the input.
+// The run of half `offset` at a pixel of the frame: the maximum or minimum
+// of the widest entries of the table at h steps back and at h + 1 - span
+// steps on, which together hold its 2 h + 1 samples. Both lie in the padded
+// texture, since the pad is at least h.
 @fragment
 fn fs_run_combine(in: VertexOutput) -> @location(0) vec4<f32> {
-    let at = vec2<i32>(in.position.xy);
+    let at = frame_pixel(in);
     let h = u.offset;
     let d = u.direction;
-    let span = 1i << firstLeadingBit(u32(2 * h + 1));
-    if (table_holds(at, h, span)) {
-        let first = alpha_at(source, at - h * d);
-        let second = alpha_at(source, at + (h + 1 - span) * d);
-        return vec4<f32>(pick(first, second), 0.0, 0.0, 1.0);
-    }
-    var run = alpha_at(other, at - h * d);
-    for (var i = 1 - h; i <= h; i = i + 1) {
-        run = pick(run, alpha_at(other, at + i * d));
-    }
-    return vec4<f32>(run, 0.0, 0.0, 1.0);
+    let first = read_at(at - h * d);
+    let second = read_at(at + (h + 1 - u.span) * d);
+    return vec4<f32>(pick(first, second), 0.0, 0.0, 1.0);
 }
 
 // The mean of the pixels of one cell that the render holds.
