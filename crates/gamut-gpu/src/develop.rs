@@ -1039,6 +1039,26 @@ impl Develop {
         self.refine.source_builds
     }
 
+    /// How many passes of Refine edges this graph has drawn. A develop slider
+    /// draws none.
+    pub fn refine_passes(&self) -> u32 {
+        self.refine.refine_passes
+    }
+
+    /// How many tiles of Refine edges this graph has drawn. A grid of cells
+    /// the scratch budget holds is one tile.
+    pub fn refine_tiles(&self) -> u32 {
+        self.refine.refine_tiles
+    }
+
+    /// The same graph with a Refine edges scratch of at most `bytes`, so a
+    /// test can draw a refine in more tiles than the default budget gives.
+    #[doc(hidden)]
+    pub fn with_refine_scratch_budget(mut self, bytes: u64) -> Self {
+        self.refine = self.refine.with_scratch_budget(bytes);
+        self
+    }
+
     /// How many passes of Shift edge, of Feather's cells and of the finished
     /// alpha this graph has drawn. A develop slider draws none of them.
     pub fn edge_passes(&self) -> EdgePasses {

@@ -1190,6 +1190,7 @@ fn develop_at_viewer_size_is_fast_enough() {
                 sensitivity: 50.0,
             };
             timed_view(&gpu, &mut develop, &one, &actual);
+            let (tiles, builds) = (develop.refine_tiles(), develop.refine_builds());
             let (held_p50, held_p95, _) =
                 stepped_view_with(&gpu, &mut develop, &one, &actual, |edit, value| {
                     edit.masks[AUTO_BRUSH].refine.sensitivity = 50.0 + 40.0 * value;
@@ -1199,8 +1200,12 @@ fn develop_at_viewer_size_is_fast_enough() {
                     let odd = ((value + 1.0) * (RENDERS - 1) as f32 / 2.0).round() as u32 % 2 == 1;
                     edit.masks[AUTO_BRUSH].refine.radius = if odd { other } else { radius };
                 });
+            // The tiles of a refine, over every refine of the two runs.
+            let refines =
+                develop.refine_builds().0 - builds.0 + develop.refine_builds().1 - builds.1;
+            let tiles_a_refine = f64::from(develop.refine_tiles() - tiles) / refines.max(1) as f64;
             println!(
-                "the refine of one mask at 100 percent, Radius {radius} (not asserted): source moments held p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; taken again p50 {taken_p50:.2} ms, p95 {taken_p95:.2} ms; so the source moments about {:.2} ms and one gather about {:.2} ms",
+                "the refine of one mask at 100 percent, Radius {radius} (not asserted): source moments held p50 {held_p50:.2} ms, p95 {held_p95:.2} ms; taken again p50 {taken_p50:.2} ms, p95 {taken_p95:.2} ms; so the source moments about {:.2} ms and one gather about {:.2} ms; refine_tiles {tiles_a_refine:.2} a refine over {refines} refines",
                 (taken_p50 - held_p50).max(0.0),
                 held_p50 / 3.0
             );

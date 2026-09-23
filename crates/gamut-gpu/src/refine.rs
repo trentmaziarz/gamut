@@ -6,10 +6,11 @@
 //! out. The moments of the filter are differences of near-equal numbers, so
 //! they live in Rgba32Float targets read with `textureLoad`. Those targets
 //! belong to the frame and not to a mask, exist only once an edit holds a
-//! refined mask, and hold one tile of the cell grid at a time, so their size
-//! is bounded whatever the render: a render larger than a tile is refined a
-//! tile after another. A default device draws into at most 32 bytes a sample,
-//! which is two of them a pass.
+//! refined mask, and hold one tile of the cell grid at a time within a budget
+//! of bytes, so their size is bounded whatever the render: a grid the budget
+//! holds is one tile, and a larger render is refined a tile after another. A
+//! default device draws into at most 32 bytes a sample, which is two of them
+//! a pass.
 //!
 //! A tile is drawn in 24 passes. Six take the moments of the source and
 //! their box means; they depend on no mask and no gather, so they are kept
@@ -31,8 +32,39 @@ pub(crate) const MOMENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba3
 /// The format of the target that holds `q` between two gathers.
 pub(crate) const MOVED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-/// The most cells a side the float targets hold, unless one box needs more.
-pub(crate) const TILE_CELLS: u32 = 768;
+/// The bytes a cell of each format costs a target.
+const MOMENT_BYTES: u64 = 16;
+const MOVED_BYTES: u64 = 4;
+
+/// How many Rgba32Float targets of cells a scratch holds of each kind: the
+/// box means of the source's moments, the far side of every box mean, and
+/// what a gather solved. The far side of the mask's box mean is one more.
+const SOURCE_TARGETS: usize = 3;
+const FAR_TARGETS: usize = 3;
+const SOLVED_TARGETS: usize = 4;
+
+/// The most bytes the scratch of a frame takes, the targets of cells and `q`
+/// together, unless one box needs more.
+pub(crate) const SCRATCH_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
+
+/// The bytes one cell of a tile costs the scratch, at `step` pixels a cell.
+/// Counted are the eleven Rgba32Float targets of cells, 16 bytes a cell each:
+/// the three `s` (the box means of the source's moments), the three `f` (the
+/// far side of every box mean), `g` (the far side of the box mean of the
+/// mask's moments) and the four `v` (what a gather solved). Then the R32Float
+/// target `q` (the moved alpha between two gathers), which holds the `step`
+/// by `step` pixels of a cell at 4 bytes each. The refined alpha belongs to
+/// its mask and is not counted. At a step of 4 a cell costs 240 bytes.
+pub(crate) fn bytes_a_cell(step: u32) -> u64 {
+    let moments = (SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64;
+    moments * MOMENT_BYTES + u64::from(step * step) * MOVED_BYTES
+}
+
+/// The most cells a side a square tile of `step` pixels a cell holds within
+/// `budget` bytes.
+pub(crate) fn budget_side(budget: u64, step: u32) -> u32 {
+    u32::try_from((budget / bytes_a_cell(step)).isqrt()).unwrap_or(u32::MAX)
+}
 
 /// A rectangle of pixels or of cells: x, y, width, height.
 pub(crate) type Rect = (u32, u32, u32, u32);
@@ -122,11 +154,15 @@ impl Tile {
     }
 }
 
-/// The most cells a side a tile of this plan may hold: [`TILE_CELLS`], or
+/// The most cells a side a tile of this plan may hold: as many as a square
+/// of `budget` bytes holds and no more than the larger side of the grid, or
 /// what the boxes of the gathers and a few pixels around them need when that
 /// is more.
-pub(crate) fn tile_side(plan: &Plan) -> u32 {
-    TILE_CELLS.max(plan.margin() * 2 + 64)
+pub(crate) fn tile_side(plan: &Plan, budget: u64) -> u32 {
+    let (_, grid) = plan.grid();
+    budget_side(budget, plan.step)
+        .min(grid.0.max(grid.1))
+        .max(plan.margin() * 2 + 64)
 }
 
 /// The cells one axis of a span of pixels of the render needs: the cells its
@@ -222,14 +258,14 @@ struct Held {
 /// The float targets of a frame, eleven of cells and one of pixels.
 pub(crate) struct Scratch {
     /// The box means of the source's moments: (I, rr), (rg, rb, gg, gb), (bb).
-    s: [FloatTarget; 3],
+    s: [FloatTarget; SOURCE_TARGETS],
     /// The far side of every box mean. While a mask is gathered `f[0]` holds
     /// the means of (q, q I) and `f[2]` those of (p, p p).
-    f: [FloatTarget; 3],
+    f: [FloatTarget; FAR_TARGETS],
     /// The far side of the box mean of (p, p p).
     g: FloatTarget,
     /// What a gather solved: 15 numbers a cell.
-    v: [FloatTarget; 4],
+    v: [FloatTarget; SOLVED_TARGETS],
     /// `q` between two gathers, at the pixels of the cells.
     q: FloatTarget,
     /// The cells a side the targets of cells hold, and the pixels `q` holds.
@@ -300,6 +336,12 @@ pub(crate) struct RefinePass {
     scratches: u64,
     /// How many times the moments of the source were taken, in tiles.
     pub(crate) source_builds: u64,
+    /// The most bytes the scratch takes: [`SCRATCH_BUDGET_BYTES`], unless a
+    /// test sets less to draw a render in more tiles.
+    scratch_budget: u64,
+    /// How many passes and how many tiles this pass family has drawn.
+    pub(crate) refine_passes: u32,
+    pub(crate) refine_tiles: u32,
 }
 
 const SHADER: &str = include_str!("shaders/refine.wgsl");
@@ -402,6 +444,19 @@ impl RefinePass {
             stride: (size as u32).div_ceil(alignment) * alignment,
             scratches: 0,
             source_builds: 0,
+            scratch_budget: SCRATCH_BUDGET_BYTES,
+            refine_passes: 0,
+            refine_tiles: 0,
+        }
+    }
+
+    /// The same pass family with a scratch of at most `bytes`, so a test can
+    /// draw a render in more tiles than the default budget gives.
+    #[doc(hidden)]
+    pub fn with_scratch_budget(self, bytes: u64) -> Self {
+        RefinePass {
+            scratch_budget: bytes,
+            ..self
         }
     }
 
@@ -448,7 +503,7 @@ impl RefinePass {
         over: Rect,
     ) -> u32 {
         let (_, grid) = plan.grid();
-        let side = tile_side(plan);
+        let side = tile_side(plan, self.scratch_budget);
         let wanted = (grid.0.min(side), grid.1.min(side));
         let wanted_q = (
             (wanted.0 * plan.step).min(plan.size.0),
@@ -471,10 +526,10 @@ impl RefinePass {
                 view: target(device, label, MOMENT_FORMAT, size.0, size.1).view,
             };
             *scratch = Some(Scratch {
-                s: [0; 3].map(|_| float("refine source means")),
-                f: [0; 3].map(|_| float("refine means")),
+                s: [0; SOURCE_TARGETS].map(|_| float("refine source means")),
+                f: [0; FAR_TARGETS].map(|_| float("refine means")),
                 g: float("refine mask means"),
-                v: [0; 4].map(|_| float("refine solved")),
+                v: [0; SOLVED_TARGETS].map(|_| float("refine solved")),
                 q: FloatTarget {
                     view: target(device, "refine moved", MOVED_FORMAT, q_size.0, q_size.1).view,
                 },
@@ -565,6 +620,7 @@ impl RefinePass {
             ));
         }
         let (_, binds) = refined.binds.as_ref().expect("made above");
+        let mut drawn = 0u32;
         for (slot, tile) in tiles.iter().enumerate() {
             let offset = slot as u32 * self.stride;
             queue.write_buffer(
@@ -579,6 +635,7 @@ impl RefinePass {
                             targets: &[&wgpu::TextureView],
                             area: Rect| {
                 draw(encoder, label, pipeline, bind, offset, targets, area);
+                drawn += 1;
             };
             fn pair<'a>(a: &'a FloatTarget, b: &'a FloatTarget) -> [&'a wgpu::TextureView; 2] {
                 [&a.view, &b.view]
@@ -726,6 +783,8 @@ impl RefinePass {
                 }
             }
         }
+        self.refine_passes = self.refine_passes.wrapping_add(drawn);
+        self.refine_tiles = self.refine_tiles.wrapping_add(tiles.len() as u32);
         tiles.len() as u32
     }
 }
@@ -905,18 +964,37 @@ mod tests {
         assert_eq!(twin::SOLVED.div_ceil(4), 4);
         assert_eq!(MOMENT_FORMAT.target_pixel_byte_cost(), Some(16));
         assert_eq!(MOVED_FORMAT.target_pixel_byte_cost(), Some(4));
+        assert_eq!(MOMENT_BYTES, 16);
+        assert_eq!(MOVED_BYTES, 4);
+        assert_eq!(SOURCE_TARGETS, twin::SOURCE_MOMENTS.div_ceil(4));
+        assert_eq!(SOLVED_TARGETS, twin::SOLVED.div_ceil(4));
+        assert_eq!(FAR_TARGETS, 3);
     }
 
     #[test]
     fn a_render_that_fits_is_one_tile_of_its_whole_grid() {
         let plan = plan(0.01, (1280, 1600), (0, 0), (1280, 1600));
         assert_eq!((plan.step, plan.cells), (2, 6), "16 pixels");
-        let tiles = tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan));
-        // The grid is 640 by 800 cells: more than one tile holds.
+        // The grid is 640 by 800 cells: one tile of the budget holds it, and
+        // more than one of a budget of 512 cells a side.
+        let tiles = tiles(
+            &plan,
+            (0, 0, 1280, 1600),
+            tile_side(&plan, SCRATCH_BUDGET_BYTES),
+        );
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].count, (640, 800));
+        let small = 512 * 512 * bytes_a_cell(plan.step);
+        assert_eq!(tile_side(&plan, small), 512);
+        let tiles = self::tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan, small));
         assert!(tiles.len() > 1);
         let plan = self::plan(0.05, (1280, 1600), (0, 0), (1280, 1600));
         assert_eq!((plan.step, plan.cells), (4, 14), "80 pixels");
-        let tiles = self::tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan));
+        let tiles = self::tiles(
+            &plan,
+            (0, 0, 1280, 1600),
+            tile_side(&plan, SCRATCH_BUDGET_BYTES),
+        );
         assert_eq!(
             tiles,
             vec![Tile {
@@ -934,7 +1012,11 @@ mod tests {
         // A patch of the same render keeps the tile and works on the cells
         // it needs alone: the cells its pixels lie among, 49 to 62 across and
         // 74 to 85 down, and 44 cells of margin around them.
-        let patch = self::tiles(&plan, (200, 300, 50, 40), tile_side(&plan));
+        let patch = self::tiles(
+            &plan,
+            (200, 300, 50, 40),
+            tile_side(&plan, SCRATCH_BUDGET_BYTES),
+        );
         assert_eq!(patch.len(), 1);
         assert_eq!((patch[0].first, patch[0].count), ((0, 0), (320, 400)));
         assert_eq!(plan.margin(), 44);
@@ -946,7 +1028,11 @@ mod tests {
     fn a_window_that_begins_inside_a_cell_places_q_on_its_first_pixel() {
         let plan = plan(0.05, (6000, 4000), (1021, 513), (900, 700));
         assert_eq!(plan.step, 4);
-        let tile = tiles(&plan, (0, 0, 900, 700), tile_side(&plan))[0];
+        let tile = tiles(
+            &plan,
+            (0, 0, 900, 700),
+            tile_side(&plan, SCRATCH_BUDGET_BYTES),
+        )[0];
         // The first cell, 255, begins at pixel 1020, before the render.
         assert_eq!(tile.first, (255, 128));
         assert_eq!(tile.q_first(&plan), (0, 0));
@@ -988,8 +1074,13 @@ mod tests {
                 (600, 700, 301, 277),
             ),
         ];
-        for (plan, over) in cases {
-            let side = tile_side(&plan);
+        // The budget, and 16 MiB, which cuts every grid into more tiles.
+        let budgets = [SCRATCH_BUDGET_BYTES, 16 * 1024 * 1024];
+        for ((plan, over), budget) in cases
+            .into_iter()
+            .flat_map(|case| budgets.map(|budget| (case, budget)))
+        {
+            let side = tile_side(&plan, budget);
             let tiles = tiles(&plan, over, side);
             let (grid_first, grid_count) = plan.grid();
             let mut written = vec![0u8; (over.2 * over.3) as usize];
@@ -1047,7 +1138,10 @@ mod tests {
                 );
             }
             assert!(written.iter().all(|count| *count == 1), "{plan:?}");
-            println!("{} tiles of at most {side} cells a side", tiles.len());
+            println!(
+                "{} tiles of at most {side} cells a side at a budget of {budget} bytes",
+                tiles.len()
+            );
         }
     }
 
@@ -1057,8 +1151,80 @@ mod tests {
         // cells either side for each of the three gathers.
         let plan = plan(0.05, (40_000, 30_000), (0, 0), (40_000, 30_000));
         assert_eq!((plan.step, plan.cells), (4, 355));
-        assert!(tile_side(&plan) > TILE_CELLS);
-        let tiles = tiles(&plan, (0, 0, 4000, 3000), tile_side(&plan));
+        let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
+        assert!(side > budget_side(SCRATCH_BUDGET_BYTES, plan.step));
+        assert_eq!(side, plan.margin() * 2 + 64);
+        let tiles = tiles(&plan, (0, 0, 4000, 3000), side);
         assert!(tiles.iter().all(|tile| tile.out.2 >= 4 && tile.out.3 >= 4));
+    }
+
+    #[test]
+    fn a_cell_costs_the_scratch_its_eleven_float_targets_and_its_pixels_of_q() {
+        // 11 targets of 16 bytes, and step by step pixels of 4 bytes.
+        assert_eq!(bytes_a_cell(1), 180);
+        assert_eq!(bytes_a_cell(2), 192);
+        assert_eq!(bytes_a_cell(3), 212);
+        assert_eq!(bytes_a_cell(4), 240);
+        assert_eq!(SCRATCH_BUDGET_BYTES, 402_653_184);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 4), 1295);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 1), 1495);
+    }
+
+    /// The window of timing_24mp.jpg at 100 percent at Radius 0.05: 2624 by
+    /// 3264 pixels padded to a frame of 4032 by 4000 that begins at column
+    /// 960, 1008 by 1000 cells of 4 pixels.
+    #[test]
+    fn the_100_percent_window_at_radius_0_05_is_one_tile() {
+        let plan = plan(0.05, (6000, 4000), (960, 0), (4032, 4000));
+        assert_eq!((plan.step, plan.cells), (4, 53));
+        assert_eq!(plan.grid(), ((240, 0), (1008, 1000)));
+        let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
+        assert_eq!(side, 1008);
+        assert!(1008 * 1000 * bytes_a_cell(plan.step) <= SCRATCH_BUDGET_BYTES);
+        // The product region a Refine slider refines, and the whole frame
+        // an edge control refines.
+        for over in [(702, 382, 2628, 3268), (0, 0, 4032, 4000)] {
+            let tiles = tiles(&plan, over, side);
+            assert_eq!(tiles.len(), 1, "{over:?}");
+            assert_eq!(tiles[0].first, (240, 0));
+            assert_eq!(tiles[0].count, (1008, 1000));
+            assert_eq!(tiles[0].out, over);
+        }
+    }
+
+    /// An export of 6000 by 4000 pixels in cells of one pixel is 24 million
+    /// cells, far over the budget, and is still refined a tile after another.
+    #[test]
+    fn a_step_1_export_still_tiles() {
+        let plan = plan(0.0012, (6000, 4000), (0, 0), (6000, 4000));
+        assert_eq!((plan.step, plan.cells), (1, 5));
+        assert_eq!(plan.grid(), ((0, 0), (6000, 4000)));
+        let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
+        assert_eq!(side, 1495);
+        assert!(u64::from(side * side) * bytes_a_cell(plan.step) <= SCRATCH_BUDGET_BYTES);
+        let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
+        assert!(tiles.len() > 1);
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| tile.count.0 <= side && tile.count.1 <= side)
+        );
+        println!("a step 1 export: {} tiles of {side} cells", tiles.len());
+    }
+
+    /// The `q` target of a tile the budget holds is its side in cells times
+    /// the step in pixels, under the largest texture a device of default
+    /// limits makes, which is what the headless device asks for.
+    #[test]
+    fn the_one_tile_side_times_the_step_stays_under_the_texture_limit() {
+        let limit = wgpu::Limits::default().max_texture_dimension_2d;
+        assert_eq!(limit, 8192);
+        for step in 1..=4 {
+            let side = budget_side(SCRATCH_BUDGET_BYTES, step);
+            assert!(side * step < limit, "step {step}: {side} cells");
+        }
+        let plan = plan(0.05, (6000, 4000), (960, 0), (4032, 4000));
+        assert!(tile_side(&plan, SCRATCH_BUDGET_BYTES) * plan.step < limit);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 4) * 4, 5180);
     }
 }

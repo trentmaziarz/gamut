@@ -2780,16 +2780,25 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     let mut develop = Develop::new(&gpu.device, &gpu.queue);
     develop.set_source(&photo);
     // The alphas drawn, the refined alphas drawn, and how many times the
-    // moments of the source were taken.
+    // moments of the source were taken. A refine of the 64 pixel photo is
+    // one tile: 18 passes, and 6 more when it takes the moments of the
+    // source.
     let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
             .expect("a source is set");
-        (
-            develop.mask_alpha_builds(),
-            develop.refine_builds().0,
-            develop.refine_source_builds(),
-        )
+        let (refines, sources) = (develop.refine_builds().0, develop.refine_source_builds());
+        assert_eq!(
+            u64::from(develop.refine_tiles()),
+            refines,
+            "one tile a refine"
+        );
+        assert_eq!(
+            u64::from(develop.refine_passes()),
+            18 * refines + 6 * sources,
+            "18 passes a refine and 6 a source"
+        );
+        (develop.mask_alpha_builds(), refines, sources)
     };
     let mut edit = masked(vec![
         refined(exposure_mask("Radial", radial_over_the_band())),
@@ -2806,6 +2815,7 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         "the same edit again"
     );
 
+    let (passes, tiles) = (develop.refine_passes(), develop.refine_tiles());
     edit.exposure = 0.7;
     edit.masks[0].adjust.exposure = -0.5;
     edit.masks[0].adjust.look.curves.master = s_curve();
@@ -2814,6 +2824,11 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         builds_after(&mut develop, &edit),
         (2, 1, 1),
         "sliders of the develop chain, global and of the mask"
+    );
+    assert_eq!(
+        (develop.refine_passes(), develop.refine_tiles()),
+        (passes, tiles),
+        "a develop slider draws no refine pass"
     );
 
     edit.masks[0].refine.amount = 60.0;
@@ -2864,6 +2879,11 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         "a new source content draws all three"
     );
     assert_eq!(develop.refine_builds().1, 0, "never a part");
+    assert_eq!(
+        (develop.refine_passes(), develop.refine_tiles()),
+        (7 * 18 + 3 * 6, 7),
+        "seven refines of one tile, three of them with the moments of the source"
+    );
 }
 
 /// A photo with hard edges, large enough that a zoomed window is a real part
@@ -2938,6 +2958,103 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
             &photo,
             &edit,
         );
+    }
+}
+
+/// A scratch budget too small for the grid of cells cuts a refine into tiles,
+/// and the tiles draw byte for byte what one tile draws. On the 1101 by 90
+/// photo of the test above, the grid is 551 by 45 cells of two pixels at a
+/// radius of 0.015 and 276 by 23 cells of four at 0.03, each with a margin of
+/// 20 cells. A tile of 203 cells a side writes 320 pixels a row, and one of
+/// 127 writes 336, so each cuts the 1101 pixels into 4 tiles; the default
+/// budget holds either grid in one. A cell costs the scratch 192 bytes at a
+/// step of 2 and 240 at a step of 4. A stroke along the whole photo, with a
+/// hard rim over the row edge at 60, crosses every cut between the tiles.
+#[test]
+fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = blocky_photo(1101, 90);
+    let size = (photo.width, photo.height);
+    let readback = Readback::new(&gpu.device);
+    for (radius, step, side, cell_bytes) in [(0.015, 2, 203u64, 192u64), (0.03, 4, 127, 240)] {
+        let plan = Plan::for_geometry(
+            &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
+            &Geometry::full(size, size),
+        );
+        assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 20));
+        let budget = side * side * cell_bytes;
+        // A stroke across the photo, its centre on row 52 and its hard rim
+        // 5 pixels over the row edge at 60, refined alone; then with the
+        // radial gradient and the stroke down the photo of the test above,
+        // all three refined.
+        let band = brush_source(&[stroke(&[[0.02, 0.578], [0.98, 0.578]], 0.012, 20.0, 100.0)]);
+        let radial = MaskSource::Radial(RadialGradient {
+            centre: [0.4995, 0.5],
+            radius: [0.0309, 0.05],
+            rotation: 0.0,
+            feather: 15.0,
+        });
+        let brush = brush_source(&[stroke(&[[0.2543, 0.1], [0.2543, 0.9]], 0.012, 20.0, 100.0)]);
+        let one = masked(vec![refined_at(
+            exposure_mask("Band", band.clone()),
+            100.0,
+            radius,
+            60.0,
+        )]);
+        let three = masked(vec![
+            refined_at(exposure_mask("Band", band), 100.0, radius, 60.0),
+            refined_at(exposure_mask("Radial", radial), 100.0, radius, 50.0),
+            refined_at(exposure_mask("Brush", brush), 100.0, radius, 60.0),
+        ]);
+        for (edit, refined_masks) in [(one, 1u32), (three, 3)] {
+            let name = format!(
+                "{refined_masks} refined masks on the 1101 pixel photo, cells of {step}, in tiles of {side} cells"
+            );
+            let moved = assert_the_refine_shows(&photo, &edit);
+            // A graph of its own for each budget, so its counters read the
+            // tiles of this render alone.
+            let render = |budget: Option<u64>| -> (Vec<u8>, u32) {
+                let develop = Develop::new(&gpu.device, &gpu.queue);
+                let mut develop = match budget {
+                    Some(bytes) => develop.with_refine_scratch_budget(bytes),
+                    None => develop,
+                };
+                develop.set_source(&photo);
+                let view = develop
+                    .render(&edit, CropRect::FULL, size, size)
+                    .expect("a source is set");
+                let pixels = readback.read(&gpu.device, &gpu.queue, view, size.0, size.1);
+                (pixels, develop.refine_tiles())
+            };
+            let (tiled, tiles) = render(Some(budget));
+            let (whole, one_tile) = render(None);
+            println!("{name}: refine_tiles {tiles} then {one_tile}; the twin moves {moved} pixels");
+            assert_eq!(
+                (tiles, one_tile),
+                (4 * refined_masks, refined_masks),
+                "{name}: 4 tiles a mask at {budget} bytes, then 1"
+            );
+            let differing = tiled.iter().zip(&whole).filter(|(a, b)| a != b).count();
+            assert_eq!(tiled.len(), whole.len());
+            assert_eq!(
+                differing, 0,
+                "{name}: {differing} bytes of the tiles differ from one tile"
+            );
+            let pixels: Vec<[u8; 3]> = tiled
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| [px[0], px[1], px[2]])
+                .collect();
+            assert_matches_the_twin(&name, &photo, &edit, &pixels);
+        }
     }
 }
 
