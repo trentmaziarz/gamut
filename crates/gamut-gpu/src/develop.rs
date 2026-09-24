@@ -1031,12 +1031,20 @@ impl Develop {
         (self.refine_builds, self.refine_patches)
     }
 
-    /// How many times Refine edges took the moments of the source, in tiles.
-    /// They are kept while the source, the radius and the tile stay the
-    /// same: a Refine slider, a new stroke and another mask of the same
-    /// radius take none.
+    /// How many times Refine edges took the moments of the source over the
+    /// whole work of a tile, in tiles. They are kept while the source, the
+    /// side of a cell, the grid and the tile stay the same: a Refine slider,
+    /// a new stroke, another mask and a Radius step that keeps the side of a
+    /// cell take none.
     pub fn refine_source_builds(&self) -> u64 {
         self.refine.source_builds
+    }
+
+    /// How many strips Refine edges took the moments of the source over: the
+    /// cells a refine works over that the moments held do not cover, at most
+    /// four rectangles a tile.
+    pub fn refine_source_strips(&self) -> u64 {
+        self.refine.source_strips
     }
 
     /// How many passes of Refine edges this graph has drawn. A develop slider

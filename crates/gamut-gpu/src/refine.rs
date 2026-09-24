@@ -16,33 +16,40 @@
 //! A tile is drawn in 18 passes. Five take the moments of the source, in one
 //! pass of three targets, and their box means; they depend on no mask and no
 //! gather, so they are kept while the source, the radius and the tile stay
-//! the same, and a tile then costs 13. They are taken over the cells the
-//! gathers work over, joined with the cells already held, so a refine over
-//! cells they cover draws none, and a refine of a small mask on a large grid
-//! draws few. Each of the three gathers takes four: the moments of `q` over
-//! the cells, their box means across and down, and the solve in one pass of
-//! four targets. The two later gathers take `q` at each pixel as they sum
-//! it, the mask moved by what the gather before solved, so `q` is never
-//! stored between gathers. The apply after the last gather moves the mask at
-//! full resolution into the r8unorm refined alpha.
+//! the same, and a tile then costs 13. The moments themselves depend on the
+//! side of a cell and the grid alone, never on the radius of the box, and
+//! keep targets of their own: a Radius step that keeps the side of a cell
+//! draws the four box means of the source over them and not the moments, 17
+//! passes. The moments are taken over the cells the gathers work over,
+//! joined with the cells already held: a refine over cells they cover takes
+//! none, and a refine over cells they partly cover takes them over the strips
+//! it adds, at most four rectangles. Each of the three gathers takes four:
+//! the moments of `q` over the cells, their box means across and down, and
+//! the solve in one pass of four targets. The two later gathers take `q` at
+//! each pixel as they sum it, the mask moved by what the gather before
+//! solved, so `q` is never stored between gathers. The apply after the last
+//! gather moves the mask at full resolution into the r8unorm refined alpha.
 //!
 //! A device that draws into no more than 32 bytes a sample, such as one made
 //! with wgpu's default limits, draws the moments of the source in a pass of
 //! two targets and a pass of one, and the solve in two passes of two: the
 //! source takes six, a gather five, and a tile 22, or 16 with the moments of
-//! the source held. The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both
-//! offer 128 bytes, so both draw the fused source and the fused solve.
+//! the source held and 20 on a Radius step that keeps the side of a cell.
+//! The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both offer 128 bytes, so
+//! both draw the fused source and the fused solve.
 //!
 //! A box of [`BLOCK_TAPS`] cells or more (a radius of 12 cells or more)
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 28 passes, and 19 with the moments of the source held
-//! (32 and 22 with the source and the solve drawn in two passes each). A box
-//! keeps its cells, each held at the edges as before; only the order of the
-//! sum changes. A smaller box sums every cell in the direct loop, which
-//! measured no slower (see [`BLOCK_TAPS`]): a block pass is a pass of its
-//! own, and a box of few cells does not win it back.
+//! ten block passes: 28 passes, 19 with the moments of the source held, and
+//! 27 on a Radius step that keeps the side of a cell, whose four box means of
+//! the source each draw their block pass (32, 22 and 30 with the source and
+//! the solve drawn in two passes each). A box keeps its cells, each held at
+//! the edges as before; only the order of the sum changes. A smaller box
+//! sums every cell in the direct loop, which measured no slower (see
+//! [`BLOCK_TAPS`]): a block pass is a pass of its own, and a box of few cells
+//! does not win it back.
 
 use bytemuck::{Pod, Zeroable};
 use gamut_color::refine::{GATHERS, Plan};
@@ -56,8 +63,9 @@ pub(crate) const MOMENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba3
 const MOMENT_BYTES: u64 = 16;
 
 /// How many Rgba32Float targets of cells a scratch holds of each kind: the
-/// box means of the source's moments, the far side of every box mean, and
-/// what a gather solved. The far side of the mask's box mean is one more.
+/// source's moments, and apart from them their box means, the far side of
+/// every box mean, and what a gather solved. The far side of the mask's box
+/// mean is one more.
 const SOURCE_TARGETS: usize = 3;
 const FAR_TARGETS: usize = 3;
 const SOLVED_TARGETS: usize = 4;
@@ -93,16 +101,17 @@ pub(crate) fn box_blocks(cells: u32) -> u32 {
 }
 
 /// The bytes one cell of a tile costs the scratch, at every step. Counted
-/// are the eleven Rgba32Float targets of cells, 16 bytes a cell each: the
-/// three `s` (the box means of the source's moments), the three `f` (the far
-/// side of every box mean), `g` (the far side of the box mean of the mask's
-/// moments) and the four `v` (what a gather solved), 176 bytes. `q` is never
-/// stored, and the refined alpha belongs to its mask and is not counted. The
-/// block passes before the boxes add no target: they write `v[0]` and
-/// `v[1]`, which no pass reads between the moments of a gather and its
-/// solve, and every box lies between the two (see [`RefinePass::run`]).
+/// are the fourteen Rgba32Float targets of cells, 16 bytes a cell each: the
+/// three `r` (the source's moments), the three `s` (their box means), the
+/// three `f` (the far side of every box mean), `g` (the far side of the box
+/// mean of the mask's moments) and the four `v` (what a gather solved), 224
+/// bytes. `q` is never stored, and the refined alpha belongs to its mask and
+/// is not counted. The block passes before the boxes add no target: they
+/// write `v[0]` and `v[1]`, which no pass reads before the first gather or
+/// between the moments of a gather and its solve, and every box lies there
+/// (see [`RefinePass::run`]).
 pub(crate) const CELL_BYTES: u64 =
-    (SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64 * MOMENT_BYTES;
+    (2 * SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64 * MOMENT_BYTES;
 
 /// The most cells a side a square tile holds within `budget` bytes.
 pub(crate) fn budget_side(budget: u64) -> u32 {
@@ -280,39 +289,62 @@ struct FloatTarget {
     view: wgpu::TextureView,
 }
 
-/// The moments of the source the targets `s` hold: the plan they were taken
-/// with, but for eps and the amount, the tile, and the cells of the tile
-/// they were taken over.
+/// The moments of the source the targets `r` hold and their box means the
+/// targets `s` hold: the plan they were taken with, but for eps and the
+/// amount, the tile, the cells of the tile the moments were taken over, and
+/// the radius of the box and the cells of the box means.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Held {
     full: (u32, u32),
     origin: (u32, u32),
     size: (u32, u32),
     step: u32,
+    /// The radius in cells of the box of the means `s` holds.
     cells: u32,
     first: (u32, u32),
     count: (u32, u32),
+    /// The cells `r` holds the moments of.
     area: Rect,
+    /// The cells `s` holds the box means of.
+    boxed: Rect,
 }
 
 impl Held {
     /// Whether these moments were taken with the plan and the tile of
-    /// `other`, over whichever cells.
+    /// `other`, over whichever cells. The moments of a cell depend on the
+    /// side of a cell and the grid, never on the radius of the box, so the
+    /// radius is not compared.
     fn takes_as(&self, other: &Held) -> bool {
         Held {
+            cells: other.cells,
             area: other.area,
+            boxed: other.boxed,
             ..*self
         } == *other
     }
 
-    /// Whether they were taken over every cell of `area`. The box means
-    /// near the edge of the cells taken read cells not taken, as the box
-    /// means of a gather near the edge of its work do, and the margin of
+    /// Whether the moments were taken over every cell of `area`. The box
+    /// means near the edge of the cells taken read cells not taken, as the
+    /// box means of a gather near the edge of its work do, and the margin of
     /// the work keeps both from the pixels a tile writes.
     fn covers(&self, area: Rect) -> bool {
-        let (x, y, width, height) = self.area;
-        area.0 >= x && area.1 >= y && area.0 + area.2 <= x + width && area.1 + area.3 <= y + height
+        holds(self.area, area)
     }
+
+    /// Whether the box means were taken with a box of `cells` over every
+    /// cell of `area`.
+    fn boxes(&self, cells: u32, area: Rect) -> bool {
+        self.cells == cells && holds(self.boxed, area)
+    }
+}
+
+/// Whether `outer` holds every cell of `inner`.
+fn holds(outer: Rect, inner: Rect) -> bool {
+    let (x, y, width, height) = outer;
+    inner.0 >= x
+        && inner.1 >= y
+        && inner.0 + inner.2 <= x + width
+        && inner.1 + inner.3 <= y + height
 }
 
 /// The smallest rectangle that holds both.
@@ -323,9 +355,29 @@ fn join(a: Rect, b: Rect) -> Rect {
     (x, y, right - x, bottom - y)
 }
 
-/// The float targets of a frame, eleven of cells.
+/// The cells of `outer` outside `inner`, which it holds, as at most four
+/// rectangles that do not overlap: the rows above and below `inner` the
+/// width of `outer`, then the columns either side of `inner` its height.
+fn strips(outer: Rect, inner: Rect) -> Vec<Rect> {
+    let (x, y, width, height) = outer;
+    let (right, bottom) = (x + width, y + height);
+    let (inner_right, inner_bottom) = (inner.0 + inner.2, inner.1 + inner.3);
+    [
+        (x, y, width, inner.1 - y),
+        (x, inner_bottom, width, bottom - inner_bottom),
+        (x, inner.1, inner.0 - x, inner.3),
+        (inner_right, inner.1, right - inner_right, inner.3),
+    ]
+    .into_iter()
+    .filter(|strip| strip.2 > 0 && strip.3 > 0)
+    .collect()
+}
+
+/// The float targets of a frame, fourteen of cells.
 pub(crate) struct Scratch {
-    /// The box means of the source's moments: (I, rr), (rg, rb, gg, gb), (bb).
+    /// The source's moments: (I, rr), (rg, rb, gg, gb), (bb).
+    r: [FloatTarget; SOURCE_TARGETS],
+    /// Their box means, in the same layout.
     s: [FloatTarget; SOURCE_TARGETS],
     /// The far side of every box mean. While a mask is gathered `f[0]` holds
     /// the means of (q, q I) and `f[2]` those of (p, p p).
@@ -368,7 +420,7 @@ struct Binds {
     /// f1, g: the passes over the pixels of a cell, which read no target of
     /// cells, and the box down of a gather.
     cells: wgpu::BindGroup,
-    /// s0, s1 and s2: the box across of the source's moments.
+    /// r0, r1 and r2: the box across of the source's moments.
     source_pair: wgpu::BindGroup,
     source_one: wgpu::BindGroup,
     /// f0, f1 and f2: the box down of the source's moments.
@@ -459,8 +511,12 @@ pub(crate) struct RefinePass {
     /// The distance between two tiles in the uniform buffer.
     stride: u32,
     scratches: u64,
-    /// How many times the moments of the source were taken, in tiles.
+    /// How many times the moments of the source were taken over the whole
+    /// work of a tile, in tiles.
     pub(crate) source_builds: u64,
+    /// How many strips the moments of the source were taken over, where a
+    /// tile works over cells the moments held partly cover.
+    pub(crate) source_strips: u64,
     /// The most bytes the scratch takes: [`SCRATCH_BUDGET_BYTES`], unless a
     /// test sets less to draw a render in more tiles.
     scratch_budget: u64,
@@ -585,6 +641,7 @@ impl RefinePass {
             stride: (size as u32).div_ceil(alignment) * alignment,
             scratches: 0,
             source_builds: 0,
+            source_strips: 0,
             scratch_budget: SCRATCH_BUDGET_BYTES,
             refine_passes: 0,
             refine_tiles: 0,
@@ -676,6 +733,7 @@ impl RefinePass {
                 view: target(device, label, MOMENT_FORMAT, size.0, size.1).view,
             };
             *scratch = Some(Scratch {
+                r: [0; SOURCE_TARGETS].map(|_| float("refine source moments")),
                 s: [0; SOURCE_TARGETS].map(|_| float("refine source means")),
                 f: [0; FAR_TARGETS].map(|_| float("refine means")),
                 g: float("refine mask means"),
@@ -730,13 +788,13 @@ impl RefinePass {
                     ],
                 })
             };
-            let (s, f, g, v) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v);
+            let (r, s, f, g, v) = (&scratch.r, &scratch.s, &scratch.f, &scratch.g, &scratch.v);
             refined.binds = Some((
                 scratch.id,
                 Binds {
                     cells: group("refine cells", [&f[1], g, &v[0], &v[1], &v[2]]),
-                    source_pair: group("refine source pair", [&s[0], &s[1], &v[0], &v[1], &v[2]]),
-                    source_one: group("refine source one", [&s[2], &v[2], &v[0], &v[1], &v[3]]),
+                    source_pair: group("refine source pair", [&r[0], &r[1], &v[0], &v[1], &v[2]]),
+                    source_one: group("refine source one", [&r[2], &v[2], &v[0], &v[1], &v[3]]),
                     far_pair: group("refine far pair", [&f[0], &f[1], &v[0], &v[1], &v[2]]),
                     far_one: group("refine far one", [&f[2], &v[2], &v[0], &v[1], &v[3]]),
                     gather_across: group(
@@ -748,11 +806,11 @@ impl RefinePass {
                     block_cells: group("refine block cells", [&f[1], g, &v[2], &v[3], &s[2]]),
                     block_source_pair: group(
                         "refine block source pair",
-                        [&s[0], &s[1], &v[2], &v[3], g],
+                        [&r[0], &r[1], &v[2], &v[3], g],
                     ),
                     block_source_one: group(
                         "refine block source one",
-                        [&s[2], g, &v[2], &v[3], &f[0]],
+                        [&r[2], g, &v[2], &v[3], &f[0]],
                     ),
                     block_far_pair: group("refine block far pair", [&f[0], &f[1], &v[2], &v[3], g]),
                     block_far_one: group("refine block far one", [&f[2], g, &v[2], &v[3], &f[0]]),
@@ -783,7 +841,7 @@ impl RefinePass {
                 u64::from(offset),
                 bytemuck::bytes_of(&uniform),
             );
-            let (s, f, g, v) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v);
+            let (f, g, v) = (&scratch.f, &scratch.g, &scratch.v);
             // A box pass of blocks has its block pass first, into v0 (and v1
             // for a pair). Both are free at every box: the solve writes them
             // after the last box of a gather, and the moments of the next
@@ -814,9 +872,14 @@ impl RefinePass {
             fn pair<'a>(a: &'a FloatTarget, b: &'a FloatTarget) -> [&'a wgpu::TextureView; 2] {
                 [&a.view, &b.view]
             }
+            let work = tile.work;
             // The moments of the source over the cells the gathers work
-            // over, unless the targets hold them there already; joined with
-            // the cells held when those were taken with this plan and tile.
+            // over, unless the targets hold them there already: over the
+            // whole work when none are held of this plan's grid and tile,
+            // and otherwise over the strips the work adds to the cells held.
+            // The moments do not depend on the radius of the box; their box
+            // means are taken again over the work unless the targets hold
+            // them there with this radius.
             let held = Held {
                 full: plan.full,
                 origin: plan.origin,
@@ -825,48 +888,67 @@ impl RefinePass {
                 cells: plan.cells,
                 first: tile.first,
                 count: tile.count,
-                area: tile.work,
+                area: work,
+                boxed: work,
             };
-            let take = match scratch.held {
-                Some(had) if had.takes_as(&held) && had.covers(tile.work) => None,
-                Some(had) if had.takes_as(&held) => Some(join(had.area, tile.work)),
-                _ => Some(tile.work),
+            let had = scratch.held.filter(|had| had.takes_as(&held));
+            let (moments, whole) = match had {
+                Some(had) if had.covers(work) => (Vec::new(), false),
+                Some(had) => (strips(join(had.area, work), had.area), false),
+                None => (vec![work], true),
             };
-            if let Some(all) = take {
-                let cells = &binds.cells;
+            let (r, s) = (&scratch.r, &scratch.s);
+            let cells = &binds.cells;
+            for &over in &moments {
+                let label = |whole_label: &'static str, strip_label: &'static str| {
+                    if whole { whole_label } else { strip_label }
+                };
                 if let Some(source) = &self.source {
                     pass(
-                        "refine source",
+                        label("refine source", "refine source strip"),
                         source,
                         cells,
-                        &[&s[0].view, &s[1].view, &s[2].view],
-                        all,
+                        &[&r[0].view, &r[1].view, &r[2].view],
+                        over,
                         None,
                     );
                 } else {
                     pass(
-                        "refine source a",
+                        label("refine source a", "refine source a strip"),
                         self.source_a.as_ref().expect("made without a fused source"),
                         cells,
-                        &pair(&s[0], &s[1]),
-                        all,
+                        &pair(&r[0], &r[1]),
+                        over,
                         None,
                     );
                     pass(
-                        "refine source b",
+                        label("refine source b", "refine source b strip"),
                         self.source_b.as_ref().expect("made without a fused source"),
                         cells,
-                        &[&s[2].view],
-                        all,
+                        &[&r[2].view],
+                        over,
                         None,
                     );
                 }
+            }
+            if whole {
+                self.source_builds += 1;
+            } else {
+                self.source_strips += moments.len() as u64;
+            }
+            let area = had.map_or(work, |had| join(had.area, work));
+            let boxed = had.filter(|had| had.boxes(plan.cells, work));
+            scratch.held = Some(match boxed {
+                Some(had) => Held { area, ..had },
+                None => Held { area, ..held },
+            });
+            if boxed.is_none() {
                 pass(
                     "refine source h a",
                     &self.box_h2,
                     &binds.source_pair,
                     &pair(&f[0], &f[1]),
-                    all,
+                    work,
                     Block::across(
                         "refine source h a block",
                         &self.block_h2,
@@ -878,7 +960,7 @@ impl RefinePass {
                     &self.box_h1,
                     &binds.source_one,
                     &[&f[2].view],
-                    all,
+                    work,
                     Block::across(
                         "refine source h b block",
                         &self.block_h1,
@@ -890,7 +972,7 @@ impl RefinePass {
                     &self.box_v2,
                     &binds.far_pair,
                     &pair(&s[0], &s[1]),
-                    all,
+                    work,
                     Block::down(
                         "refine source v a block",
                         &self.block_v2,
@@ -902,17 +984,14 @@ impl RefinePass {
                     &self.box_v1,
                     &binds.far_one,
                     &[&s[2].view],
-                    all,
+                    work,
                     Block::down(
                         "refine source v b block",
                         &self.block_v1,
                         &binds.block_far_one,
                     ),
                 );
-                scratch.held = Some(Held { area: all, ..held });
-                self.source_builds += 1;
             }
-            let work = tile.work;
             for gather in 0..GATHERS {
                 if gather == 0 {
                     // With the moments of the mask itself, which the solve
@@ -1097,8 +1176,10 @@ mod tests {
     use super::*;
 
     /// Moments of the source serve a later refine over cells they were
-    /// taken over, with the same plan and tile; a refine over other cells
-    /// takes them over both.
+    /// taken over, with the same grid, side of a cell and tile, whatever the
+    /// radius of the box; a refine over other cells takes them over the
+    /// strips it adds. Their box means serve a refine with the same radius
+    /// over cells they were taken over.
     #[test]
     fn the_held_moments_serve_the_cells_they_were_taken_over() {
         let held = Held {
@@ -1110,6 +1191,7 @@ mod tests {
             first: (240, 0),
             count: (1008, 1000),
             area: (100, 50, 600, 700),
+            boxed: (110, 60, 580, 680),
         };
         assert!(held.covers((100, 50, 600, 700)));
         assert!(held.covers((150, 60, 20, 30)));
@@ -1119,16 +1201,64 @@ mod tests {
             area: (0, 0, 1008, 1000),
             ..held
         }));
-        assert!(!held.takes_as(&Held { cells: 52, ..held }));
+        // A Radius step that keeps the side of a cell keeps the moments.
+        let fewer = Held { cells: 52, ..held };
+        assert!(fewer.takes_as(&held));
+        assert!(held.takes_as(&fewer));
+        assert!(held.takes_as(&Held {
+            boxed: (0, 0, 1, 1),
+            ..held
+        }));
+        // A step, a grid or a tile of another size does not.
+        assert!(!held.takes_as(&Held { step: 3, ..held }));
+        assert!(!fewer.takes_as(&Held { step: 3, ..held }));
+        assert!(!held.takes_as(&Held {
+            size: (4036, 4000),
+            ..held
+        }));
         assert!(!held.takes_as(&Held {
             first: (0, 0),
             ..held
         }));
+        // The box means serve their radius over the cells they were taken
+        // over.
+        assert!(held.boxes(53, (110, 60, 580, 680)));
+        assert!(held.boxes(53, (200, 100, 10, 10)));
+        assert!(!held.boxes(52, (200, 100, 10, 10)));
+        assert!(!held.boxes(53, (100, 50, 600, 700)));
         assert_eq!(
             join((100, 50, 600, 700), (650, 700, 51, 10)),
             (100, 50, 601, 700)
         );
         assert_eq!(join((10, 20, 5, 5), (0, 0, 3, 3)), (0, 0, 15, 25));
+    }
+
+    /// The strips of a rectangle outside one it holds cover every cell of
+    /// it outside that one exactly once, in at most four rectangles.
+    #[test]
+    fn the_strips_cover_what_the_join_adds_once() {
+        let cases = [
+            // Grown by 3 cells on every side.
+            ((97, 47, 606, 706), (100, 50, 600, 700), 4),
+            // Grown to the right alone.
+            ((100, 50, 601, 700), (100, 50, 600, 700), 1),
+            // Grown up and to the left.
+            ((90, 40, 610, 710), (100, 50, 600, 700), 2),
+            // The same.
+            ((100, 50, 600, 700), (100, 50, 600, 700), 0),
+        ];
+        for (outer, inner, count) in cases {
+            let strips = strips(outer, inner);
+            assert_eq!(strips.len(), count, "{outer:?} {inner:?}");
+            for y in outer.1..outer.1 + outer.3 {
+                for x in outer.0..outer.0 + outer.2 {
+                    let cell = (x, y, 1, 1);
+                    let times = strips.iter().filter(|s| holds(**s, cell)).count();
+                    let wanted = usize::from(!holds(inner, cell));
+                    assert_eq!(times, wanted, "{outer:?} {inner:?} at {x}, {y}");
+                }
+            }
+        }
     }
     use gamut_color::acescct;
     use gamut_color::refine as twin;
@@ -1474,11 +1604,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_costs_the_scratch_its_eleven_float_targets() {
-        // 11 targets of 16 bytes, at every step: `q` is never stored.
-        assert_eq!(CELL_BYTES, 176);
+    fn a_cell_costs_the_scratch_its_fourteen_float_targets() {
+        // 14 targets of 16 bytes, at every step: `q` is never stored.
+        assert_eq!(CELL_BYTES, 224);
         assert_eq!(SCRATCH_BUDGET_BYTES, 402_653_184);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1512);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1340);
     }
 
     /// The window of timing_24mp.jpg at 100 percent at Radius 0.05: 2624 by
@@ -1504,15 +1634,15 @@ mod tests {
     }
 
     /// An export of 6000 by 4000 pixels at Radius 0.05 is 1500 by 1000 cells
-    /// of 4 pixels, 264 MB of scratch under the budget of 384 MiB, and
+    /// of 4 pixels, 336 MB of scratch under the budget of 384 MiB, and
     /// targets of 1500 by 1000 cells under the texture limit: one tile.
     #[test]
     fn a_24_megapixel_export_at_step_4_is_one_tile() {
         let plan = plan(0.05, (6000, 4000), (0, 0), (6000, 4000));
         assert_eq!((plan.step, plan.cells), (4, 53));
         assert_eq!(plan.grid(), ((0, 0), (1500, 1000)));
-        assert_eq!(1500 * 1000 * CELL_BYTES, 264_000_000);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1512);
+        assert_eq!(1500 * 1000 * CELL_BYTES, 336_000_000);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1340);
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
         assert_eq!(side, 1500);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
@@ -1536,7 +1666,7 @@ mod tests {
         assert_eq!(TEXTURE_SIDE_LIMIT, 8192);
         // A grid of 2100 by 500 cells of 4 pixels, 8400 pixels wide, fits
         // the budget and the limit: one tile of the whole grid, though a
-        // square of the budget holds only 1512 cells a side.
+        // square of the budget holds only 1340 cells a side.
         let plan = plan(0.05, (8400, 2000), (0, 0), (8400, 2000));
         assert_eq!(plan.step, 4);
         let (_, grid) = plan.grid();
@@ -1545,12 +1675,12 @@ mod tests {
         assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 2100);
         // A grid whose targets would pass the limit on one side is not one
         // tile, though its cells fit the budget: 9000 cells of one pixel.
-        let plan = self::plan(0.0008, (9000, 200), (0, 0), (9000, 200));
+        let plan = self::plan(0.0008, (9000, 150), (0, 0), (9000, 150));
         assert_eq!(plan.step, 1);
         let (_, grid) = plan.grid();
-        assert_eq!(grid, (9000, 200));
+        assert_eq!(grid, (9000, 150));
         assert!(u64::from(grid.0 * grid.1) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
-        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1512);
+        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1340);
     }
 
     /// An export of 6000 by 4000 pixels in cells of one pixel is 24 million
@@ -1561,7 +1691,7 @@ mod tests {
         assert_eq!((plan.step, plan.cells), (1, 5));
         assert_eq!(plan.grid(), ((0, 0), (6000, 4000)));
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
-        assert_eq!(side, 1512);
+        assert_eq!(side, 1340);
         assert!(u64::from(side * side) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
         assert!(tiles.len() > 1);

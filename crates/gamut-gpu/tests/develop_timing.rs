@@ -1153,8 +1153,15 @@ fn develop_at_viewer_size_is_fast_enough() {
         amount_p95 = Some(p95);
     }
     // Not asserted: the whole refine of one mask with the moments of the
-    // source held (18 passes: a step of Edge sensitivity) and taken again
-    // (24: Radius stepping between two boxes), at each end of the radius.
+    // source held (a step of Edge sensitivity) and with Radius stepping
+    // between two boxes, at each end of the radius. At the viewer size both
+    // Radius pairs keep the side of a cell, 2 pixels at 0.01 and 0.012 and 4
+    // at 0.05 and 0.04, so a Radius step takes no moments of the source and
+    // draws their four box means again. Held: 13 passes at 0.01, and 19 at
+    // 0.05, whose boxes of 14 cells draw a block pass each. Stepped: 17 at
+    // 0.01, 0.012 and 0.04 (a box of 11 cells, no block pass), 27 at 0.05.
+    // "Taken again" below is that step, and its difference from the held
+    // line is the four box means of the source.
     let ends: &[(f32, f32)] = if on_gpu {
         &[(0.01, 0.012), (0.05, 0.04)]
     } else {

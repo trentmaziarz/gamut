@@ -2783,13 +2783,15 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     // moments of the source were taken. A refine of the 64 pixel photo is
     // one tile: 13 passes with the solve in one pass of four targets, 16
     // with it in two passes of two, and 5 more when it takes the moments of
-    // the source in one pass of three targets, 6 with them in two passes.
+    // the source in one pass of three targets, 6 with them in two passes. A
+    // Radius step that keeps the side of a cell takes no moments of the
+    // source and draws their 4 box means again. `boxed` counts those steps.
     let (refine, source) = if develop.refine_fused() {
         (13, 5)
     } else {
         (16, 6)
     };
-    let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, u64) {
+    let builds_after = |develop: &mut Develop, edit: &PhotoEdit, boxed: u64| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
             .expect("a source is set");
@@ -2800,9 +2802,14 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
             "one tile a refine"
         );
         assert_eq!(
+            develop.refine_source_strips(),
+            0,
+            "a refine of the whole photo takes no strips"
+        );
+        assert_eq!(
             u64::from(develop.refine_passes()),
-            refine * refines + source * sources,
-            "{refine} passes a refine and {source} a source"
+            refine * refines + source * sources + 4 * boxed,
+            "{refine} passes a refine, {source} a source and 4 a box of the source"
         );
         (develop.mask_alpha_builds(), refines, sources)
     };
@@ -2811,12 +2818,12 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         exposure_mask("Luminance", luminance_source()),
     ]);
     assert_eq!(
-        builds_after(&mut develop, &edit),
+        builds_after(&mut develop, &edit, 0),
         (2, 1, 1),
         "two alphas, one of them refined"
     );
     assert_eq!(
-        builds_after(&mut develop, &edit),
+        builds_after(&mut develop, &edit, 0),
         (2, 1, 1),
         "the same edit again"
     );
@@ -2827,7 +2834,7 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     edit.masks[0].adjust.look.curves.master = s_curve();
     edit.masks[0].opacity = 35.0;
     assert_eq!(
-        builds_after(&mut develop, &edit),
+        builds_after(&mut develop, &edit, 0),
         (2, 1, 1),
         "sliders of the develop chain, global and of the mask"
     );
@@ -2839,27 +2846,36 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
 
     edit.masks[0].refine.amount = 60.0;
     assert_eq!(
-        builds_after(&mut develop, &edit),
+        builds_after(&mut develop, &edit, 0),
         (2, 2, 1),
         "the Amount slider gathers again over the moments of the source it holds"
     );
     edit.masks[0].refine.sensitivity = 80.0;
     assert_eq!(
-        builds_after(&mut develop, &edit),
+        builds_after(&mut develop, &edit, 0),
         (2, 3, 1),
         "the Edge sensitivity slider too"
     );
+    // On the 64 pixel photo a Radius of 0.05 and one of 0.02 both take
+    // cells of one pixel, with a box of 2 cells and of 1.
+    let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
+    for (radius, cells) in [(0.05, 2), (0.02, 1)] {
+        let mut refine = edit.masks[0].refine;
+        refine.radius = radius;
+        let plan = Plan::for_geometry(&refine, &geometry);
+        assert_eq!((plan.step, plan.cells), (1, cells));
+    }
     edit.masks[0].refine.radius = 0.02;
     assert_eq!(
-        builds_after(&mut develop, &edit),
-        (2, 4, 2),
-        "the Radius slider takes the moments of the source over its new box"
+        builds_after(&mut develop, &edit, 1),
+        (2, 4, 1),
+        "the Radius slider keeps the moments of the source of the same side of a cell and draws their box means again"
     );
 
     edit.masks[0].components[0].invert = true;
     assert_eq!(
-        builds_after(&mut develop, &edit),
-        (3, 5, 2),
+        builds_after(&mut develop, &edit, 1),
+        (3, 5, 1),
         "a component redraws the alpha, and the filter reads it"
     );
     // The second mask takes the radius of the first, so the moments of the
@@ -2867,28 +2883,28 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     edit.masks[1].refine.radius = 0.02;
     edit.masks[1].refine.amount = 100.0;
     assert_eq!(
-        builds_after(&mut develop, &edit),
-        (3, 6, 2),
+        builds_after(&mut develop, &edit, 1),
+        (3, 6, 1),
         "refine switched on for the second mask filters the alpha it holds"
     );
     edit.masks[1].refine.amount = 0.0;
     assert_eq!(
-        builds_after(&mut develop, &edit),
-        (3, 6, 2),
+        builds_after(&mut develop, &edit, 1),
+        (3, 6, 1),
         "and off again"
     );
 
     develop.set_source(&hazy_photo());
     assert_eq!(
-        builds_after(&mut develop, &edit),
-        (5, 7, 3),
+        builds_after(&mut develop, &edit, 1),
+        (5, 7, 2),
         "a new source content draws all three"
     );
     assert_eq!(develop.refine_builds().1, 0, "never a part");
     assert_eq!(
         (develop.refine_passes(), develop.refine_tiles()),
-        (7 * refine as u32 + 3 * source as u32, 7),
-        "seven refines of one tile, three of them with the moments of the source"
+        (7 * refine as u32 + 2 * source as u32 + 4, 7),
+        "seven refines of one tile, two of them with the moments of the source and one with their box means alone"
     );
 }
 
@@ -2970,8 +2986,8 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
 /// A scratch budget under the bytes of the grid of cells cuts a refine into
 /// tiles, and the tiles draw byte for byte what one tile draws. On the 1101
 /// by 90 photo of the test above, the grid is 551 by 45 cells of two pixels
-/// at a radius of 0.015 (24,795 cells of 176 bytes) and 276 by 23 cells of
-/// four at 0.03 (6,348 cells of 176 bytes), each with a margin of 20 cells.
+/// at a radius of 0.015 (24,795 cells of 224 bytes) and 276 by 23 cells of
+/// four at 0.03 (6,348 cells of 224 bytes), each with a margin of 20 cells.
 /// A budget of 157 by 157 cells at a step of 2 gives tiles of 157 cells a
 /// side, which write 228 pixels a row. One of 79 by 79 cells at a step of 4
 /// gives tiles of 104 cells, the floor of two margins and 64, which write
@@ -2994,7 +3010,7 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     // The radius, the step, the cells a side of the budget, the bytes of a
     // cell, and the side of a tile.
     for (radius, step, budget_side, cell_bytes, side) in
-        [(0.015, 2, 157u64, 176u64, 157u32), (0.03, 4, 79, 176, 104)]
+        [(0.015, 2, 157u64, 224u64, 157u32), (0.03, 4, 79, 224, 104)]
     {
         let plan = Plan::for_geometry(
             &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
@@ -3073,6 +3089,187 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
             assert_matches_the_twin(&name, &photo, &edit, &pixels);
         }
     }
+}
+
+/// The photo, the mask and the render of the two tests of a Radius step:
+/// blocks of colour 1420 pixels wide and 160 rows, where a Radius of 0.05
+/// and one of 0.049 both take cells of 4 pixels, with a box of 13 cells
+/// either side and of 12, each summed in 3 blocks of 8 and the cells left
+/// over, and a Radius of 0.01 takes cells of one pixel. The mask is a radial
+/// gradient 160 pixels across either side with a hard rim 8 pixels over the
+/// block edge at column 576.
+fn radius_step_photo_and_mask(radius: f32) -> (Photo, PhotoEdit) {
+    let photo = blocky_photo(1420, 160);
+    let w = photo.width as f32;
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [(576.0 + 8.0 - 160.0) / w, 0.5],
+        radius: [160.0 / w, 70.0 / w],
+        rotation: 0.0,
+        feather: 15.0,
+    });
+    let edit = masked(vec![refined_at(
+        exposure_mask("Radial", radial),
+        100.0,
+        radius,
+        50.0,
+    )]);
+    (photo, edit)
+}
+
+/// The edit of `radius_step_photo_and_mask` at another Radius.
+fn at_radius(edit: &PhotoEdit, radius: f32) -> PhotoEdit {
+    let mut edit = edit.clone();
+    edit.masks[0].refine.radius = radius;
+    edit
+}
+
+/// A Radius step that keeps the side of a cell keeps the moments of the
+/// source and draws only their box means again. On one photo and one mask,
+/// Radius 0.05 rendered fresh, then 0.049, then 0.05 again on the same graph:
+/// the moments of the source are taken once, the render at 0.049 is byte for
+/// byte a fresh render at 0.049, and the third render is byte for byte the
+/// first. Then a zoomed window, whose work at 0.049 is 3 cells a side
+/// narrower than at 0.05 inside the grid: 0.049 and then 0.05 on one graph
+/// takes the moments over the strips the wider work adds, and gives byte for
+/// byte a fresh render at 0.05.
+#[test]
+fn a_radius_step_of_the_same_cell_size_holds_the_moments_of_the_source() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let (photo, wide) = radius_step_photo_and_mask(0.05);
+    let narrow = at_radius(&wide, 0.049);
+    let size = (photo.width, photo.height);
+    for (edit, cells) in [(&wide, 13), (&narrow, 12)] {
+        let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+        assert_eq!((plan.step, plan.cells), (4, cells));
+    }
+    let moved = assert_the_refine_shows(&photo, &wide);
+    let readback = Readback::new(&gpu.device);
+    let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+        let view = develop
+            .render(edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        readback.read(&gpu.device, &gpu.queue, view, size.0, size.1)
+    };
+    let fresh = |edit: &PhotoEdit| -> Vec<u8> {
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        render(&mut develop, edit)
+    };
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    let first = render(&mut develop, &wide);
+    let second = render(&mut develop, &narrow);
+    let third = render(&mut develop, &wide);
+    let (builds, strips) = (
+        develop.refine_source_builds(),
+        develop.refine_source_strips(),
+    );
+    println!(
+        "a Radius step of the same cell size, the whole photo: refine_source_builds {builds}, refine_source_strips {strips}, refine_passes {}; the twin moves {moved} pixels",
+        develop.refine_passes()
+    );
+    assert!(first != second, "the Radius step shows on the picture");
+    assert_eq!(
+        second,
+        fresh(&narrow),
+        "the box means drawn again over the moments held give a fresh render"
+    );
+    assert!(
+        third == first,
+        "the third render is byte for byte the first"
+    );
+    assert_eq!(builds, 1, "the moments of the source taken whole once");
+    assert!(strips <= 4, "at most four strips on the grow back");
+
+    // A zoomed window: the refine works over the cells of the window and the
+    // margin around them, inside a grid padded by the reach of Refine edges.
+    let view = ViewWindow {
+        full: size,
+        window: (400, 0, 480, 160),
+        visible: (400, 0, 480, 160),
+    };
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    view_render_of(&mut develop, &gpu, &readback, &narrow, &view);
+    let grown = view_render_of(&mut develop, &gpu, &readback, &wide, &view);
+    let (builds, strips) = (
+        develop.refine_source_builds(),
+        develop.refine_source_strips(),
+    );
+    println!(
+        "a Radius step of the same cell size, a zoomed window: refine_source_builds {builds}, refine_source_strips {strips}"
+    );
+    let mut alone = Develop::new(&gpu.device, &gpu.queue);
+    alone.set_source(&photo);
+    let fresh_view = view_render_of(&mut alone, &gpu, &readback, &wide, &view);
+    assert!(
+        grown == fresh_view,
+        "the moments taken over the strips give a fresh render byte for byte"
+    );
+    assert_eq!(builds, 1, "the moments of the source taken whole once");
+    assert!(
+        (1..=4).contains(&strips),
+        "the wider work takes the moments over 1 to 4 strips, not {strips}"
+    );
+}
+
+/// A Radius step that changes the side of a cell takes the moments of the
+/// source again: on the photo of the test above, Radius 0.05 takes cells of
+/// 4 pixels and Radius 0.01 cells of one, and the render at 0.01 after 0.05
+/// is byte for byte a fresh render at 0.01.
+#[test]
+fn a_radius_step_to_another_cell_size_takes_the_moments_again() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let (photo, wide) = radius_step_photo_and_mask(0.05);
+    let fine = at_radius(&wide, 0.01);
+    let size = (photo.width, photo.height);
+    for (edit, step) in [(&wide, 4), (&fine, 1)] {
+        let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+        assert_eq!(plan.step, step);
+    }
+    let readback = Readback::new(&gpu.device);
+    let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<u8> {
+        let view = develop
+            .render(edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        readback.read(&gpu.device, &gpu.queue, view, size.0, size.1)
+    };
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    render(&mut develop, &wide);
+    let stepped = render(&mut develop, &fine);
+    let (builds, strips) = (
+        develop.refine_source_builds(),
+        develop.refine_source_strips(),
+    );
+    println!(
+        "a Radius step to another cell size: refine_source_builds {builds}, refine_source_strips {strips}"
+    );
+    let mut alone = Develop::new(&gpu.device, &gpu.queue);
+    alone.set_source(&photo);
+    assert!(
+        stepped == render(&mut alone, &fine),
+        "the render at 0.01 after 0.05 is byte for byte a fresh one"
+    );
+    assert_eq!(
+        builds, 2,
+        "the moments of the source taken again at the new step"
+    );
+    assert_eq!(strips, 0, "and never over strips");
 }
 
 /// A box of 24 cells or more adds the sums of 8 cells a block pass wrote,
