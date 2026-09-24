@@ -23,7 +23,10 @@
 //
 // The passes of one tile, in order:
 //   once a source and radius (kept while neither changes)
-//     fs_source_a, fs_source_b    the means of I and I I over each cell
+//     fs_source                   the means of I and I I over each cell, in
+//                                 three targets; fs_source_a, fs_source_b
+//                                 in a pass of two and a pass of one on a
+//                                 device that draws into 32 bytes a sample
 //     fs_box_h2, fs_box_h1        their means over the box, across
 //     fs_box_v2, fs_box_v1        and down
 //   each of the three gathers
@@ -160,6 +163,14 @@ struct Pair {
     @location(1) two: vec4<f32>,
 }
 
+// The three targets of the fused source, on a device that draws into 64
+// bytes a sample.
+struct Three {
+    @location(0) one: vec4<f32>,
+    @location(1) two: vec4<f32>,
+    @location(2) three: vec4<f32>,
+}
+
 // The four targets of the fused solve, on a device that draws into 64 bytes
 // a sample.
 struct Four {
@@ -199,7 +210,21 @@ fn source_moments(texel: vec2<u32>) -> SourceMoments {
     return out;
 }
 
-// (I, rr) and (rg, rb, gg, gb).
+// (I, rr), (rg, rb, gg, gb) and (bb) in one pass of three targets, on a
+// device that draws into 64 bytes a sample: the targets of fs_source_a, then
+// that of fs_source_b, from one call of source_moments.
+@fragment
+fn fs_source(in: VertexOutput) -> Three {
+    let m = source_moments(vec2<u32>(in.position.xy));
+    var out: Three;
+    out.one = vec4<f32>(m.i, m.ii_r.x);
+    out.two = vec4<f32>(m.ii_r.y, m.ii_r.z, m.ii_g.x, m.ii_g.y);
+    out.three = vec4<f32>(m.ii_g.z, 0.0, 0.0, 0.0);
+    return out;
+}
+
+// The same in a pass of two targets and a pass of one, on a device that
+// draws into 32 bytes a sample: (I, rr) and (rg, rb, gg, gb).
 @fragment
 fn fs_source_a(in: VertexOutput) -> Pair {
     let m = source_moments(vec2<u32>(in.position.xy));

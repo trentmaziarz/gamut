@@ -13,34 +13,35 @@
 //! a pass; Gamut asks the adapter for up to 64
 //! ([`crate::video::wanted_limits`]), which is four.
 //!
-//! A tile is drawn in 21 passes. Six take the moments of the source and
-//! their box means; they depend on no mask and no gather, so they are kept
-//! while the source, the radius and the tile stay the same, and a tile then
-//! costs 15. They are taken over the cells the gathers work over, joined
-//! with the cells already held, so a refine over cells they cover draws
-//! none, and a refine of a small mask on a large grid draws few. Each of the
-//! three gathers takes five: the moments of `q` over the cells, their box
-//! means across and down, the solve in one pass of four targets, and the
-//! move at full resolution. The move of the last gather writes the r8unorm
-//! refined alpha; the two before it write `q` into a 32 bit single channel
-//! target, so no store rounds it between gathers.
+//! A tile is drawn in 20 passes. Five take the moments of the source, in one
+//! pass of three targets, and their box means; they depend on no mask and no
+//! gather, so they are kept while the source, the radius and the tile stay
+//! the same, and a tile then costs 15. They are taken over the cells the
+//! gathers work over, joined with the cells already held, so a refine over
+//! cells they cover draws none, and a refine of a small mask on a large grid
+//! draws few. Each of the three gathers takes five: the moments of `q` over
+//! the cells, their box means across and down, the solve in one pass of four
+//! targets, and the move at full resolution. The move of the last gather
+//! writes the r8unorm refined alpha; the two before it write `q` into a 32
+//! bit single channel target, so no store rounds it between gathers.
 //!
 //! A device that draws into no more than 32 bytes a sample, such as one made
-//! with wgpu's default limits, draws the solve in two passes of two targets:
-//! a gather takes six, and a tile 24, or 18 with the moments of the source
-//! held. The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both offer 128
-//! bytes, so both draw the fused solve.
+//! with wgpu's default limits, draws the moments of the source in a pass of
+//! two targets and a pass of one, and the solve in two passes of two: the
+//! source takes six, a gather six, and a tile 24, or 18 with the moments of
+//! the source held. The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both
+//! offer 128 bytes, so both draw the fused source and the fused solve.
 //!
 //! A box of [`BLOCK_TAPS`] cells or more (a radius of 12 cells or more)
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 31 passes, and 21 with the moments of the source held
-//! (34 and 24 with the solve in two passes). A box keeps its cells, each held
-//! at the edges as before; only the order of the sum changes. A smaller box
-//! sums every cell in the direct loop, which measured no slower (see
-//! [`BLOCK_TAPS`]): a block pass is a pass of its own, and a box of few cells
-//! does not win it back.
+//! ten block passes: 30 passes, and 21 with the moments of the source held
+//! (34 and 24 with the source and the solve drawn in two passes each). A box
+//! keeps its cells, each held at the edges as before; only the order of the
+//! sum changes. A smaller box sums every cell in the direct loop, which
+//! measured no slower (see [`BLOCK_TAPS`]): a block pass is a pass of its
+//! own, and a box of few cells does not win it back.
 
 use bytemuck::{Pod, Zeroable};
 use gamut_color::refine::{GATHERS, Plan};
@@ -480,8 +481,13 @@ impl<'a> Block<'a> {
 /// The pipelines of `refine.wgsl`.
 pub(crate) struct RefinePass {
     layout: wgpu::BindGroupLayout,
-    source_a: wgpu::RenderPipeline,
-    source_b: wgpu::RenderPipeline,
+    /// The moments of the source in one pass of three targets, on a device
+    /// that draws into 64 bytes a sample; `None` on one that draws into less.
+    source: Option<wgpu::RenderPipeline>,
+    /// The moments of the source in a pass of two targets and a pass of
+    /// one, when there is no `source`.
+    source_a: Option<wgpu::RenderPipeline>,
+    source_b: Option<wgpu::RenderPipeline>,
     gather_first: wgpu::RenderPipeline,
     gather: wgpu::RenderPipeline,
     box_h2: wgpu::RenderPipeline,
@@ -598,14 +604,19 @@ impl RefinePass {
         };
         let pair = [MOMENT_FORMAT; 2];
         let one = [MOMENT_FORMAT];
-        // The fused solve draws into every solved target at once.
+        // The fused solve draws into every solved target at once, and the
+        // fused source into every target of the source's moments, fewer
+        // bytes a sample: one limit serves both.
         let fused = u64::from(device.limits().max_color_attachment_bytes_per_sample)
             >= SOLVED_TARGETS as u64 * MOMENT_BYTES;
-        let split = |fragment: &str| (!fused).then(|| pipeline(fragment, &pair));
+        let split = |fragment: &str, targets: &[wgpu::TextureFormat]| {
+            (!fused).then(|| pipeline(fragment, targets))
+        };
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         RefinePass {
-            source_a: pipeline("fs_source_a", &pair),
-            source_b: pipeline("fs_source_b", &one),
+            source: fused.then(|| pipeline("fs_source", &[MOMENT_FORMAT; SOURCE_TARGETS])),
+            source_a: split("fs_source_a", &pair),
+            source_b: split("fs_source_b", &one),
             gather_first: pipeline("fs_gather_first", &pair),
             gather: pipeline("fs_gather", &one),
             box_h2: pipeline("fs_box_h2", &pair),
@@ -617,8 +628,8 @@ impl RefinePass {
             block_h1: pipeline("fs_block_h1", &one),
             block_v1: pipeline("fs_block_v1", &one),
             solve: fused.then(|| pipeline("fs_solve", &[MOMENT_FORMAT; SOLVED_TARGETS])),
-            solve_a: split("fs_solve_a"),
-            solve_b: split("fs_solve_b"),
+            solve_a: split("fs_solve_a", &pair),
+            solve_b: split("fs_solve_b", &pair),
             moving: pipeline("fs_move", &[MOVED_FORMAT]),
             apply: pipeline("fs_apply", &[alpha_format]),
             layout,
@@ -632,9 +643,10 @@ impl RefinePass {
         }
     }
 
-    /// Whether the solve is drawn in one pass of four targets, on a device
-    /// that draws into 64 bytes a sample, rather than in two of two.
-    pub(crate) fn solve_fused(&self) -> bool {
+    /// Whether the moments of the source are drawn in one pass of three
+    /// targets and the solve in one pass of four, on a device that draws into
+    /// 64 bytes a sample, rather than each in two passes.
+    pub(crate) fn fused(&self) -> bool {
         self.solve.is_some()
     }
 
@@ -918,22 +930,33 @@ impl RefinePass {
             };
             if let Some(all) = take {
                 let cells = &binds.cells;
-                pass(
-                    "refine source a",
-                    &self.source_a,
-                    cells,
-                    &pair(&s[0], &s[1]),
-                    all,
-                    None,
-                );
-                pass(
-                    "refine source b",
-                    &self.source_b,
-                    cells,
-                    &[&s[2].view],
-                    all,
-                    None,
-                );
+                if let Some(source) = &self.source {
+                    pass(
+                        "refine source",
+                        source,
+                        cells,
+                        &[&s[0].view, &s[1].view, &s[2].view],
+                        all,
+                        None,
+                    );
+                } else {
+                    pass(
+                        "refine source a",
+                        self.source_a.as_ref().expect("made without a fused source"),
+                        cells,
+                        &pair(&s[0], &s[1]),
+                        all,
+                        None,
+                    );
+                    pass(
+                        "refine source b",
+                        self.source_b.as_ref().expect("made without a fused source"),
+                        cells,
+                        &[&s[2].view],
+                        all,
+                        None,
+                    );
+                }
                 pass(
                     "refine source h a",
                     &self.box_h2,

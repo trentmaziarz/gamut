@@ -1045,11 +1045,12 @@ impl Develop {
         self.refine.refine_passes
     }
 
-    /// Whether Refine edges draws its solve in one pass of four targets, on
-    /// a device that draws into 64 bytes a sample, rather than in two passes
-    /// of two: a gather then draws one pass fewer.
-    pub fn refine_solve_fused(&self) -> bool {
-        self.refine.solve_fused()
+    /// Whether Refine edges draws the moments of the source in one pass of
+    /// three targets and its solve in one pass of four, on a device that
+    /// draws into 64 bytes a sample, rather than each in two passes: the
+    /// source and each gather then draw one pass fewer.
+    pub fn refine_fused(&self) -> bool {
+        self.refine.fused()
     }
 
     /// How many tiles of Refine edges this graph has drawn. A grid of cells
