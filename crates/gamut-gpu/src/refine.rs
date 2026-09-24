@@ -13,22 +13,23 @@
 //! a pass; Gamut asks the adapter for up to 64
 //! ([`crate::video::wanted_limits`]), which is four.
 //!
-//! A tile is drawn in 20 passes. Five take the moments of the source, in one
+//! A tile is drawn in 18 passes. Five take the moments of the source, in one
 //! pass of three targets, and their box means; they depend on no mask and no
 //! gather, so they are kept while the source, the radius and the tile stay
-//! the same, and a tile then costs 15. They are taken over the cells the
+//! the same, and a tile then costs 13. They are taken over the cells the
 //! gathers work over, joined with the cells already held, so a refine over
 //! cells they cover draws none, and a refine of a small mask on a large grid
-//! draws few. Each of the three gathers takes five: the moments of `q` over
-//! the cells, their box means across and down, the solve in one pass of four
-//! targets, and the move at full resolution. The move of the last gather
-//! writes the r8unorm refined alpha; the two before it write `q` into a 32
-//! bit single channel target, so no store rounds it between gathers.
+//! draws few. Each of the three gathers takes four: the moments of `q` over
+//! the cells, their box means across and down, and the solve in one pass of
+//! four targets. The two later gathers take `q` at each pixel as they sum
+//! it, the mask moved by what the gather before solved, so `q` is never
+//! stored between gathers. The apply after the last gather moves the mask at
+//! full resolution into the r8unorm refined alpha.
 //!
 //! A device that draws into no more than 32 bytes a sample, such as one made
 //! with wgpu's default limits, draws the moments of the source in a pass of
 //! two targets and a pass of one, and the solve in two passes of two: the
-//! source takes six, a gather six, and a tile 24, or 18 with the moments of
+//! source takes six, a gather five, and a tile 22, or 16 with the moments of
 //! the source held. The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both
 //! offer 128 bytes, so both draw the fused source and the fused solve.
 //!
@@ -36,8 +37,8 @@
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 30 passes, and 21 with the moments of the source held
-//! (34 and 24 with the source and the solve drawn in two passes each). A box
+//! ten block passes: 28 passes, and 19 with the moments of the source held
+//! (32 and 22 with the source and the solve drawn in two passes each). A box
 //! keeps its cells, each held at the edges as before; only the order of the
 //! sum changes. A smaller box sums every cell in the direct loop, which
 //! measured no slower (see [`BLOCK_TAPS`]): a block pass is a pass of its
@@ -51,12 +52,8 @@ use crate::{FULLSCREEN_VERTICES, fullscreen_primitive};
 /// The format of the float targets of the cells.
 pub(crate) const MOMENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// The format of the target that holds `q` between two gathers.
-pub(crate) const MOVED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
-
-/// The bytes a cell of each format costs a target.
+/// The bytes a cell costs a target.
 const MOMENT_BYTES: u64 = 16;
-const MOVED_BYTES: u64 = 4;
 
 /// How many Rgba32Float targets of cells a scratch holds of each kind: the
 /// box means of the source's moments, the far side of every box mean, and
@@ -65,13 +62,13 @@ const SOURCE_TARGETS: usize = 3;
 const FAR_TARGETS: usize = 3;
 const SOLVED_TARGETS: usize = 4;
 
-/// The most bytes the scratch of a frame takes, the targets of cells and `q`
-/// together, unless one box needs more.
+/// The most bytes the scratch of a frame takes, its targets of cells, unless
+/// one box needs more.
 pub(crate) const SCRATCH_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
 
 /// The longest side of a texture a device of default limits makes, which is
-/// what the headless device and the app ask for: `q` of one tile over a
-/// whole grid stays inside it.
+/// what the headless device and the app ask for: the targets of cells of one
+/// tile over a whole grid stay inside it.
 pub(crate) const TEXTURE_SIDE_LIMIT: u32 = 8192;
 
 /// How many cells a block pass sums, as `BLOCK` in `refine.wgsl`.
@@ -95,26 +92,21 @@ pub(crate) fn box_blocks(cells: u32) -> u32 {
     if taps < BLOCK_TAPS { 0 } else { taps / BLOCK }
 }
 
-/// The bytes one cell of a tile costs the scratch, at `step` pixels a cell.
-/// Counted are the eleven Rgba32Float targets of cells, 16 bytes a cell each:
-/// the three `s` (the box means of the source's moments), the three `f` (the
-/// far side of every box mean), `g` (the far side of the box mean of the
-/// mask's moments) and the four `v` (what a gather solved). Then the R32Float
-/// target `q` (the moved alpha between two gathers), which holds the `step`
-/// by `step` pixels of a cell at 4 bytes each. The refined alpha belongs to
-/// its mask and is not counted. At a step of 4 a cell costs 240 bytes. The
+/// The bytes one cell of a tile costs the scratch, at every step. Counted
+/// are the eleven Rgba32Float targets of cells, 16 bytes a cell each: the
+/// three `s` (the box means of the source's moments), the three `f` (the far
+/// side of every box mean), `g` (the far side of the box mean of the mask's
+/// moments) and the four `v` (what a gather solved), 176 bytes. `q` is never
+/// stored, and the refined alpha belongs to its mask and is not counted. The
 /// block passes before the boxes add no target: they write `v[0]` and
-/// `v[1]`, which no pass reads between a move and the next solve, and every
-/// box lies between the two (see [`RefinePass::run`]).
-pub(crate) fn bytes_a_cell(step: u32) -> u64 {
-    let moments = (SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64;
-    moments * MOMENT_BYTES + u64::from(step * step) * MOVED_BYTES
-}
+/// `v[1]`, which no pass reads between the moments of a gather and its
+/// solve, and every box lies between the two (see [`RefinePass::run`]).
+pub(crate) const CELL_BYTES: u64 =
+    (SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64 * MOMENT_BYTES;
 
-/// The most cells a side a square tile of `step` pixels a cell holds within
-/// `budget` bytes.
-pub(crate) fn budget_side(budget: u64, step: u32) -> u32 {
-    u32::try_from((budget / bytes_a_cell(step)).isqrt()).unwrap_or(u32::MAX)
+/// The most cells a side a square tile holds within `budget` bytes.
+pub(crate) fn budget_side(budget: u64) -> u32 {
+    u32::try_from((budget / CELL_BYTES).isqrt()).unwrap_or(u32::MAX)
 }
 
 /// A rectangle of pixels or of cells: x, y, width, height.
@@ -130,7 +122,6 @@ pub(crate) struct RefineUniform {
     pub(crate) grid_count: [u32; 2],
     pub(crate) tile_first: [u32; 2],
     pub(crate) tile_count: [u32; 2],
-    pub(crate) q_first: [u32; 2],
     pub(crate) step: u32,
     pub(crate) cells: u32,
     pub(crate) eps: f32,
@@ -145,7 +136,7 @@ pub(crate) struct RefineUniform {
 /// the float targets hold while it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Tile {
-    /// The pixels of the render the last move writes.
+    /// The pixels of the render the apply writes.
     pub(crate) out: Rect,
     /// The first cell held and how many, on each axis.
     pub(crate) first: (u32, u32),
@@ -156,43 +147,8 @@ pub(crate) struct Tile {
 }
 
 impl Tile {
-    /// The pixel of the render the first texel of the `q` target holds: the
-    /// first pixel of the first cell.
-    fn q_first(&self, plan: &Plan) -> (u32, u32) {
-        let axis = |first: u32, origin: u32| (first * plan.step).max(origin) - origin;
-        (
-            axis(self.first.0, plan.origin.0),
-            axis(self.first.1, plan.origin.1),
-        )
-    }
-
-    /// The pixels of the render inside the cells of `work`.
-    fn work_pixels(&self, plan: &Plan) -> Rect {
-        let axis = |first: u32, start: u32, count: u32, origin: u32, size: u32| {
-            let low = ((first + start) * plan.step).max(origin) - origin;
-            let high = ((first + start + count) * plan.step).min(origin + size) - origin;
-            (low, high - low)
-        };
-        let (x, width) = axis(
-            self.first.0,
-            self.work.0,
-            self.work.2,
-            plan.origin.0,
-            plan.size.0,
-        );
-        let (y, height) = axis(
-            self.first.1,
-            self.work.1,
-            self.work.3,
-            plan.origin.1,
-            plan.size.1,
-        );
-        (x, y, width, height)
-    }
-
     pub(crate) fn uniform(&self, plan: &Plan) -> RefineUniform {
         let (grid_first, grid_count) = plan.grid();
-        let q_first = self.q_first(plan);
         RefineUniform {
             origin: [plan.origin.0, plan.origin.1],
             size: [plan.size.0, plan.size.1],
@@ -200,7 +156,6 @@ impl Tile {
             grid_count: [grid_count.0, grid_count.1],
             tile_first: [self.first.0, self.first.1],
             tile_count: [self.count.0, self.count.1],
-            q_first: [q_first.0, q_first.1],
             step: plan.step,
             cells: plan.cells,
             eps: plan.eps,
@@ -212,21 +167,19 @@ impl Tile {
 }
 
 /// The most cells a side a tile of this plan may hold. The whole grid is one
-/// tile when its cells fit `budget` bytes and its `q` fits a texture on each
-/// side; the side is then the larger side of the grid. Otherwise as many as
+/// tile when its cells fit `budget` bytes and a texture on each side; the
+/// side is then the larger side of the grid. Otherwise as many as
 /// a square of `budget` bytes holds and no more than the larger side of the
 /// grid. Either way at least what the boxes of the gathers and a few pixels
 /// around them need.
 pub(crate) fn tile_side(plan: &Plan, budget: u64) -> u32 {
     let (_, grid) = plan.grid();
-    let bytes = u64::from(grid.0) * u64::from(grid.1) * bytes_a_cell(plan.step);
-    let whole = bytes <= budget
-        && u64::from(grid.0) * u64::from(plan.step) <= u64::from(TEXTURE_SIDE_LIMIT)
-        && u64::from(grid.1) * u64::from(plan.step) <= u64::from(TEXTURE_SIDE_LIMIT);
+    let bytes = u64::from(grid.0) * u64::from(grid.1) * CELL_BYTES;
+    let whole = bytes <= budget && grid.0 <= TEXTURE_SIDE_LIMIT && grid.1 <= TEXTURE_SIDE_LIMIT;
     let side = if whole {
         grid.0.max(grid.1)
     } else {
-        budget_side(budget, plan.step).min(grid.0.max(grid.1))
+        budget_side(budget).min(grid.0.max(grid.1))
     };
     side.max(plan.margin() * 2 + 64)
 }
@@ -370,7 +323,7 @@ fn join(a: Rect, b: Rect) -> Rect {
     (x, y, right - x, bottom - y)
 }
 
-/// The float targets of a frame, eleven of cells and one of pixels.
+/// The float targets of a frame, eleven of cells.
 pub(crate) struct Scratch {
     /// The box means of the source's moments: (I, rr), (rg, rb, gg, gb), (bb).
     s: [FloatTarget; SOURCE_TARGETS],
@@ -381,11 +334,8 @@ pub(crate) struct Scratch {
     g: FloatTarget,
     /// What a gather solved: 15 numbers a cell.
     v: [FloatTarget; SOLVED_TARGETS],
-    /// `q` between two gathers, at the pixels of the cells.
-    q: FloatTarget,
-    /// The cells a side the targets of cells hold, and the pixels `q` holds.
+    /// The cells a side the targets of cells hold.
     size: (u32, u32),
-    q_size: (u32, u32),
     held: Option<Held>,
     /// Told apart from every scratch before it, for the bind groups that
     /// hold its views.
@@ -428,7 +378,8 @@ struct Binds {
     gather_across: wgpu::BindGroup,
     /// s0, s1, s2, f0, f2: the solve.
     solve: wgpu::BindGroup,
-    /// v0 to v3, and no `q`: the move.
+    /// v0 to v3: a later gather, which moves the mask as it sums, and the
+    /// apply.
     moving: wgpu::BindGroup,
     /// What the block pass before each box reads, the same targets first
     /// and never v0 or v1, which it writes.
@@ -489,7 +440,7 @@ pub(crate) struct RefinePass {
     source_a: Option<wgpu::RenderPipeline>,
     source_b: Option<wgpu::RenderPipeline>,
     gather_first: wgpu::RenderPipeline,
-    gather: wgpu::RenderPipeline,
+    gather_moved: wgpu::RenderPipeline,
     box_h2: wgpu::RenderPipeline,
     box_v2: wgpu::RenderPipeline,
     box_h1: wgpu::RenderPipeline,
@@ -504,7 +455,6 @@ pub(crate) struct RefinePass {
     /// The solve in two passes of two targets, when there is no `solve`.
     solve_a: Option<wgpu::RenderPipeline>,
     solve_b: Option<wgpu::RenderPipeline>,
-    moving: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     /// The distance between two tiles in the uniform buffer.
     stride: u32,
@@ -618,7 +568,7 @@ impl RefinePass {
             source_a: split("fs_source_a", &pair),
             source_b: split("fs_source_b", &one),
             gather_first: pipeline("fs_gather_first", &pair),
-            gather: pipeline("fs_gather", &one),
+            gather_moved: pipeline("fs_gather_moved", &one),
             box_h2: pipeline("fs_box_h2", &pair),
             box_v2: pipeline("fs_box_v2", &pair),
             box_h1: pipeline("fs_box_h1", &one),
@@ -630,7 +580,6 @@ impl RefinePass {
             solve: fused.then(|| pipeline("fs_solve", &[MOMENT_FORMAT; SOLVED_TARGETS])),
             solve_a: split("fs_solve_a", &pair),
             solve_b: split("fs_solve_b", &pair),
-            moving: pipeline("fs_move", &[MOVED_FORMAT]),
             apply: pipeline("fs_apply", &[alpha_format]),
             layout,
             stride: (size as u32).div_ceil(alignment) * alignment,
@@ -715,21 +664,12 @@ impl RefinePass {
         let (_, grid) = plan.grid();
         let side = tile_side(plan, self.scratch_budget);
         let wanted = (grid.0.min(side), grid.1.min(side));
-        let wanted_q = (
-            (wanted.0 * plan.step).min(plan.size.0),
-            (wanted.1 * plan.step).min(plan.size.1),
-        );
-        if scratch.as_ref().is_none_or(|held| {
-            held.size.0 < wanted.0
-                || held.size.1 < wanted.1
-                || held.q_size.0 < wanted_q.0
-                || held.q_size.1 < wanted_q.1
-        }) {
-            let (size, q_size) = scratch.as_ref().map_or((wanted, wanted_q), |held| {
-                (
-                    (held.size.0.max(wanted.0), held.size.1.max(wanted.1)),
-                    (held.q_size.0.max(wanted_q.0), held.q_size.1.max(wanted_q.1)),
-                )
+        if scratch
+            .as_ref()
+            .is_none_or(|held| held.size.0 < wanted.0 || held.size.1 < wanted.1)
+        {
+            let size = scratch.as_ref().map_or(wanted, |held| {
+                (held.size.0.max(wanted.0), held.size.1.max(wanted.1))
             });
             self.scratches += 1;
             let float = |label: &str| FloatTarget {
@@ -740,11 +680,7 @@ impl RefinePass {
                 f: [0; FAR_TARGETS].map(|_| float("refine means")),
                 g: float("refine mask means"),
                 v: [0; SOLVED_TARGETS].map(|_| float("refine solved")),
-                q: FloatTarget {
-                    view: target(device, "refine moved", MOVED_FORMAT, q_size.0, q_size.1).view,
-                },
                 size,
-                q_size,
                 held: None,
                 id: self.scratches,
             });
@@ -761,7 +697,8 @@ impl RefinePass {
             .as_ref()
             .is_none_or(|(id, _)| *id != scratch.id)
         {
-            let group = |label: &str, moved: &wgpu::TextureView, textures: [&FloatTarget; 5]| {
+            // Binding 3 is read by no pass; every group binds the alpha there.
+            let group = |label: &str, textures: [&FloatTarget; 5]| {
                 fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
                     wgpu::BindGroupEntry {
                         binding,
@@ -784,7 +721,7 @@ impl RefinePass {
                         },
                         view(1, working),
                         view(2, alpha),
-                        view(3, moved),
+                        view(3, alpha),
                         view(4, &textures[0].view),
                         view(5, &textures[1].view),
                         view(6, &textures[2].view),
@@ -793,67 +730,34 @@ impl RefinePass {
                     ],
                 })
             };
-            let (s, f, g, v, q) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v, &scratch.q);
+            let (s, f, g, v) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v);
             refined.binds = Some((
                 scratch.id,
                 Binds {
-                    cells: group("refine cells", &q.view, [&f[1], g, &v[0], &v[1], &v[2]]),
-                    source_pair: group(
-                        "refine source pair",
-                        &q.view,
-                        [&s[0], &s[1], &v[0], &v[1], &v[2]],
-                    ),
-                    source_one: group(
-                        "refine source one",
-                        &q.view,
-                        [&s[2], &v[2], &v[0], &v[1], &v[3]],
-                    ),
-                    far_pair: group(
-                        "refine far pair",
-                        &q.view,
-                        [&f[0], &f[1], &v[0], &v[1], &v[2]],
-                    ),
-                    far_one: group(
-                        "refine far one",
-                        &q.view,
-                        [&f[2], &v[2], &v[0], &v[1], &v[3]],
-                    ),
+                    cells: group("refine cells", [&f[1], g, &v[0], &v[1], &v[2]]),
+                    source_pair: group("refine source pair", [&s[0], &s[1], &v[0], &v[1], &v[2]]),
+                    source_one: group("refine source one", [&s[2], &v[2], &v[0], &v[1], &v[3]]),
+                    far_pair: group("refine far pair", [&f[0], &f[1], &v[0], &v[1], &v[2]]),
+                    far_one: group("refine far one", [&f[2], &v[2], &v[0], &v[1], &v[3]]),
                     gather_across: group(
                         "refine gather across",
-                        &q.view,
                         [&f[0], &f[2], &v[0], &v[1], &v[2]],
                     ),
-                    solve: group("refine solve", &q.view, [&s[0], &s[1], &s[2], &f[0], &f[2]]),
-                    // The move writes `q`, so the alpha stands in its place.
-                    moving: group("refine move", alpha, [&v[0], &v[1], &v[2], &v[3], &f[1]]),
-                    block_cells: group(
-                        "refine block cells",
-                        &q.view,
-                        [&f[1], g, &v[2], &v[3], &s[2]],
-                    ),
+                    solve: group("refine solve", [&s[0], &s[1], &s[2], &f[0], &f[2]]),
+                    moving: group("refine move", [&v[0], &v[1], &v[2], &v[3], &f[1]]),
+                    block_cells: group("refine block cells", [&f[1], g, &v[2], &v[3], &s[2]]),
                     block_source_pair: group(
                         "refine block source pair",
-                        &q.view,
                         [&s[0], &s[1], &v[2], &v[3], g],
                     ),
                     block_source_one: group(
                         "refine block source one",
-                        &q.view,
                         [&s[2], g, &v[2], &v[3], &f[0]],
                     ),
-                    block_far_pair: group(
-                        "refine block far pair",
-                        &q.view,
-                        [&f[0], &f[1], &v[2], &v[3], g],
-                    ),
-                    block_far_one: group(
-                        "refine block far one",
-                        &q.view,
-                        [&f[2], g, &v[2], &v[3], &f[0]],
-                    ),
+                    block_far_pair: group("refine block far pair", [&f[0], &f[1], &v[2], &v[3], g]),
+                    block_far_one: group("refine block far one", [&f[2], g, &v[2], &v[3], &f[0]]),
                     block_gather_across: group(
                         "refine block gather across",
-                        &q.view,
                         [&f[0], &f[2], &v[2], &v[3], g],
                     ),
                 },
@@ -882,8 +786,8 @@ impl RefinePass {
             let (s, f, g, v) = (&scratch.s, &scratch.f, &scratch.g, &scratch.v);
             // A box pass of blocks has its block pass first, into v0 (and v1
             // for a pair). Both are free at every box: the solve writes them
-            // after the last box of a gather, and the move reads them before
-            // the first box of the next.
+            // after the last box of a gather, and the moments of the next
+            // gather read them before its first box.
             let sums = [&v[0].view, &v[1].view];
             let count = tile.count;
             let mut pass = |label: &str,
@@ -1009,14 +913,6 @@ impl RefinePass {
                 self.source_builds += 1;
             }
             let work = tile.work;
-            let q_first = tile.q_first(plan);
-            let work_pixels = tile.work_pixels(plan);
-            let moved_area = (
-                work_pixels.0 - q_first.0,
-                work_pixels.1 - q_first.1,
-                work_pixels.2,
-                work_pixels.3,
-            );
             for gather in 0..GATHERS {
                 if gather == 0 {
                     // With the moments of the mask itself, which the solve
@@ -1050,10 +946,12 @@ impl RefinePass {
                         Block::down("refine gather v2 block", &self.block_v2, &binds.block_cells),
                     );
                 } else {
+                    // q moved from what the gather before solved, pixel by
+                    // pixel, as the moments are summed.
                     pass(
                         "refine gather",
-                        &self.gather,
-                        &binds.cells,
+                        &self.gather_moved,
+                        &binds.moving,
                         &[&f[0].view],
                         work,
                         None,
@@ -1106,16 +1004,7 @@ impl RefinePass {
                         None,
                     );
                 }
-                if gather + 1 < GATHERS {
-                    pass(
-                        "refine move",
-                        &self.moving,
-                        &binds.moving,
-                        &[&scratch.q.view],
-                        moved_area,
-                        None,
-                    );
-                } else {
+                if gather + 1 == GATHERS {
                     pass(
                         "refine apply",
                         &self.apply,
@@ -1285,15 +1174,14 @@ mod tests {
         assert_eq!(offset("grid_count"), offset_of!(RefineUniform, grid_count));
         assert_eq!(offset("tile_first"), offset_of!(RefineUniform, tile_first));
         assert_eq!(offset("tile_count"), offset_of!(RefineUniform, tile_count));
-        assert_eq!(offset("q_first"), offset_of!(RefineUniform, q_first));
         assert_eq!(offset("step"), offset_of!(RefineUniform, step));
         assert_eq!(offset("cells"), offset_of!(RefineUniform, cells));
         assert_eq!(offset("eps"), offset_of!(RefineUniform, eps));
         assert_eq!(offset("amount"), offset_of!(RefineUniform, amount));
         assert_eq!(offset("blocks"), offset_of!(RefineUniform, blocks));
         // The pad fills the shader struct to its 8 byte alignment.
-        assert_eq!(offset_of!(RefineUniform, pad), 76);
-        assert_eq!(members.len(), 12);
+        assert_eq!(offset_of!(RefineUniform, pad), 68);
+        assert_eq!(members.len(), 11);
     }
 
     /// The value of `const NAME: f32 = value;` in the shader.
@@ -1359,9 +1247,7 @@ mod tests {
         assert_eq!(twin::MASK_MOMENTS.div_ceil(4), 1);
         assert_eq!(twin::SOLVED.div_ceil(4), 4);
         assert_eq!(MOMENT_FORMAT.target_pixel_byte_cost(), Some(16));
-        assert_eq!(MOVED_FORMAT.target_pixel_byte_cost(), Some(4));
         assert_eq!(MOMENT_BYTES, 16);
-        assert_eq!(MOVED_BYTES, 4);
         assert_eq!(SOURCE_TARGETS, twin::SOURCE_MOMENTS.div_ceil(4));
         assert_eq!(SOLVED_TARGETS, twin::SOLVED.div_ceil(4));
         assert_eq!(FAR_TARGETS, 3);
@@ -1380,7 +1266,7 @@ mod tests {
         );
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].count, (640, 800));
-        let small = 512 * 512 * bytes_a_cell(plan.step);
+        let small = 512 * 512 * CELL_BYTES;
         assert_eq!(tile_side(&plan, small), 512);
         let tiles = self::tiles(&plan, (0, 0, 1280, 1600), tile_side(&plan, small));
         assert!(tiles.len() > 1);
@@ -1403,7 +1289,6 @@ mod tests {
         let uniform = tiles[0].uniform(&plan);
         assert_eq!(uniform.grid_count, [320, 400]);
         assert_eq!(uniform.tile_count, [320, 400]);
-        assert_eq!(uniform.q_first, [0, 0]);
         assert_eq!((uniform.step, uniform.cells), (4, 14));
         // A patch of the same render keeps the tile and works on the cells
         // it needs alone: the cells its pixels lie among, 49 to 62 across and
@@ -1417,26 +1302,6 @@ mod tests {
         assert_eq!((patch[0].first, patch[0].count), ((0, 0), (320, 400)));
         assert_eq!(plan.margin(), 44);
         assert_eq!(patch[0].work, (5, 30, 102, 100));
-        assert_eq!(patch[0].work_pixels(&plan), (20, 120, 408, 400));
-    }
-
-    #[test]
-    fn a_window_that_begins_inside_a_cell_places_q_on_its_first_pixel() {
-        let plan = plan(0.05, (6000, 4000), (1021, 513), (900, 700));
-        assert_eq!(plan.step, 4);
-        let tile = tiles(
-            &plan,
-            (0, 0, 900, 700),
-            tile_side(&plan, SCRATCH_BUDGET_BYTES),
-        )[0];
-        // The first cell, 255, begins at pixel 1020, before the render.
-        assert_eq!(tile.first, (255, 128));
-        assert_eq!(tile.q_first(&plan), (0, 0));
-        let tile = Tile {
-            first: (300, 140),
-            ..tile
-        };
-        assert_eq!(tile.q_first(&plan), (1200 - 1021, 560 - 513));
     }
 
     /// Every pixel of what is refined is written by exactly one tile, and a
@@ -1522,16 +1387,6 @@ mod tests {
                         );
                     }
                 }
-                // The q target holds the pixels of every cell worked on.
-                let q_first = tile.q_first(&plan);
-                let pixels = tile.work_pixels(&plan);
-                assert!(pixels.0 >= q_first.0 && pixels.1 >= q_first.1, "{tile:?}");
-                assert!(
-                    pixels.0 - q_first.0 + pixels.2 <= (tile.count.0 * plan.step).min(plan.size.0)
-                        && pixels.1 - q_first.1 + pixels.3
-                            <= (tile.count.1 * plan.step).min(plan.size.1),
-                    "{tile:?}"
-                );
             }
             assert!(written.iter().all(|count| *count == 1), "{plan:?}");
             println!(
@@ -1548,7 +1403,7 @@ mod tests {
         let plan = plan(0.05, (40_000, 30_000), (0, 0), (40_000, 30_000));
         assert_eq!((plan.step, plan.cells), (4, 355));
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
-        assert!(side > budget_side(SCRATCH_BUDGET_BYTES, plan.step));
+        assert!(side > budget_side(SCRATCH_BUDGET_BYTES));
         assert_eq!(side, plan.margin() * 2 + 64);
         let tiles = tiles(&plan, (0, 0, 4000, 3000), side);
         assert!(tiles.iter().all(|tile| tile.out.2 >= 4 && tile.out.3 >= 4));
@@ -1619,15 +1474,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_costs_the_scratch_its_eleven_float_targets_and_its_pixels_of_q() {
-        // 11 targets of 16 bytes, and step by step pixels of 4 bytes.
-        assert_eq!(bytes_a_cell(1), 180);
-        assert_eq!(bytes_a_cell(2), 192);
-        assert_eq!(bytes_a_cell(3), 212);
-        assert_eq!(bytes_a_cell(4), 240);
+    fn a_cell_costs_the_scratch_its_eleven_float_targets() {
+        // 11 targets of 16 bytes, at every step: `q` is never stored.
+        assert_eq!(CELL_BYTES, 176);
         assert_eq!(SCRATCH_BUDGET_BYTES, 402_653_184);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 4), 1295);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 1), 1495);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1512);
     }
 
     /// The window of timing_24mp.jpg at 100 percent at Radius 0.05: 2624 by
@@ -1640,7 +1491,7 @@ mod tests {
         assert_eq!(plan.grid(), ((240, 0), (1008, 1000)));
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
         assert_eq!(side, 1008);
-        assert!(1008 * 1000 * bytes_a_cell(plan.step) <= SCRATCH_BUDGET_BYTES);
+        const { assert!(1008 * 1000 * CELL_BYTES <= SCRATCH_BUDGET_BYTES) };
         // The product region a Refine slider refines, and the whole frame
         // an edge control refines.
         for over in [(702, 382, 2628, 3268), (0, 0, 4032, 4000)] {
@@ -1653,30 +1504,29 @@ mod tests {
     }
 
     /// An export of 6000 by 4000 pixels at Radius 0.05 is 1500 by 1000 cells
-    /// of 4 pixels, 360 MB of scratch under the budget of 384 MiB, and `q` of
-    /// 6000 by 4000 pixels under the texture limit: one tile, though a square
-    /// of the budget holds only 1295 cells a side.
+    /// of 4 pixels, 264 MB of scratch under the budget of 384 MiB, and
+    /// targets of 1500 by 1000 cells under the texture limit: one tile.
     #[test]
     fn a_24_megapixel_export_at_step_4_is_one_tile() {
         let plan = plan(0.05, (6000, 4000), (0, 0), (6000, 4000));
         assert_eq!((plan.step, plan.cells), (4, 53));
         assert_eq!(plan.grid(), ((0, 0), (1500, 1000)));
-        assert_eq!(1500 * 1000 * bytes_a_cell(plan.step), 360_000_000);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, plan.step), 1295);
+        assert_eq!(1500 * 1000 * CELL_BYTES, 264_000_000);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1512);
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
         assert_eq!(side, 1500);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
         assert_eq!(tiles.len(), 1);
         assert_eq!((tiles[0].first, tiles[0].count), ((0, 0), (1500, 1000)));
-        assert!(1500 * plan.step <= TEXTURE_SIDE_LIMIT);
+        const { assert!(1500 <= TEXTURE_SIDE_LIMIT) };
         // A budget under the grid's bytes still cuts it into tiles.
-        let under = 1500 * 1000 * bytes_a_cell(plan.step) - 1;
+        let under = 1500 * 1000 * CELL_BYTES - 1;
         assert_eq!(tile_side(&plan, under), 1224);
         assert!(self::tiles(&plan, (0, 0, 6000, 4000), 1224).len() > 1);
     }
 
-    /// The texture limit the one-tile rule keeps `q` under is the one a device
-    /// of default limits has.
+    /// The texture limit the one-tile rule keeps the targets of cells under
+    /// is the one a device of default limits has.
     #[test]
     fn the_texture_side_limit_is_the_default_device_limit() {
         assert_eq!(
@@ -1684,14 +1534,23 @@ mod tests {
             wgpu::Limits::default().max_texture_dimension_2d
         );
         assert_eq!(TEXTURE_SIDE_LIMIT, 8192);
-        // A grid whose `q` would pass the limit on one side is not one tile,
-        // though its cells fit the budget: 2100 cells of 4 pixels is 8400.
+        // A grid of 2100 by 500 cells of 4 pixels, 8400 pixels wide, fits
+        // the budget and the limit: one tile of the whole grid, though a
+        // square of the budget holds only 1512 cells a side.
         let plan = plan(0.05, (8400, 2000), (0, 0), (8400, 2000));
         assert_eq!(plan.step, 4);
         let (_, grid) = plan.grid();
         assert_eq!(grid, (2100, 500));
-        assert!(u64::from(grid.0 * grid.1) * bytes_a_cell(4) <= SCRATCH_BUDGET_BYTES);
-        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1295);
+        assert!(u64::from(grid.0 * grid.1) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
+        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 2100);
+        // A grid whose targets would pass the limit on one side is not one
+        // tile, though its cells fit the budget: 9000 cells of one pixel.
+        let plan = self::plan(0.0008, (9000, 200), (0, 0), (9000, 200));
+        assert_eq!(plan.step, 1);
+        let (_, grid) = plan.grid();
+        assert_eq!(grid, (9000, 200));
+        assert!(u64::from(grid.0 * grid.1) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
+        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1512);
     }
 
     /// An export of 6000 by 4000 pixels in cells of one pixel is 24 million
@@ -1702,8 +1561,8 @@ mod tests {
         assert_eq!((plan.step, plan.cells), (1, 5));
         assert_eq!(plan.grid(), ((0, 0), (6000, 4000)));
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
-        assert_eq!(side, 1495);
-        assert!(u64::from(side * side) * bytes_a_cell(plan.step) <= SCRATCH_BUDGET_BYTES);
+        assert_eq!(side, 1512);
+        assert!(u64::from(side * side) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
         assert!(tiles.len() > 1);
         assert!(
@@ -1714,19 +1573,15 @@ mod tests {
         println!("a step 1 export: {} tiles of {side} cells", tiles.len());
     }
 
-    /// The `q` target of a tile the budget holds is its side in cells times
-    /// the step in pixels, under the largest texture a device of default
-    /// limits makes, which is what the headless device asks for.
+    /// The targets of cells of a tile the budget holds are its side in cells,
+    /// under the largest texture a device of default limits makes, which is
+    /// what the headless device asks for.
     #[test]
-    fn the_one_tile_side_times_the_step_stays_under_the_texture_limit() {
+    fn the_side_of_a_tile_the_budget_holds_stays_under_the_texture_limit() {
         let limit = wgpu::Limits::default().max_texture_dimension_2d;
         assert_eq!(limit, 8192);
-        for step in 1..=4 {
-            let side = budget_side(SCRATCH_BUDGET_BYTES, step);
-            assert!(side * step < limit, "step {step}: {side} cells");
-        }
+        assert!(budget_side(SCRATCH_BUDGET_BYTES) < limit);
         let plan = plan(0.05, (6000, 4000), (960, 0), (4032, 4000));
-        assert!(tile_side(&plan, SCRATCH_BUDGET_BYTES) * plan.step < limit);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES, 4) * 4, 5180);
+        assert!(tile_side(&plan, SCRATCH_BUDGET_BYTES) < limit);
     }
 }

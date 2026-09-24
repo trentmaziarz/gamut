@@ -2781,13 +2781,13 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     develop.set_source(&photo);
     // The alphas drawn, the refined alphas drawn, and how many times the
     // moments of the source were taken. A refine of the 64 pixel photo is
-    // one tile: 15 passes with the solve in one pass of four targets, 18
+    // one tile: 13 passes with the solve in one pass of four targets, 16
     // with it in two passes of two, and 5 more when it takes the moments of
     // the source in one pass of three targets, 6 with them in two passes.
     let (refine, source) = if develop.refine_fused() {
-        (15, 5)
+        (13, 5)
     } else {
-        (18, 6)
+        (16, 6)
     };
     let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, u64) {
         develop
@@ -2970,8 +2970,8 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
 /// A scratch budget under the bytes of the grid of cells cuts a refine into
 /// tiles, and the tiles draw byte for byte what one tile draws. On the 1101
 /// by 90 photo of the test above, the grid is 551 by 45 cells of two pixels
-/// at a radius of 0.015 (24,795 cells of 192 bytes) and 276 by 23 cells of
-/// four at 0.03 (6,348 cells of 240 bytes), each with a margin of 20 cells.
+/// at a radius of 0.015 (24,795 cells of 176 bytes) and 276 by 23 cells of
+/// four at 0.03 (6,348 cells of 176 bytes), each with a margin of 20 cells.
 /// A budget of 157 by 157 cells at a step of 2 gives tiles of 157 cells a
 /// side, which write 228 pixels a row. One of 79 by 79 cells at a step of 4
 /// gives tiles of 104 cells, the floor of two margins and 64, which write
@@ -2994,7 +2994,7 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     // The radius, the step, the cells a side of the budget, the bytes of a
     // cell, and the side of a tile.
     for (radius, step, budget_side, cell_bytes, side) in
-        [(0.015, 2, 157u64, 192u64, 157u32), (0.03, 4, 79, 240, 104)]
+        [(0.015, 2, 157u64, 176u64, 157u32), (0.03, 4, 79, 176, 104)]
     {
         let plan = Plan::for_geometry(
             &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
@@ -3086,12 +3086,13 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
 /// others. Each render matches the twin and is set beside the same render
 /// with every box summed in the direct loop.
 ///
-/// A refine of one tile is 18 passes, and 6 more when it takes the moments
-/// of the source; with blocks, each of the 6 boxes of the three gathers and
-/// of the 4 boxes of the source has a block pass before it. Of the two masks
-/// here the first takes the moments of the source and the second holds
-/// them: 34 and 24 passes, 58 in all, against 24 and 18, 42, in the direct
-/// loop.
+/// A refine of one tile is 13 passes, and 5 more when it takes the moments
+/// of the source (16 and 6 with the solve and the source each drawn in two
+/// passes); with blocks, each of the 6 boxes of the three gathers and of the
+/// 4 boxes of the source has a block pass before it. Of the two masks here
+/// the first takes the moments of the source and the second holds them: 28
+/// and 19 passes, 47 in all, against 18 and 13, 31, in the direct loop (32
+/// and 22, 54, against 22 and 16, 38, in two passes each).
 #[test]
 fn a_refined_mask_whose_box_spans_blocks_matches() {
     let _turn = ONE_AT_A_TIME
@@ -3186,11 +3187,11 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         println!(
             "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop, the source and the solve fused {fused}; the twin moves {moved} pixels"
         );
-        // A refine without blocks: 15 passes with the solve in one pass of
-        // four targets, 18 with it in two passes of two. The moments of the
+        // A refine without blocks: 13 passes with the solve in one pass of
+        // four targets, 16 with it in two passes of two. The moments of the
         // source without blocks: 5 passes with them in one pass of three
         // targets, 6 with them in a pass of two and a pass of one.
-        let (refine, source) = if fused { (15, 5) } else { (18, 6) };
+        let (refine, source) = if fused { (13, 5) } else { (16, 6) };
         if blocks > 0 {
             assert_eq!(
                 passes,

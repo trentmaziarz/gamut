@@ -10,16 +10,16 @@
 // over a box, solves the one direction of colour that best tells the two
 // classes apart, and moves every pixel of the mask AS DRAWN by where its
 // colour lies along that direction. It gathers three times: the first gather
-// weighs the classes by p and each later one by the q the gather before
-// wrote, which is only ever a weight.
+// weighs the classes by p and each later one by q, the mask moved by what the
+// gather before solved, which is only ever a weight.
 //
 // The moments are taken on a grid of cells that lies on the pixel grid of the
 // whole picture at the scale of the render. They live in 32 bit float
 // targets: they are differences of near-equal numbers, and a half float would
 // lose them. The targets hold one tile of the grid at a time, so their size
 // does not grow with the render; texel (0, 0) is the cell `tile_first`. The q
-// between two gathers is a 32 bit float too, so no store rounds it; its texel
-// (0, 0) is the pixel `q_first` of the render.
+// of a later gather is never stored: the gather moves each pixel it sums from
+// what the gather before solved, so no store rounds it.
 //
 // The passes of one tile, in order:
 //   once a source and radius (kept while neither changes)
@@ -30,16 +30,18 @@
 //     fs_box_h2, fs_box_h1        their means over the box, across
 //     fs_box_v2, fs_box_v1        and down
 //   each of the three gathers
-//     fs_gather_first / fs_gather the means of q and q I over each cell (and
-//                                 of p and p p, with the first)
+//     fs_gather_first             the means of q and q I over each cell, and
+//       / fs_gather_moved         of p and p p, with the first; a later
+//                                 gather moves each pixel into q as it sums
 //     fs_box_h2 / fs_box_h1       their means over the box, across
 //     fs_box_v2 / fs_box_v1       and down
 //     fs_solve                    the 15 numbers of each cell, in four
 //                                 targets; fs_solve_a, fs_solve_b in two
 //                                 passes of two on a device that draws
 //                                 into 32 bytes a sample
-//     fs_move / fs_apply          q at full resolution; the last gather mixes
-//                                 it into p by amount and stores the alpha
+//   after the last gather
+//     fs_apply                    q at full resolution, mixed into p by
+//                                 amount: the refined alpha
 //
 // A box of BLOCK_TAPS cells or more (2 cells + 1, from a radius of 12
 // cells) is drawn in two passes: fs_block_h2, fs_block_v2, fs_block_h1 or
@@ -60,8 +62,6 @@ struct Uniform {
     // the tile they hold.
     tile_first: vec2<u32>,
     tile_count: vec2<u32>,
-    // The pixel of the render texel (0, 0) of the q target holds.
-    q_first: vec2<u32>,
     // The side of a cell in pixels and the radius of the box in cells.
     step: u32,
     cells: u32,
@@ -76,7 +76,7 @@ struct Uniform {
 @group(0) @binding(0) var<uniform> u: Uniform;
 @group(0) @binding(1) var working: texture_2d<f32>;
 @group(0) @binding(2) var alpha: texture_2d<f32>;
-@group(0) @binding(3) var moved_before: texture_2d<f32>;
+// Binding 3 is read by no pass; every group binds the alpha there.
 @group(0) @binding(4) var tex_a: texture_2d<f32>;
 @group(0) @binding(5) var tex_b: texture_2d<f32>;
 @group(0) @binding(6) var tex_c: texture_2d<f32>;
@@ -266,16 +266,18 @@ fn fs_gather_first(in: VertexOutput) -> Pair {
     return out;
 }
 
-// A later gather weighs them by the q the gather before wrote: (q, q I).
+// A later gather weighs them by q, the mask moved at each pixel by what the
+// gather before solved, `tex_a` to `tex_d`: (q, q I). q is taken here and
+// never stored.
 @fragment
-fn fs_gather(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_gather_moved(in: VertexOutput) -> @location(0) vec4<f32> {
     let span = cell_span(vec2<u32>(in.position.xy));
     var q = 0.0;
     var qi = vec3<f32>(0.0);
     for (var y = span.low.y; y < span.high.y; y = y + 1u) {
         for (var x = span.low.x; x < span.high.x; x = x + 1u) {
             let at = vec2<i32>(i32(x), i32(y));
-            let a = textureLoad(moved_before, at - vec2<i32>(u.q_first), 0).r;
+            let a = moved(vec2<u32>(at)).y;
             let g = acescct_encode(textureLoad(working, at, 0).rgb);
             q = q + a;
             qi = qi + g * a;
@@ -633,13 +635,6 @@ fn moved(pixel: vec2<u32>) -> vec2<f32> {
     let out = on_line * (1.0 - smooth_between(est, OUT_LOW, OUT_HIGH));
     let into = on_line * smooth_between(est, IN_LOW, IN_HIGH);
     return vec2<f32>(p, p + d2_c_p.y * (into * (1.0 - p) - out * p));
-}
-
-// The q of a gather before the last, into the q target.
-@fragment
-fn fs_move(in: VertexOutput) -> @location(0) vec4<f32> {
-    let q = moved(vec2<u32>(in.position.xy) + u.q_first).y;
-    return vec4<f32>(q, 0.0, 0.0, 1.0);
 }
 
 // The q of the last gather, mixed into p by amount: the refined alpha.
