@@ -31,7 +31,10 @@
 //                                 of p and p p, with the first)
 //     fs_box_h2 / fs_box_h1       their means over the box, across
 //     fs_box_v2 / fs_box_v1       and down
-//     fs_solve_a, fs_solve_b      the 15 numbers of each cell
+//     fs_solve                    the 15 numbers of each cell, in four
+//                                 targets; fs_solve_a, fs_solve_b in two
+//                                 passes of two on a device that draws
+//                                 into 32 bytes a sample
 //     fs_move / fs_apply          q at full resolution; the last gather mixes
 //                                 it into p by amount and stores the alpha
 //
@@ -155,6 +158,15 @@ fn span_count(span: Span) -> f32 {
 struct Pair {
     @location(0) one: vec4<f32>,
     @location(1) two: vec4<f32>,
+}
+
+// The four targets of the fused solve, on a device that draws into 64 bytes
+// a sample.
+struct Four {
+    @location(0) one: vec4<f32>,
+    @location(1) two: vec4<f32>,
+    @location(2) three: vec4<f32>,
+    @location(3) four: vec4<f32>,
 }
 
 // The 9 sums of the source in one cell, in the order of refine.rs: I, then
@@ -512,6 +524,22 @@ fn solve(at: vec2<i32>) -> Solved {
     return out;
 }
 
+// The 15 numbers of each cell in one pass of four targets, on a device that
+// draws into 64 bytes a sample: the targets of fs_solve_a, then those of
+// fs_solve_b, from one call of solve.
+@fragment
+fn fs_solve(in: VertexOutput) -> Four {
+    let solved = solve(vec2<i32>(in.position.xy));
+    var out: Four;
+    out.one = solved.a_s;
+    out.two = solved.d2_c_p;
+    out.three = solved.p;
+    out.four = solved.mid;
+    return out;
+}
+
+// The same 15 numbers in two passes of two targets, on a device that draws
+// into 32 bytes a sample.
 @fragment
 fn fs_solve_a(in: VertexOutput) -> Pair {
     let solved = solve(vec2<i32>(in.position.xy));

@@ -19,6 +19,26 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     adapter.features() & P010_FEATURE
 }
 
+/// The most bytes a sample Gamut asks a device to draw into: four
+/// Rgba32Float targets, the fused solve of Refine edges.
+pub const WANTED_COLOR_ATTACHMENT_BYTES: u32 = 64;
+
+/// The limits Gamut asks a device for: `base`, with the bytes a sample a
+/// pass draws into raised to what the adapter offers, up to
+/// [`WANTED_COLOR_ATTACHMENT_BYTES`]. No limit of `base` is lowered.
+pub fn wanted_limits(adapter: &wgpu::Adapter, base: wgpu::Limits) -> wgpu::Limits {
+    let offered = adapter
+        .limits()
+        .max_color_attachment_bytes_per_sample
+        .min(WANTED_COLOR_ATTACHMENT_BYTES);
+    wgpu::Limits {
+        max_color_attachment_bytes_per_sample: base
+            .max_color_attachment_bytes_per_sample
+            .max(offered),
+        ..base
+    }
+}
+
 /// The luma and chroma formats of a plane format.
 pub fn texture_formats(format: PlaneFormat) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
     match format {
@@ -186,5 +206,41 @@ impl VideoSource {
     /// frame.
     pub fn uniform(&self, window: [f32; 4]) -> VideoUniform {
         VideoUniform::new(self.format, self.colour, self.rotation, window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headless::Headless;
+
+    #[test]
+    fn the_wanted_limits_lie_between_the_base_and_the_adapter() {
+        let Some(gpu) = Headless::new() else {
+            println!("no adapter, skipped");
+            return;
+        };
+        let offered = gpu.adapter.limits();
+        let base = wgpu::Limits::default();
+        let wanted = wanted_limits(&gpu.adapter, base.clone());
+        println!(
+            "adapter: {}; max_color_attachment_bytes_per_sample: adapter {}, base {}, wanted {}, device {}",
+            gpu.describe(),
+            offered.max_color_attachment_bytes_per_sample,
+            base.max_color_attachment_bytes_per_sample,
+            wanted.max_color_attachment_bytes_per_sample,
+            gpu.device.limits().max_color_attachment_bytes_per_sample,
+        );
+        assert!(
+            wanted.check_limits(&offered),
+            "no wanted limit above the adapter's"
+        );
+        assert!(base.check_limits(&wanted), "no wanted limit below the base");
+        assert!(wanted.max_color_attachment_bytes_per_sample <= WANTED_COLOR_ATTACHMENT_BYTES);
+        assert_eq!(
+            gpu.device.limits().max_color_attachment_bytes_per_sample,
+            wanted.max_color_attachment_bytes_per_sample,
+            "the headless device asks for the wanted limits"
+        );
     }
 }

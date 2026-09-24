@@ -27,6 +27,7 @@ impl Headless {
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("Gamut headless device"),
             required_features: crate::video::wanted_features(&adapter),
+            required_limits: crate::video::wanted_limits(&adapter, wgpu::Limits::default()),
             ..Default::default()
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).ok()?;

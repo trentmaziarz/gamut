@@ -2781,8 +2781,10 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     develop.set_source(&photo);
     // The alphas drawn, the refined alphas drawn, and how many times the
     // moments of the source were taken. A refine of the 64 pixel photo is
-    // one tile: 18 passes, and 6 more when it takes the moments of the
-    // source.
+    // one tile: 15 passes with the solve in one pass of four targets, 18
+    // with it in two passes of two, and 6 more when it takes the moments of
+    // the source.
+    let refine = if develop.refine_solve_fused() { 15 } else { 18 };
     let builds_after = |develop: &mut Develop, edit: &PhotoEdit| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
@@ -2795,8 +2797,8 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         );
         assert_eq!(
             u64::from(develop.refine_passes()),
-            18 * refines + 6 * sources,
-            "18 passes a refine and 6 a source"
+            refine * refines + 6 * sources,
+            "{refine} passes a refine and 6 a source"
         );
         (develop.mask_alpha_builds(), refines, sources)
     };
@@ -2881,7 +2883,7 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     assert_eq!(develop.refine_builds().1, 0, "never a part");
     assert_eq!(
         (develop.refine_passes(), develop.refine_tiles()),
-        (7 * 18 + 3 * 6, 7),
+        (7 * refine as u32 + 3 * 6, 7),
         "seven refines of one tile, three of them with the moments of the source"
     );
 }
@@ -3155,7 +3157,7 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         // A graph of its own for each render, so its counters read that
         // render alone: the passes, the refines and the moments of the
         // source taken.
-        let render = |direct: bool| -> (Vec<u8>, u32, u64, u64) {
+        let render = |direct: bool| -> (Vec<u8>, u32, u64, u64, bool) {
             let mut develop = Develop::new(&gpu.device, &gpu.queue).with_refine_direct_box(direct);
             develop.set_source(&photo);
             let view = develop
@@ -3167,24 +3169,28 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
                 develop.refine_passes(),
                 develop.refine_builds().0,
                 develop.refine_source_builds(),
+                develop.refine_solve_fused(),
             )
         };
-        let (summed, passes, refines, sources) = render(false);
-        let (direct, direct_passes, direct_refines, direct_sources) = render(true);
+        let (summed, passes, refines, sources, fused) = render(false);
+        let (direct, direct_passes, direct_refines, direct_sources, _) = render(true);
         assert_eq!(
             (refines, sources, direct_refines, direct_sources),
             (2, 1, 2, 1),
             "{name}: two refines of one tile, the moments of the source taken once"
         );
         println!(
-            "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop; the twin moves {moved} pixels"
+            "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop, the solve fused {fused}; the twin moves {moved} pixels"
         );
+        // A refine without blocks: 15 passes with the solve in one pass of
+        // four targets, 18 with it in two passes of two.
+        let refine = if fused { 15 } else { 18 };
         if blocks > 0 {
-            assert_eq!(passes, (18 + 6) * 2 + (6 + 4), "{name}: with blocks");
+            assert_eq!(passes, (refine + 6) * 2 + (6 + 4), "{name}: with blocks");
         } else {
-            assert_eq!(passes, 18 * 2 + 6, "{name}: no block pass");
+            assert_eq!(passes, refine * 2 + 6, "{name}: no block pass");
         }
-        assert_eq!(direct_passes, 18 * 2 + 6, "{name}: in the direct loop");
+        assert_eq!(direct_passes, refine * 2 + 6, "{name}: in the direct loop");
         assert_eq!(summed.len(), direct.len());
         let largest = summed
             .iter()

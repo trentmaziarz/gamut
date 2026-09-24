@@ -63,13 +63,16 @@ pub fn window_icon() -> egui::IconData {
 }
 
 /// The eframe options: the wgpu renderer, the title, the icon, the launch
-/// size and the device features the video planes need.
+/// size, the device features the video planes need and the limits the
+/// fused solve of Refine edges needs.
 pub fn native_options() -> eframe::NativeOptions {
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     let base = setup.device_descriptor.clone();
     setup.device_descriptor = Arc::new(move |adapter| {
         let mut descriptor = base(adapter);
         descriptor.required_features |= gamut_gpu::video::wanted_features(adapter);
+        descriptor.required_limits =
+            gamut_gpu::video::wanted_limits(adapter, descriptor.required_limits);
         descriptor
     });
     eframe::NativeOptions {

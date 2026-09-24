@@ -10,28 +10,37 @@
 //! of bytes, so their size is bounded whatever the render: a grid the budget
 //! holds is one tile, and a larger render is refined a tile after another. A
 //! default device draws into at most 32 bytes a sample, which is two of them
-//! a pass.
+//! a pass; Gamut asks the adapter for up to 64
+//! ([`crate::video::wanted_limits`]), which is four.
 //!
-//! A tile is drawn in 24 passes. Six take the moments of the source and
+//! A tile is drawn in 21 passes. Six take the moments of the source and
 //! their box means; they depend on no mask and no gather, so they are kept
 //! while the source, the radius and the tile stay the same, and a tile then
-//! costs 18. They are taken over the cells the gathers work over, joined
+//! costs 15. They are taken over the cells the gathers work over, joined
 //! with the cells already held, so a refine over cells they cover draws
-//! none, and a refine of a small mask on a large grid draws few. Each of the three gathers takes six: the moments of `q` over the
-//! cells, their box means across and down, the solve in two passes of two
-//! targets, and the move at full resolution. The move of the last gather
-//! writes the r8unorm refined alpha; the two before it write `q` into a 32
-//! bit single channel target, so no store rounds it between gathers.
+//! none, and a refine of a small mask on a large grid draws few. Each of the
+//! three gathers takes five: the moments of `q` over the cells, their box
+//! means across and down, the solve in one pass of four targets, and the
+//! move at full resolution. The move of the last gather writes the r8unorm
+//! refined alpha; the two before it write `q` into a 32 bit single channel
+//! target, so no store rounds it between gathers.
+//!
+//! A device that draws into no more than 32 bytes a sample, such as one made
+//! with wgpu's default limits, draws the solve in two passes of two targets:
+//! a gather takes six, and a tile 24, or 18 with the moments of the source
+//! held. The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both offer 128
+//! bytes, so both draw the fused solve.
 //!
 //! A box of [`BLOCK_TAPS`] cells or more (a radius of 12 cells or more)
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 34 passes, and 24 with the moments of the source held.
-//! A box keeps its cells, each held at the edges as before; only the order of
-//! the sum changes. A smaller box sums every cell in the direct loop, which
-//! measured no slower (see [`BLOCK_TAPS`]): a block pass is a pass of its
-//! own, and a box of few cells does not win it back.
+//! ten block passes: 31 passes, and 21 with the moments of the source held
+//! (34 and 24 with the solve in two passes). A box keeps its cells, each held
+//! at the edges as before; only the order of the sum changes. A smaller box
+//! sums every cell in the direct loop, which measured no slower (see
+//! [`BLOCK_TAPS`]): a block pass is a pass of its own, and a box of few cells
+//! does not win it back.
 
 use bytemuck::{Pod, Zeroable};
 use gamut_color::refine::{GATHERS, Plan};
@@ -483,8 +492,12 @@ pub(crate) struct RefinePass {
     block_v2: wgpu::RenderPipeline,
     block_h1: wgpu::RenderPipeline,
     block_v1: wgpu::RenderPipeline,
-    solve_a: wgpu::RenderPipeline,
-    solve_b: wgpu::RenderPipeline,
+    /// The solve in one pass of four targets, on a device that draws into
+    /// 64 bytes a sample; `None` on one that draws into less.
+    solve: Option<wgpu::RenderPipeline>,
+    /// The solve in two passes of two targets, when there is no `solve`.
+    solve_a: Option<wgpu::RenderPipeline>,
+    solve_b: Option<wgpu::RenderPipeline>,
     moving: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     /// The distance between two tiles in the uniform buffer.
@@ -585,6 +598,10 @@ impl RefinePass {
         };
         let pair = [MOMENT_FORMAT; 2];
         let one = [MOMENT_FORMAT];
+        // The fused solve draws into every solved target at once.
+        let fused = u64::from(device.limits().max_color_attachment_bytes_per_sample)
+            >= SOLVED_TARGETS as u64 * MOMENT_BYTES;
+        let split = |fragment: &str| (!fused).then(|| pipeline(fragment, &pair));
         let alignment = device.limits().min_uniform_buffer_offset_alignment.max(1);
         RefinePass {
             source_a: pipeline("fs_source_a", &pair),
@@ -599,8 +616,9 @@ impl RefinePass {
             block_v2: pipeline("fs_block_v2", &pair),
             block_h1: pipeline("fs_block_h1", &one),
             block_v1: pipeline("fs_block_v1", &one),
-            solve_a: pipeline("fs_solve_a", &pair),
-            solve_b: pipeline("fs_solve_b", &pair),
+            solve: fused.then(|| pipeline("fs_solve", &[MOMENT_FORMAT; SOLVED_TARGETS])),
+            solve_a: split("fs_solve_a"),
+            solve_b: split("fs_solve_b"),
             moving: pipeline("fs_move", &[MOVED_FORMAT]),
             apply: pipeline("fs_apply", &[alpha_format]),
             layout,
@@ -612,6 +630,12 @@ impl RefinePass {
             refine_tiles: 0,
             direct_box: false,
         }
+    }
+
+    /// Whether the solve is drawn in one pass of four targets, on a device
+    /// that draws into 64 bytes a sample, rather than in two of two.
+    pub(crate) fn solve_fused(&self) -> bool {
+        self.solve.is_some()
     }
 
     /// The same pass family with a scratch of at most `bytes`, so a test can
@@ -1032,22 +1056,33 @@ impl RefinePass {
                         Block::down("refine gather v1 block", &self.block_v1, &binds.block_cells),
                     );
                 }
-                pass(
-                    "refine solve a",
-                    &self.solve_a,
-                    &binds.solve,
-                    &pair(&v[0], &v[1]),
-                    work,
-                    None,
-                );
-                pass(
-                    "refine solve b",
-                    &self.solve_b,
-                    &binds.solve,
-                    &pair(&v[2], &v[3]),
-                    work,
-                    None,
-                );
+                if let Some(solve) = &self.solve {
+                    pass(
+                        "refine solve",
+                        solve,
+                        &binds.solve,
+                        &[&v[0].view, &v[1].view, &v[2].view, &v[3].view],
+                        work,
+                        None,
+                    );
+                } else {
+                    pass(
+                        "refine solve a",
+                        self.solve_a.as_ref().expect("made without a fused solve"),
+                        &binds.solve,
+                        &pair(&v[0], &v[1]),
+                        work,
+                        None,
+                    );
+                    pass(
+                        "refine solve b",
+                        self.solve_b.as_ref().expect("made without a fused solve"),
+                        &binds.solve,
+                        &pair(&v[2], &v[3]),
+                        work,
+                        None,
+                    );
+                }
                 if gather + 1 < GATHERS {
                     pass(
                         "refine move",
