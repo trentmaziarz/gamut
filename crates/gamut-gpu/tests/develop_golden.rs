@@ -3069,20 +3069,23 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     }
 }
 
-/// A box of 8 cells or more adds the sums of 8 cells a block pass wrote, and
-/// the cells left over. At Radius 0.05 a photo 1024 pixels wide has cells of
-/// 4 pixels and a box of 9 cells either side, 19 cells: 2 blocks and 3
-/// cells. One 2048 pixels wide has a box of 18, 37 cells: 4 blocks and 5. At
-/// 160 rows the grid is 40 cells down, so a box down is held at the edges of
-/// the grid in some cells and at neither edge in others. Each render matches
-/// the twin and is set beside the same render with every box summed in the
-/// direct loop.
+/// A box of 24 cells or more adds the sums of 8 cells a block pass wrote,
+/// and the cells left over. At Radius 0.05 a photo 1344 pixels wide has
+/// cells of 4 pixels and a box of 12 cells either side, 25 cells: 3 blocks
+/// and 1 cell. One 2048 pixels wide has a box of 18, 37 cells: 4 blocks and
+/// 5. One 1024 pixels wide has a box of 9, 19 cells, under 24: it sums every
+/// cell in the direct loop, draws no block pass, and gives the direct loop's
+/// render byte for byte. At 160 rows the grid is 40 cells down, so a box down
+/// is held at the edges of the grid in some cells and at neither edge in
+/// others. Each render matches the twin and is set beside the same render
+/// with every box summed in the direct loop.
 ///
 /// A refine of one tile is 18 passes, and 6 more when it takes the moments
-/// of the source; each of the 6 boxes of the three gathers and of the 4
-/// boxes of the source has a block pass before it. Of the two masks here the
-/// first takes the moments of the source and the second holds them: 34 and
-/// 24 passes, 58 in all, against 24 and 18, 42, in the direct loop.
+/// of the source; with blocks, each of the 6 boxes of the three gathers and
+/// of the 4 boxes of the source has a block pass before it. Of the two masks
+/// here the first takes the moments of the source and the second holds
+/// them: 34 and 24 passes, 58 in all, against 24 and 18, 42, in the direct
+/// loop.
 #[test]
 fn a_refined_mask_whose_box_spans_blocks_matches() {
     let _turn = ONE_AT_A_TIME
@@ -3097,7 +3100,8 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
     // The width, the box in cells either side, its blocks and the cells left
     // over, and the block edge the masks lie over.
     for (width, cells, blocks, singles, edge) in [
-        (1024u32, 9u32, 2u32, 3u32, 576f32),
+        (1024u32, 9u32, 0u32, 19u32, 576f32),
+        (1344, 12, 3, 1, 768.0),
         (2048, 18, 4, 5, 1152.0),
     ] {
         let photo = blocky_photo(width, 160);
@@ -3108,8 +3112,13 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         );
         assert_eq!((plan.step, plan.cells), (4, cells));
         assert_eq!(plan.grid().1, (width / 4, 40));
+        let taps = 2 * cells + 1;
         assert_eq!(
-            ((2 * cells + 1) / 8, (2 * cells + 1) % 8),
+            if taps < 24 {
+                (0, taps)
+            } else {
+                (taps / 8, taps % 8)
+            },
             (blocks, singles)
         );
         let w = width as f32;
@@ -3133,10 +3142,15 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
             refined_at(exposure_mask("Radial", radial), 100.0, 0.05, 50.0),
             refined_at(exposure_mask("Brush", brush), 100.0, 0.05, 60.0),
         ]);
-        let name = format!(
-            "refined masks on a photo {width} pixels wide, a box of {} cells in {blocks} blocks and {singles} cells",
-            2 * cells + 1
-        );
+        let name = if blocks > 0 {
+            format!(
+                "refined masks on a photo {width} pixels wide, a box of {taps} cells in {blocks} blocks and {singles} cells"
+            )
+        } else {
+            format!(
+                "refined masks on a photo {width} pixels wide, a box of {taps} cells in the direct loop"
+            )
+        };
         let moved = assert_the_refine_shows(&photo, &edit);
         // A graph of its own for each render, so its counters read that
         // render alone: the passes, the refines and the moments of the
@@ -3165,7 +3179,11 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         println!(
             "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop; the twin moves {moved} pixels"
         );
-        assert_eq!(passes, (18 + 6) * 2 + (6 + 4), "{name}: with blocks");
+        if blocks > 0 {
+            assert_eq!(passes, (18 + 6) * 2 + (6 + 4), "{name}: with blocks");
+        } else {
+            assert_eq!(passes, 18 * 2 + 6, "{name}: no block pass");
+        }
         assert_eq!(direct_passes, 18 * 2 + 6, "{name}: in the direct loop");
         assert_eq!(summed.len(), direct.len());
         let largest = summed
@@ -3179,6 +3197,18 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
             "{name}: the blocks against the direct loop: largest byte difference {largest}, {differing} of {} bytes differ",
             summed.len()
         );
+        // The block sums move each box sum by about 1e-7 relative, which
+        // moves an output byte by 1 at most.
+        assert!(
+            largest <= 1,
+            "{name}: the blocks differ from the direct loop by {largest} in a byte, over 1"
+        );
+        if blocks == 0 {
+            assert_eq!(
+                differing, 0,
+                "{name}: a box under 24 cells draws the direct loop"
+            );
+        }
         let pixels: Vec<[u8; 3]> = summed
             .as_chunks::<4>()
             .0

@@ -33,14 +33,21 @@
 //! costs, built once, and what stamping the whole auto layer over the padded
 //! window costs are printed for the record.
 //!
+//! Refine edges at 100 on two of the six masks follows. A step of each
+//! Refine edges slider at 100 percent, Amount, Radius and Sensitivity at
+//! Radius 0.05 and at 0.01, the mask refined whole each time, is held to the
+//! gate. The whole refine of one mask with the moments of the source held
+//! and taken again is printed for the record.
+//!
 //! The edge controls come last: Shift edge -1 percent, Feather 1 percent and
 //! Contrast 50 on the two refined masks. A develop slider step, a Shift edge,
 //! a Feather and a Contrast slider step at the viewer size and at 100
 //! percent, and painting an auto stroke with a pen into such a mask at 100
-//! and at 400 percent, are held to the gate. What the shift passes alone and
-//! the feather passes alone cost over the padded window at 100 percent at 1
-//! and at 5 percent, and a Shift edge and a Feather slider step at 100
-//! percent at 5 percent, are printed for the record.
+//! and at 400 percent, are held to the gate. A Shift edge, a Feather and a
+//! Contrast slider step at 100 percent with the three at 5 percent are held
+//! to the gate too. What the shift passes alone and the feather passes alone
+//! cost over the padded window at 100 percent at 1 and at 5 percent is
+//! printed for the record.
 
 use std::time::Instant;
 
@@ -1175,6 +1182,9 @@ fn develop_at_viewer_size_is_fast_enough() {
         );
     }
     let mut refined_view_p95 = None;
+    // The p95 of each Refine edges slider step at 100 percent, with its
+    // slider and its radius.
+    let mut refine_step_p95: Vec<(&str, f32, f64)> = Vec::new();
     if info.device_type == wgpu::DeviceType::Cpu {
         println!("zoomed refine lines skipped on a CPU adapter");
     } else {
@@ -1219,8 +1229,8 @@ fn develop_at_viewer_size_is_fast_enough() {
             );
         }
         // A step of each Refine edges slider at 100 percent, the mask refined
-        // whole each time, at each end of the radius; printed, not asserted
-        // yet. Each Radius pair keeps the pad of the window.
+        // whole each time, at each end of the radius, held to the gate. Each
+        // Radius pair keeps the pad of the window.
         for (radius, other) in [(0.05, 0.049), (0.01, 0.011)] {
             let mut one = gated.clone();
             one.masks[AUTO_BRUSH].refine = Refine {
@@ -1254,8 +1264,9 @@ fn develop_at_viewer_size_is_fast_enough() {
                 let tiles_a_refine =
                     f64::from(develop.refine_tiles() - tiles) / refines.max(1) as f64;
                 println!(
-                    "Refine edges {slider} slider step at 100 percent, Radius {radius}, the mask refined whole each time, {RENDERS} renders (not asserted): p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; refine_tiles {tiles_a_refine:.2} a refine over {refines} refines"
+                    "Refine edges {slider} slider step at 100 percent, Radius {radius}, the mask refined whole each time, {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; refine_tiles {tiles_a_refine:.2} a refine over {refines} refines"
                 );
+                refine_step_p95.push((slider, radius, p95));
             }
         }
         let pen = Stroke {
@@ -1320,6 +1331,7 @@ fn develop_at_viewer_size_is_fast_enough() {
         println!("edge lines at the viewer size skipped on a CPU adapter");
     }
     let mut edged_view_p95 = None;
+    let mut wide_view_p95 = None;
     if info.device_type == wgpu::DeviceType::Cpu {
         println!("zoomed edge lines skipped on a CPU adapter");
     } else {
@@ -1380,8 +1392,9 @@ fn develop_at_viewer_size_is_fast_enough() {
         let (deep, _) = zoomed_view(full, 4);
         let deep_p95 = paint(&deep, "400");
 
-        // For the record: each control's passes alone, and a Shift edge and a
-        // Feather slider step with the three at 5 percent.
+        // For the record: each control's passes alone. Then a Shift edge, a
+        // Feather and a Contrast slider step with the three at 5 percent, held
+        // to the gate.
         edge_passes_alone(&gpu, &mut develop, &refined, &actual, &EDGED);
         edge_passes_alone(&gpu, &mut develop, &refined, &actual, &EDGED_WIDE);
         let wide = with_edged_masks(&refined, EDGED_WIDE.edge);
@@ -1389,15 +1402,15 @@ fn develop_at_viewer_size_is_fast_enough() {
         println!(
             "first render of the padded window at 100 percent with the three edge controls at 5 percent on the two refined masks: {first:.2} ms"
         );
-        edge_slider_steps(
+        wide_view_p95 = Some(edge_slider_steps(
             &gpu,
             &mut develop,
             &wide,
             Some(&actual),
             &EDGED_WIDE,
             "at 100 percent",
-            false,
-        );
+            true,
+        ));
         edged_view_p95 = Some([
             step_p95,
             shift_p95,
@@ -1449,6 +1462,24 @@ fn develop_at_viewer_size_is_fast_enough() {
                     "p95 of {what}, {p95:.2} ms, is not under {GATE_MS} ms"
                 );
             }
+        }
+        if let Some([shift_p95, feather_p95, contrast_p95]) = wide_view_p95 {
+            for (p95, what) in [
+                (shift_p95, "Shift edge"),
+                (feather_p95, "Feather"),
+                (contrast_p95, "Contrast"),
+            ] {
+                assert!(
+                    p95 < GATE_MS,
+                    "p95 of a {what} slider step at 100 percent with the three at 5 percent, {p95:.2} ms, is not under {GATE_MS} ms"
+                );
+            }
+        }
+        for (slider, radius, p95) in &refine_step_p95 {
+            assert!(
+                *p95 < GATE_MS,
+                "p95 of a Refine edges {slider} slider step at 100 percent, Radius {radius}, {p95:.2} ms, is not under {GATE_MS} ms"
+            );
         }
         assert!(
             refined_p95 < GATE_MS,

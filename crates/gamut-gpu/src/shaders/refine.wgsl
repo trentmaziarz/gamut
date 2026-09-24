@@ -35,12 +35,13 @@
 //     fs_move / fs_apply          q at full resolution; the last gather mixes
 //                                 it into p by amount and stores the alpha
 //
-// A box of BLOCK cells or more (2 cells + 1, from a radius of 4 cells) is
-// drawn in two passes: fs_block_h2, fs_block_v2, fs_block_h1 or fs_block_v1
-// sums BLOCK cells from every cell on along the axis, and the box then adds
-// those sums BLOCK cells apart and the cells left over. It sums the same
-// cells, each held as the direct loop holds it; only the order of the sum
-// changes. A box under BLOCK cells sums its cells in the direct loop.
+// A box of BLOCK_TAPS cells or more (2 cells + 1, from a radius of 12
+// cells) is drawn in two passes: fs_block_h2, fs_block_v2, fs_block_h1 or
+// fs_block_v1 sums BLOCK cells from every cell on along the axis, and the box
+// then adds those sums BLOCK cells apart and the cells left over. It sums the
+// same cells, each held as the direct loop holds it; only the order of the
+// sum changes. A box under BLOCK_TAPS cells sums its cells in the direct
+// loop.
 
 struct Uniform {
     // Where the render begins on the whole picture, in pixels, and its size.
@@ -112,8 +113,10 @@ const IN_HIGH: f32 = 0.85;
 const SHARE_FLOOR: f32 = 0.000001;
 const SEPARATION_FLOOR: f32 = 0.000000001;
 
-// The cells a block pass sums (refine.rs in gamut-gpu).
+// The cells a block pass sums, and the fewest cells a box adds from block
+// sums (refine.rs in gamut-gpu).
 const BLOCK: u32 = 8u;
+const BLOCK_TAPS: u32 = 24u;
 
 fn acescct_encode(lin: vec3<f32>) -> vec3<f32> {
     let linear_part = ACES_SLOPE * lin + vec3<f32>(ACES_OFFSET);
@@ -390,10 +393,16 @@ fn box_one_blocks(texel: vec2<u32>, direction: vec2<i32>) -> vec4<f32> {
     return a / f32(2 * radius + 1);
 }
 
+// Whether a box adds block sums: the uniform carries its blocks, and a box
+// under BLOCK_TAPS cells sums every cell in the direct loop whatever it says.
+fn from_blocks() -> bool {
+    return u.blocks > 0u && 2u * u.cells + 1u >= BLOCK_TAPS;
+}
+
 @fragment
 fn fs_box_h2(in: VertexOutput) -> Pair {
     let texel = vec2<u32>(in.position.xy);
-    if u.blocks > 0u {
+    if from_blocks() {
         return box_pair_blocks(texel, vec2<i32>(1, 0));
     }
     return box_pair(texel, vec2<i32>(1, 0));
@@ -402,7 +411,7 @@ fn fs_box_h2(in: VertexOutput) -> Pair {
 @fragment
 fn fs_box_v2(in: VertexOutput) -> Pair {
     let texel = vec2<u32>(in.position.xy);
-    if u.blocks > 0u {
+    if from_blocks() {
         return box_pair_blocks(texel, vec2<i32>(0, 1));
     }
     return box_pair(texel, vec2<i32>(0, 1));
@@ -411,7 +420,7 @@ fn fs_box_v2(in: VertexOutput) -> Pair {
 @fragment
 fn fs_box_h1(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = vec2<u32>(in.position.xy);
-    if u.blocks > 0u {
+    if from_blocks() {
         return box_one_blocks(texel, vec2<i32>(1, 0));
     }
     return box_one(texel, vec2<i32>(1, 0));
@@ -420,7 +429,7 @@ fn fs_box_h1(in: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_box_v1(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = vec2<u32>(in.position.xy);
-    if u.blocks > 0u {
+    if from_blocks() {
         return box_one_blocks(texel, vec2<i32>(0, 1));
     }
     return box_one(texel, vec2<i32>(0, 1));

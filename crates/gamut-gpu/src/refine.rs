@@ -15,19 +15,23 @@
 //! A tile is drawn in 24 passes. Six take the moments of the source and
 //! their box means; they depend on no mask and no gather, so they are kept
 //! while the source, the radius and the tile stay the same, and a tile then
-//! costs 18. Each of the three gathers takes six: the moments of `q` over the
+//! costs 18. They are taken over the cells the gathers work over, joined
+//! with the cells already held, so a refine over cells they cover draws
+//! none, and a refine of a small mask on a large grid draws few. Each of the three gathers takes six: the moments of `q` over the
 //! cells, their box means across and down, the solve in two passes of two
 //! targets, and the move at full resolution. The move of the last gather
 //! writes the r8unorm refined alpha; the two before it write `q` into a 32
 //! bit single channel target, so no store rounds it between gathers.
 //!
-//! A box of [`BLOCK`] cells or more (a radius of 4 cells or more) has a
-//! block pass before it, which sums [`BLOCK`] cells from every cell on along
-//! the axis; the box then adds those sums [`BLOCK`] cells apart and the cells
-//! left over, in place of every cell. The ten box passes of a tile gain ten
-//! block passes: 34 passes, and 24 with the moments of the source held. A
-//! box keeps its cells, each held at the edges as before; only the order of
-//! the sum changes.
+//! A box of [`BLOCK_TAPS`] cells or more (a radius of 12 cells or more)
+//! has a block pass before it, which sums [`BLOCK`] cells from every cell on
+//! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
+//! cells left over, in place of every cell. The ten box passes of a tile gain
+//! ten block passes: 34 passes, and 24 with the moments of the source held.
+//! A box keeps its cells, each held at the edges as before; only the order of
+//! the sum changes. A smaller box sums every cell in the direct loop, which
+//! measured no slower (see [`BLOCK_TAPS`]): a block pass is a pass of its
+//! own, and a box of few cells does not win it back.
 
 use bytemuck::{Pod, Zeroable};
 use gamut_color::refine::{GATHERS, Plan};
@@ -60,14 +64,25 @@ pub(crate) const SCRATCH_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
 /// whole grid stays inside it.
 pub(crate) const TEXTURE_SIDE_LIMIT: u32 = 8192;
 
-/// How many cells a block pass sums, as `BLOCK` in `refine.wgsl`. A box of
-/// this many cells or more adds block sums in place of its cells.
+/// How many cells a block pass sums, as `BLOCK` in `refine.wgsl`.
 pub(crate) const BLOCK: u32 = 8;
 
+/// The fewest cells a box (2 cells + 1) adds from block sums, as
+/// `BLOCK_TAPS` in `refine.wgsl`; a box of fewer sums every cell in the
+/// direct loop. Measured on timing_24mp.jpg at 100 percent, the block box
+/// against the direct loop, three runs each: at 107 cells (Radius 0.05) the
+/// blocks are 0.9 to 2.4 ms faster a slider step, and at 23 cells (Radius
+/// 0.01) 0.6 to 1.2 ms slower. On the 4K30 clip at 15 cells two measurements
+/// put them 0.3 ms slower and 0.7 ms faster, inside the noise. So the blocks
+/// start at the first box past 23 cells.
+pub(crate) const BLOCK_TAPS: u32 = 24;
+
 /// How many blocks of [`BLOCK`] cells a box of `cells` either side adds: 0
-/// under [`BLOCK`] cells, where the box sums every cell in the direct loop.
+/// under [`BLOCK_TAPS`] cells, where the box sums every cell in the direct
+/// loop.
 pub(crate) fn box_blocks(cells: u32) -> u32 {
-    (2 * cells + 1) / BLOCK
+    let taps = 2 * cells + 1;
+    if taps < BLOCK_TAPS { 0 } else { taps / BLOCK }
 }
 
 /// The bytes one cell of a tile costs the scratch, at `step` pixels a cell.
@@ -303,7 +318,8 @@ struct FloatTarget {
 }
 
 /// The moments of the source the targets `s` hold: the plan they were taken
-/// with, but for eps and the amount, and the tile.
+/// with, but for eps and the amount, the tile, and the cells of the tile
+/// they were taken over.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Held {
     full: (u32, u32),
@@ -313,6 +329,35 @@ struct Held {
     cells: u32,
     first: (u32, u32),
     count: (u32, u32),
+    area: Rect,
+}
+
+impl Held {
+    /// Whether these moments were taken with the plan and the tile of
+    /// `other`, over whichever cells.
+    fn takes_as(&self, other: &Held) -> bool {
+        Held {
+            area: other.area,
+            ..*self
+        } == *other
+    }
+
+    /// Whether they were taken over every cell of `area`. The box means
+    /// near the edge of the cells taken read cells not taken, as the box
+    /// means of a gather near the edge of its work do, and the margin of
+    /// the work keeps both from the pixels a tile writes.
+    fn covers(&self, area: Rect) -> bool {
+        let (x, y, width, height) = self.area;
+        area.0 >= x && area.1 >= y && area.0 + area.2 <= x + width && area.1 + area.3 <= y + height
+    }
+}
+
+/// The smallest rectangle that holds both.
+fn join(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.0.min(b.0), a.1.min(b.1));
+    let right = (a.0 + a.2).max(b.0 + b.2);
+    let bottom = (a.1 + a.3).max(b.1 + b.3);
+    (x, y, right - x, bottom - y)
 }
 
 /// The float targets of a frame, eleven of cells and one of pixels.
@@ -385,7 +430,8 @@ struct Binds {
     block_gather_across: wgpu::BindGroup,
 }
 
-/// The block pass that draws before a box pass of [`BLOCK`] cells or more.
+/// The block pass that draws before a box pass of [`BLOCK_TAPS`] cells or
+/// more.
 struct Block<'a> {
     label: &'a str,
     pipeline: &'a wgpu::RenderPipeline,
@@ -828,8 +874,9 @@ impl RefinePass {
             fn pair<'a>(a: &'a FloatTarget, b: &'a FloatTarget) -> [&'a wgpu::TextureView; 2] {
                 [&a.view, &b.view]
             }
-            // The moments of the source over the whole tile, unless the
-            // targets hold them already.
+            // The moments of the source over the cells the gathers work
+            // over, unless the targets hold them there already; joined with
+            // the cells held when those were taken with this plan and tile.
             let held = Held {
                 full: plan.full,
                 origin: plan.origin,
@@ -838,9 +885,14 @@ impl RefinePass {
                 cells: plan.cells,
                 first: tile.first,
                 count: tile.count,
+                area: tile.work,
             };
-            if scratch.held != Some(held) {
-                let all = (0, 0, tile.count.0, tile.count.1);
+            let take = match scratch.held {
+                Some(had) if had.takes_as(&held) && had.covers(tile.work) => None,
+                Some(had) if had.takes_as(&held) => Some(join(had.area, tile.work)),
+                _ => Some(tile.work),
+            };
+            if let Some(all) = take {
                 let cells = &binds.cells;
                 pass(
                     "refine source a",
@@ -906,7 +958,7 @@ impl RefinePass {
                         &binds.block_far_one,
                     ),
                 );
-                scratch.held = Some(held);
+                scratch.held = Some(Held { area: all, ..held });
                 self.source_builds += 1;
             }
             let work = tile.work;
@@ -1096,6 +1148,41 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Moments of the source serve a later refine over cells they were
+    /// taken over, with the same plan and tile; a refine over other cells
+    /// takes them over both.
+    #[test]
+    fn the_held_moments_serve_the_cells_they_were_taken_over() {
+        let held = Held {
+            full: (6000, 4000),
+            origin: (960, 0),
+            size: (4032, 4000),
+            step: 4,
+            cells: 53,
+            first: (240, 0),
+            count: (1008, 1000),
+            area: (100, 50, 600, 700),
+        };
+        assert!(held.covers((100, 50, 600, 700)));
+        assert!(held.covers((150, 60, 20, 30)));
+        assert!(!held.covers((99, 50, 10, 10)));
+        assert!(!held.covers((650, 700, 51, 10)));
+        assert!(held.takes_as(&Held {
+            area: (0, 0, 1008, 1000),
+            ..held
+        }));
+        assert!(!held.takes_as(&Held { cells: 52, ..held }));
+        assert!(!held.takes_as(&Held {
+            first: (0, 0),
+            ..held
+        }));
+        assert_eq!(
+            join((100, 50, 600, 700), (650, 700, 51, 10)),
+            (100, 50, 601, 700)
+        );
+        assert_eq!(join((10, 20, 5, 5), (0, 0, 3, 3)), (0, 0, 15, 25));
+    }
     use gamut_color::acescct;
     use gamut_color::refine as twin;
     use gamut_core::mask::Refine;
@@ -1197,6 +1284,7 @@ mod tests {
         assert_eq!(wgsl_constant("SHARE_FLOOR"), twin::SHARE_FLOOR);
         assert_eq!(wgsl_constant("SEPARATION_FLOOR"), twin::SEPARATION_FLOOR);
         assert_eq!(wgsl_u32_constant("BLOCK"), BLOCK);
+        assert_eq!(wgsl_u32_constant("BLOCK_TAPS"), BLOCK_TAPS);
         // The shader writes the three gathers out as the loop of `run`, the
         // smoothstep as its polynomial, and never calls the builtin.
         assert_eq!(GATHERS, 3);
@@ -1409,19 +1497,22 @@ mod tests {
     }
 
     /// A box of 2 cells + 1 cells adds (2 cells + 1) / 8 blocks and the
-    /// cells left over, and a box under 8 cells sums every cell directly.
+    /// cells left over from 24 cells on, and a box under 24 cells sums
+    /// every cell directly.
     #[test]
-    fn a_box_of_8_cells_or_more_adds_blocks_and_the_cells_left_over() {
-        assert_eq!(BLOCK, 8);
+    fn a_box_of_24_cells_or_more_adds_blocks_and_the_cells_left_over() {
+        assert_eq!((BLOCK, BLOCK_TAPS), (8, 24));
         // Cells either side, blocks, and single cells left over.
         for (cells, blocks, singles) in [
             (1, 0, 3),
             (2, 0, 5),
             (3, 0, 7),
-            (4, 1, 1),
-            (6, 1, 5),
-            (9, 2, 3),
-            (11, 2, 7),
+            (4, 0, 9),
+            (6, 0, 13),
+            (7, 0, 15),
+            (9, 0, 19),
+            (11, 0, 23),
+            (12, 3, 1),
             (18, 4, 5),
             (53, 13, 3),
         ] {
