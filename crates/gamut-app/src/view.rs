@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn the_padded_window_is_snapped_to_the_grid() {
         let window = padded_window((6000, 4000), (2551, 1651, 901, 701), (450, 350), 64);
-        assert_eq!(window, (2048, 1280, 1856, 1472));
+        assert_eq!(window, (2048, 1280, 1920, 1472));
         for edge in [window.0, window.1, window.0 + window.2, window.1 + window.3] {
             assert_eq!(edge % 64, 0);
         }
@@ -838,11 +838,14 @@ mod tests {
 
     #[test]
     fn the_padded_window_never_leaves_the_photo() {
+        // At an edge the window is moved inside the photo, at the size of a
+        // window away from the edges, and still holds what is seen.
         let corner = padded_window((6000, 4000), (5099, 3299, 901, 701), (450, 350), 64);
-        assert_eq!(corner, (4608, 2944, 1392, 1056));
+        assert_eq!(corner, (4080, 2528, 1920, 1472));
         assert!(holds((0, 0, 6000, 4000), corner));
+        assert!(holds(corner, (5099, 3299, 901, 701)));
         let origin = padded_window((6000, 4000), (0, 0, 901, 701), (450, 350), 64);
-        assert_eq!((origin.0, origin.1), (0, 0));
+        assert_eq!(origin, (0, 0, 1920, 1472));
         // A picture smaller than the pad is its own window.
         assert_eq!(
             padded_window((300, 200), (0, 0, 300, 200), (450, 350), 64),

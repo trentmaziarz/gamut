@@ -534,6 +534,13 @@ struct Frame {
     window: CropRect,
     /// The size the blur sigma was taken from.
     sigma_size: (u32, u32),
+    /// The part of the frame the head-pass products cover, when the frame
+    /// serves a zoomed view: its padded window. Frames of one size placed
+    /// inside the picture can cover the same part of the source for two
+    /// windows, and the window then tells them apart, so a pan onto the
+    /// other window takes a frame built ahead for it. `None` for a render
+    /// of a crop, whose frame serves any crop of it.
+    view: Option<CropRect>,
     working: Target,
     ping: Target,
     base: Target,
@@ -1871,6 +1878,7 @@ impl Develop {
             CropRect::FULL,
             render_size,
             crop,
+            false,
         )
     }
 
@@ -1909,7 +1917,16 @@ impl Develop {
             height: crop.height / window.height,
         };
         let window_size = ((x1 - x0).round() as u32, (y1 - y0).round() as u32);
-        self.render_window(edit, inner, window_size, output_size, window, full, inner)
+        self.render_window(
+            edit,
+            inner,
+            window_size,
+            output_size,
+            window,
+            full,
+            inner,
+            false,
+        )
     }
 
     /// Renders what a zoomed viewer shows. The head-pass products (the base
@@ -1919,7 +1936,8 @@ impl Develop {
     /// one to one. A pan that stays inside the window therefore runs no
     /// head pass, and a slider step develops only what is seen.
     /// The frame holds the window plus the reach of the widest head pass on
-    /// every side, or of Refine edges when a mask's reaches further, so the
+    /// every side, or of Refine edges when a mask's reaches further, moved
+    /// inside the picture where it would pass an edge, so the
     /// picture is the one [`render`](Self::render) gives at `view.full`.
     ///
     /// `view.full` must not pass the size of the source: above one source
@@ -1955,6 +1973,7 @@ impl Develop {
             geometry.window,
             geometry.sigma_size,
             geometry.products,
+            true,
         )
     }
 
@@ -2001,28 +2020,30 @@ impl Develop {
             (f.width, f.height, f.generation) == (width, height, source.generation)
                 && f.window == geometry.window
                 && f.sigma_size == geometry.sigma_size
+                && f.view == Some(geometry.products)
         };
         if self.frame.as_ref().is_some_and(same) {
             return false;
         }
         if !self.next.as_ref().is_some_and(|next| same(&next.frame)) {
             // The frame held for another window goes first, so no more than
-            // two frames are held at once.
-            self.next = None;
-            // The frame a swap took out of use is drawn into when its
-            // textures are of this size, and dropped before a frame is made
-            // otherwise.
-            let frame = match self.spare.take() {
-                Some(mut spare) if spare.fits(width, height, source.generation) => {
-                    spare.renew(source, geometry.window, geometry.sigma_size);
-                    spare
+            // two frames are held at once. Its textures, or those of the
+            // frame a swap took out of use (the two are never held together),
+            // are drawn into when they are of this size, and dropped before a
+            // frame is made otherwise.
+            let held = self.next.take().map(|next| next.frame);
+            let mut frame = match self.spare.take().or(held) {
+                Some(mut kept) if kept.fits(width, height, source.generation) => {
+                    kept.renew(source, geometry.window, geometry.sigma_size);
+                    kept
                 }
-                spare => {
-                    drop(spare);
+                kept => {
+                    drop(kept);
                     self.frame_makes += 1;
                     self.build_frame(source, width, height, geometry.window, geometry.sigma_size)
                 }
             };
+            frame.view = Some(geometry.products);
             let (texture, transmission) =
                 head_products_wanted(edit, &mask_twin::active_masks(edit));
             let passes = HeadPass::plan(frame.content != source.content, texture, transmission);
@@ -2744,8 +2765,19 @@ impl Develop {
         let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
         let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
         let reach = head_pass_reach(full).max(self.refine_reach(edit, full));
-        let (x0, y0) = (wx.saturating_sub(reach), wy.saturating_sub(reach));
-        let (x1, y1) = ((wx + ww + reach).min(full.0), (wy + wh + reach).min(full.1));
+        // The frame is the window and the reach on every side, moved inside
+        // the picture where it would pass an edge, and cut to the picture
+        // only where the picture is shorter: so windows of one size have
+        // frames of one size. Where it is moved, the window keeps the reach
+        // on the inner side and meets the picture's own edge on the other,
+        // as the full render does.
+        let place = |start: u32, size: u32, full: u32| {
+            let span = (size + 2 * reach).min(full);
+            let low = start.saturating_sub(reach).min(full - span);
+            (low, low + span)
+        };
+        let (x0, x1) = place(wx, ww, full.0);
+        let (y0, y1) = place(wy, wh, full.1);
         let frame = ((x1 - x0) as f32, (y1 - y0) as f32);
         let window = CropRect {
             x: x0 as f32 / full.0 as f32,
@@ -2773,7 +2805,8 @@ impl Develop {
     /// with the blur sigma of `sigma_size`, draws the head-pass products
     /// over `products` of that render and the develop passes over `crop`,
     /// then crops `crop` of it into the output. `crop` lies inside
-    /// `products`.
+    /// `products`. A `view` render is of a zoomed view, whose frame is
+    /// told apart by `products` too (see [`Frame::view`]).
     #[allow(clippy::too_many_arguments)]
     fn render_window(
         &mut self,
@@ -2784,7 +2817,9 @@ impl Develop {
         window: CropRect,
         sigma_size: (u32, u32),
         products: CropRect,
+        view: bool,
     ) -> Option<&wgpu::TextureView> {
+        let view = view.then_some(products);
         let source = self.source.as_ref()?;
         let (width, height) = (render_size.0.max(1), render_size.1.max(1));
         let mut encoder = self
@@ -2797,6 +2832,7 @@ impl Develop {
             (f.width, f.height, f.generation) != (width, height, source.generation)
                 || f.window != window
                 || f.sigma_size != sigma_size
+                || f.view != view
         });
         if stale {
             // A frame built ahead for this window is swapped in once every
@@ -2809,6 +2845,7 @@ impl Develop {
                 (f.width, f.height, f.generation) == (width, height, source.generation)
                     && f.window == window
                     && f.sigma_size == sigma_size
+                    && f.view == view
             });
             match ahead {
                 Some(next) if next.build.complete() => {
@@ -2824,7 +2861,9 @@ impl Develop {
                     // frame kept for its textures goes first.
                     self.spare = None;
                     self.frame_makes += 1;
-                    self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
+                    let mut frame = self.build_frame(source, width, height, window, sigma_size);
+                    frame.view = view;
+                    self.frame = Some(frame);
                     self.window_replaces += 1;
                 }
             }
@@ -3847,6 +3886,7 @@ impl Develop {
             content: source.content.wrapping_sub(1),
             window,
             sigma_size,
+            view: None,
             working,
             ping,
             base,
@@ -4225,8 +4265,15 @@ pub struct ViewWindow {
 /// A rectangle of pixels: x, y, width, height.
 pub type PixelRect = (u32, u32, u32, u32);
 
-/// `visible` with `pad` on every side, its edges moved outward onto `grid`,
-/// kept inside `full`.
+/// `visible` with `pad` on every side, its low edges moved outward onto
+/// `grid`, at one size for every place of `visible`: on each axis the widest
+/// that `visible` and its pad snapped outward onto the grid can be, which
+/// holds them wherever they lie. Where the window would pass the far edge of
+/// `full` it is moved inward until it ends there, and so still holds
+/// `visible`; on an axis where `full` is not longer than that size the
+/// window is the whole of `full`. So every window of one zoom has one size,
+/// and so has every frame rendered for one (see [`Develop::render_view`]),
+/// and a frame a pan leaves can be drawn into for the next window.
 pub fn padded_window(
     full: (u32, u32),
     visible: PixelRect,
@@ -4235,10 +4282,12 @@ pub fn padded_window(
 ) -> PixelRect {
     let grid = grid.max(1);
     let axis = |start: u32, size: u32, pad: u32, full: u32| {
+        let span = (size + 2 * pad + grid - 1).div_ceil(grid) * grid;
+        if span >= full {
+            return (0, full.max(1));
+        }
         let low = start.saturating_sub(pad) / grid * grid;
-        let high = (start + size + pad).div_ceil(grid) * grid;
-        let high = high.min(full).max(low + 1);
-        (low, high - low)
+        (low.min(full - span), span)
     };
     let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
     let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
@@ -4737,11 +4786,13 @@ mod tests {
             )
         };
         // Right, down, left, up: the step, the exit and the window ahead.
+        // Down and up the window ahead would pass an edge of the picture: it
+        // is moved inside it at the size of every other window.
         let cases = [
             ((STEP, 0), (3031, 1199), (2688, 384, 2624, 3264)),
-            ((0, STEP), (2359, 2063), (1664, 1536, 2624, 2464)),
+            ((0, STEP), (2359, 2063), (1664, 736, 2624, 3264)),
             ((-STEP, 0), (1655, 1199), (640, 384, 2624, 3264)),
-            ((0, -STEP), (2359, 367), (1664, 0, 2624, 2432)),
+            ((0, -STEP), (2359, 367), (1664, 0, 2624, 3264)),
         ];
         for (step, exit, expected) in cases {
             let previous = at(visible, (-step.0, -step.1));
@@ -4756,6 +4807,11 @@ mod tests {
             let ahead =
                 window_ahead(FULL, window, previous, visible, PAD, GRID).expect("a window ahead");
             assert_eq!(ahead, expected, "window ahead of the pan {step:?}");
+            assert_eq!(
+                (ahead.2, ahead.3),
+                (window.2, window.3),
+                "one window size at one zoom, the pan {step:?}"
+            );
             assert!(holds(ahead, left), "{ahead:?} holds the exit {left:?}");
             assert!(
                 !holds(window, left),

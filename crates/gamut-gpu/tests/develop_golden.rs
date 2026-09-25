@@ -1337,10 +1337,11 @@ fn a_pan_across_three_windows_draws_each_ahead_into_the_frame_a_swap_left() {
     };
     println!("adapter: {}", gpu.describe());
     use gamut_gpu::develop::{holds, padded_window, pan_exit, window_ahead};
-    // Wide enough that the frames of the pan stay clear of the left and the
-    // right edge of the picture, where a frame is cut short and so has
-    // another size.
-    let (width, height) = (1600, 600);
+    // With Refine edges on, the first frames of the pan reach the left edge
+    // of the picture and every frame reaches its top and bottom edges: a
+    // frame there is moved inside the picture at the size of every other
+    // frame of the zoom, so it is drawn into as well.
+    let (width, height) = (1100, 600);
     let photo = blocky_photo(width, height);
     let readback = Readback::new(&gpu.device);
     const PAD: (u32, u32) = (40, 30);
@@ -1379,7 +1380,7 @@ fn a_pan_across_three_windows_draws_each_ahead_into_the_frame_a_swap_left() {
         let mut develop = Develop::new(&gpu.device, &gpu.queue);
         develop.set_source(&photo);
         develop.set_ahead_slice_texels(texels);
-        let start = (600, 213, 180, 140);
+        let start = (232, 213, 180, 140);
         let first = ViewWindow {
             full,
             window: padded_window(full, start, PAD, GRID),
@@ -1387,6 +1388,11 @@ fn a_pan_across_three_windows_draws_each_ahead_into_the_frame_a_swap_left() {
         };
         view_render_of(&mut develop, &gpu, &readback, edit, &first);
         assert_eq!(develop.frame_makes(), 1, "{name}: the first window");
+        println!(
+            "{name}: first window {:?}, frame {:?}",
+            first.window,
+            develop.frame_textures(false).first().map(|t| t.2)
+        );
         let (mut window, mut previous) = (first.window, start);
         let mut visible = start;
         let mut crossings = 0;
@@ -1428,8 +1434,9 @@ fn a_pan_across_three_windows_draws_each_ahead_into_the_frame_a_swap_left() {
                 fresh.set_source(&photo);
                 let alone = view_render_of(&mut fresh, &gpu, &readback, edit, &view);
                 let differing = shown.iter().zip(&alone).filter(|(a, b)| a != b).count();
+                let frame = develop.frame_textures(false).first().map(|t| t.2);
                 println!(
-                    "{name}: crossing {crossings} into {asked:?} at {visible:?}: frame makes {}, bytes that differ from a fresh render of it: {differing} of {}",
+                    "{name}: crossing {crossings} into {asked:?} at {visible:?}: frame {frame:?}, frame makes {}, bytes that differ from a fresh render of it: {differing} of {}",
                     develop.frame_makes(),
                     alone.len()
                 );
