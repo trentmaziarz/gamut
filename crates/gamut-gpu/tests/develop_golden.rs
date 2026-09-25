@@ -3924,15 +3924,16 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
 /// tiles, and the tiles draw byte for byte what one tile draws. On the 1101
 /// by 90 photo of the test above, the grid is 551 by 45 cells of two pixels
 /// at a radius of 0.015 (24,795 cells of 232 bytes) and 276 by 23 cells of
-/// four at 0.03 (6,348 cells of 232 bytes), each with a margin of 28 cells:
-/// three boxes of 6, the 2 cells beside of the gathers and the flood of the
-/// reached field, 8 cells (16.5 pixels of radius in cells of 2, 33 in cells
-/// of 4), 18 + 2 + 8 = 28. A budget of 157 by 157 cells at a step of 2 gives
-/// tiles of 157 cells a side, which write (157 - 2 x 28 - 3) x 2 = 196
-/// pixels a row: 6 tiles. One of 79 by 79 cells at a step of 4 gives tiles
-/// of 120 cells, the floor of two margins and 64, which write
-/// (120 - 59) x 4 = 244: 5 tiles. The default budget holds either
-/// grid in one. A stroke along the whole photo, with a hard rim over the row
+/// four at 0.03 (6,348 cells of 232 bytes), each with a margin of 20 cells:
+/// three boxes of 6 and the 2 cells beside of the gathers, 18 + 2 = 20. The
+/// flood of the reached field, 8 cells (16.5 pixels of radius in cells of 2,
+/// 33 in cells of 4), is not in the margin (ruled 2026-09-26): each tile's
+/// flood clamps at the tile's edge. A budget of 157 by 157 cells at a step
+/// of 2 gives tiles of 157 cells a side, which write
+/// (157 - 2 x 20 - 3) x 2 = 228 pixels a row: 5 tiles. One of 79 by 79
+/// cells at a step of 4 gives tiles of 104 cells, the floor of two margins
+/// and 64, which write (104 - 43) x 4 = 244: 5 tiles. The default budget
+/// holds either grid in one. A stroke along the whole photo, with a hard rim over the row
 /// edge at 60, crosses every cut between the tiles.
 #[test]
 fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
@@ -3950,18 +3951,18 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     // The radius, the step, the cells a side of the budget, the bytes of a
     // cell, the side of a tile, and the tiles a mask.
     for (radius, step, budget_side, cell_bytes, side, cut) in [
-        (0.015, 2, 157u64, 232u64, 157u32, 6u32),
-        (0.03, 4, 79, 232, 120, 5),
+        (0.015, 2, 157u64, 232u64, 157u32, 5u32),
+        (0.03, 4, 79, 232, 104, 5),
     ] {
         let plan = Plan::for_geometry(
             &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
             &Geometry::full(size, size),
         );
         assert_eq!(plan.flood, 8);
-        assert_eq!(plan.margin(), 3 * 6 + 2 + 8);
-        assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 28));
-        assert_eq!(side.max(2 * 28 + 64), side);
-        assert_eq!(1101u32.div_ceil((side - 2 * 28 - 3) * step), cut);
+        assert_eq!(plan.margin(), 3 * 6 + 2);
+        assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 20));
+        assert_eq!(side.max(2 * 20 + 64), side);
+        assert_eq!(1101u32.div_ceil((side - 2 * 20 - 3) * step), cut);
         let budget = budget_side * budget_side * cell_bytes;
         let (_, grid) = plan.grid();
         assert!(
@@ -4232,8 +4233,9 @@ const CELL_BYTES: u64 = 14 * 16 + 2 * 4;
 /// cuts its tiles at 300, the most rows 375 columns leave: 375 by 300 is
 /// 112,500 cells, and 375 by 301 would be 112,875. After 0.0012, the step 4
 /// mask would want 375 by 335, so it cuts at 336: 336 by 335 is 112,560,
-/// and 337 by 335 would be 112,895. The floors, 182 cells at step 4 (margin
-/// 59) and 76 at step 1 (margin 6), lie under both cuts. The first is the
+/// and 337 by 335 would be 112,895. The floors, 146 cells at step 4 (margin
+/// 3 x 13 + 2 = 41) and 74 at step 1 (margin 3 x 1 + 2 = 5), lie under both
+/// cuts. The first is the
 /// cut at 1157 of the 24 megapixel photo at the default budget. The default
 /// budget holds no column beside its square of 1317 (1318 by 1317 is
 /// 1,735,806 cells, over its 1,735,574), so there the second order keeps
@@ -5484,11 +5486,12 @@ fn case_9s_stroke_down_the_tower_refined_at_three_radii_matches() {
 /// Case 9's stroke at Radius 0.05 under a scratch budget of 150 by 150 cells
 /// is drawn in tiles, and the tiles give byte for byte what one tile gives.
 /// The grid is 320 by 214 cells of 4 pixels, 68,480 cells of 232 bytes, over
-/// the budget. The margin is 3 boxes of 11, the 2 cells beside of the
-/// gathers and the flood of the reached field, 16 cells, 33 + 2 + 16 = 51,
-/// so a tile is the floor of 2 x 51 + 64 = 166 cells a side and writes
-/// (166 - 2 x 51 - 3) x 4 = 244 pixels a row and a column:
-/// 6 tiles across 1280 pixels and 4 down 854, 24 in all.
+/// the budget. The margin is 3 boxes of 11 and the 2 cells beside of the
+/// gathers, 33 + 2 = 35; the flood of the reached field, 16 cells, is not in
+/// it (ruled 2026-09-26). The floor of 2 x 35 + 64 = 134 cells lies under
+/// the budget's 150, so a tile is 150 cells a side and writes
+/// (150 - 2 x 35 - 3) x 4 = 308 pixels a row and a column:
+/// 5 tiles across 1280 pixels and 3 down 854, 15 in all.
 #[test]
 fn case_9s_stroke_in_tiles_of_a_small_budget_gives_what_one_tile_gives() {
     let _turn = ONE_AT_A_TIME
@@ -5504,7 +5507,7 @@ fn case_9s_stroke_in_tiles_of_a_small_budget_gives_what_one_tile_gives() {
     let edit = stroke_down_the_heic_tower(0.05);
     let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
     assert_eq!((plan.step, plan.cells, plan.flood), (4, 11, 16));
-    assert_eq!(plan.margin(), 3 * 11 + 2 + 16);
+    assert_eq!(plan.margin(), 3 * 11 + 2);
     assert_eq!(plan.grid().1, (320, 214));
     let cell_bytes = 232u64;
     let budget = 150 * 150 * cell_bytes;
@@ -5513,11 +5516,11 @@ fn case_9s_stroke_in_tiles_of_a_small_budget_gives_what_one_tile_gives() {
         "the budget is under the grid"
     );
     let side = 150u32.max(2 * plan.margin() + 64);
-    assert_eq!(side, 166);
+    assert_eq!(side, 150);
     let span = (side - 2 * plan.margin() - 3) * plan.step;
-    assert_eq!(span, 244);
+    assert_eq!(span, 308);
     let cut = 1280u32.div_ceil(span) * 854u32.div_ceil(span);
-    assert_eq!(cut, 24);
+    assert_eq!(cut, 15);
     let readback = Readback::new(&gpu.device);
     // A graph of its own for each budget, so its counters read the tiles of
     // this render alone.
@@ -5546,9 +5549,10 @@ fn case_9s_stroke_in_tiles_of_a_small_budget_gives_what_one_tile_gives() {
 }
 
 /// A zoomed viewer on case 9's tower at Radius 0.01, 0.03 and 0.05: a
-/// window of the tower padded by the reach of Refine edges, which holds the
-/// flood of the reached field, gives what the full render gives on the
-/// pixels it shows.
+/// window of the tower padded by the reach of Refine edges gives what the
+/// full render gives on the pixels it shows, within the golden tolerance.
+/// The reach holds the boxes' cells and not the flood's (ruled 2026-09-26),
+/// so the window's flood clamps at its edge.
 #[test]
 fn a_zoomed_window_on_case_9s_tower_matches_the_full_render() {
     let _turn = ONE_AT_A_TIME

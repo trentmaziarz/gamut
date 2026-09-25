@@ -217,9 +217,11 @@ impl Tile {
 /// tile when its cells fit `budget` bytes and a texture on each side; the
 /// side is then the larger side of the grid. Otherwise as many as
 /// a square of `budget` bytes holds and no more than the larger side of the
-/// grid. Either way at least what the boxes of the gathers, the flood of the
-/// reached field and a few pixels around them need: [`Plan::margin`] on
-/// either side and 64 cells.
+/// grid. Either way at least what the boxes of the gathers and a few pixels
+/// around them need: [`Plan::margin`] on either side and 64 cells. The
+/// flood's cells of the reached field are not in the margin (ruled
+/// 2026-09-26): a tile's flood clamps at the tile's edge as the twin's
+/// clamps at the render's, within 1e-3 of an alpha of one tile.
 pub(crate) fn tile_side(plan: &Plan, budget: u64) -> u32 {
     let (_, grid) = plan.grid();
     let bytes = u64::from(grid.0) * u64::from(grid.1) * CELL_BYTES;
@@ -1993,12 +1995,12 @@ mod tests {
         assert_eq!((uniform.step, uniform.cells), (4, 14));
         // A patch of the same render keeps the tile and works on the cells
         // it needs alone: the cells its pixels lie among, 49 to 62 across and
-        // 74 to 85 down, and 64 cells of margin around them, three boxes of
-        // 14, the 2 cells beside of the gathers and the flood of the reached
-        // field, 20 cells (80 pixels of radius in cells of 4):
-        // 42 + 2 + 20 = 64. Across, 49 - 64 is held at the grid's first
-        // cell, 0, to 62 + 64 = 126, 127 cells; down, 74 - 64 = 10 to
-        // 85 + 64 = 149, 140 cells.
+        // 74 to 85 down, and 44 cells of margin around them, three boxes of
+        // 14 and the 2 cells beside of the gathers, 42 + 2 = 44. The flood of
+        // the reached field, 20 cells (80 pixels of radius in cells of 4), is
+        // not in the margin (ruled 2026-09-26). Across, 49 - 44 = 5 to
+        // 62 + 44 = 106, 102 cells; down, 74 - 44 = 30 to 85 + 44 = 129,
+        // 100 cells.
         let patch = self::tiles(
             &plan,
             (200, 300, 50, 40),
@@ -2007,9 +2009,9 @@ mod tests {
         assert_eq!(patch.len(), 1);
         assert_eq!((patch[0].first, patch[0].count), ((0, 0), (320, 400)));
         assert_eq!(plan.flood, 20);
-        assert_eq!(plan.margin(), 3 * 14 + 2 + 20);
-        assert_eq!(plan.margin(), 64);
-        assert_eq!(patch[0].work, (0, 10, 127, 140));
+        assert_eq!(plan.margin(), 3 * 14 + 2);
+        assert_eq!(plan.margin(), 44);
+        assert_eq!(patch[0].work, (5, 30, 102, 100));
     }
 
     /// Every pixel of what is refined is written by exactly one tile, and a
@@ -2429,18 +2431,18 @@ mod tests {
         let budget = SCRATCH_BUDGET_BYTES;
         let small = 16 * 1024 * 1024;
         // The sizes below are at CELL_BYTES 232 and the margin of 3 cells a
-        // box, 2 cells beside and the flood's cells. The floor of a tile is
-        // the margin twice and 64. The budget holds 402,653,184 / 232 = 1,735,574
+        // box and 2 cells beside; the flood's cells left the margin, ruled
+        // 2026-09-26. The floor of a tile is the margin twice and 64. The budget holds 402,653,184 / 232 = 1,735,574
         // cells, a square of 1317 (1317 squared is 1,734,489, 1317 by 1318
         // is 1,735,806). At 224 bytes and the margin of 3 cells a box and 2
         // it held 1,797,558 cells, a square of 1340 and one column more.
         let cases = [
             // The 24 megapixel photo: step 4 whole, then step 1 cut at the
             // rows 1500 columns leave the budget. 0.05 is 300 pixels: step
-            // 4, 53 cells, flood 75, margin 236, floor 536; its grid of 1500
-            // by 1000 is 348,000,000 bytes, whole. 0.0012 is 7.2 pixels:
-            // step 1, 5 cells, flood 7, margin 24, floor 112, grid 6000 by
-            // 4000, side 1317. 1500 by 1317 is 458,316,000 bytes, so the
+            // 4, 53 cells, margin 3 x 53 + 2 = 161, floor 386; its grid of
+            // 1500 by 1000 is 348,000,000 bytes, whole. 0.0012 is 7.2
+            // pixels: step 1, 5 cells, margin 3 x 5 + 2 = 17, floor 98, grid
+            // 6000 by 4000, side 1317. 1500 by 1317 is 458,316,000 bytes, so the
             // rows are cut at 402,653,184 / (1500 * 232) = 1157.05: 1157,
             // 402,636,000 bytes. At 224 the cut was 1198.
             Case {
@@ -2465,10 +2467,11 @@ mod tests {
             },
             // The worst found at 224: a step 3 grid of 2731 by 658 cells,
             // whole at 402,527,552 bytes. At 232 it is 416,903,536 bytes and
-            // not whole: 0.0035 is 28.672 pixels, step 3, 7 cells, flood 9,
-            // margin 32, floor 128, side 1317, 1317 by 658. 0.001 is 8.192
-            // pixels, step 1, 6 cells, flood 8, margin 28, floor 120, and
-            // wants 1317 by 1317, which fits: made again at 1317 by 1317.
+            // not whole: 0.0035 is 28.672 pixels, step 3, 7 cells, margin
+            // 3 x 7 + 2 = 23, floor 110, side 1317, 1317 by 658. 0.001 is
+            // 8.192 pixels, step 1, 6 cells, margin 3 x 6 + 2 = 20, floor
+            // 104, and wants 1317 by 1317, which fits: made again at 1317 by
+            // 1317.
             // At 224 the second plan cut at 658 inside 2731 by 658, kept.
             Case {
                 name: "B 0.0035 then 0.001",
@@ -2478,10 +2481,10 @@ mod tests {
                 held: vec![((1317, 658), 1317), ((1317, 1317), 1317)],
                 made: 2,
             },
-            // 0.05 is 409.6 pixels: step 4, 73 cells, flood 102, margin 323,
-            // floor 710; its grid of 2048 by 494 is whole, and 2048 by 1317
-            // is over, so it is cut at 1317 and kept. 0.0025 is 20.48
-            // pixels: step 2, 7 cells, flood 10, margin 33, floor 130, and
+            // 0.05 is 409.6 pixels: step 4, 73 cells, margin 3 x 73 + 2 =
+            // 221, floor 506; its grid of 2048 by 494 is whole, and 2048 by
+            // 1317 is over, so it is cut at 1317 and kept. 0.0025 is 20.48
+            // pixels: step 2, 7 cells, margin 3 x 7 + 2 = 23, floor 110, and
             // wants 1317 by 987, inside what is held. At 224 every plan kept
             // 2731 by 658 at sides 2731, 658, 2048 and 658.
             Case {
@@ -2533,13 +2536,15 @@ mod tests {
             },
             // The floor branch: 16 MiB holds 16,777,216 / 232 = 72,315
             // cells, a square of 268 (268 squared is 71,824, 269 squared is
-            // 72,361). 0.03 is 120 pixels: step 4, 21 cells, flood 30,
-            // margin 95, floor 254, so 268 by 268. 0.049 is 196 pixels: step
-            // 4, 35 cells, flood 49, margin 156, and the box needs a floor of
-            // 156 * 2 + 64 = 376 cells a side; the grid is 320 cells wide,
-            // and 320 by 376 (27,914,240 bytes) passes the budget alone. The
-            // same plan three more times keeps what the floor branch made.
-            // At 224 the square was 273 and the floor 278 (margin 107).
+            // 72,361). 0.03 is 120 pixels: step 4, 21 cells, margin
+            // 3 x 21 + 2 = 65, floor 194, so 268 by 268. 0.049 is 196
+            // pixels: step 4, 35 cells, margin 3 x 35 + 2 = 107, and the box
+            // needs a floor of 107 * 2 + 64 = 278 cells a side; the grid is
+            // 320 cells wide, and 278 by 278 (17,929,888 bytes) passes the
+            // budget alone. The same plan three more times keeps what the
+            // floor branch made. With the flood's 49 cells in the margin it
+            // was 156, the floor 376 and 320 by 376 (27,914,240 bytes). At
+            // 224 the square was 273 and the floor 278 (margin 107).
             Case {
                 name: "E 0.03 then 0.049 at 16 MiB",
                 photo: (1280, 4000),
@@ -2547,10 +2552,10 @@ mod tests {
                 budget: small,
                 held: vec![
                     ((268, 268), 268),
-                    ((320, 376), 376),
-                    ((320, 376), 376),
-                    ((320, 376), 376),
-                    ((320, 376), 376),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
                 ],
                 made: 2,
             },
