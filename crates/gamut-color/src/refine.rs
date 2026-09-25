@@ -241,19 +241,21 @@ impl Plan {
 
     /// How many cells around the two a pixel lies among one tile of the GPU
     /// holds, and the twin reads: a box for each gather, the cell beside for
-    /// the bilinear step of the two gathers before the last, and the reached
-    /// field gather 1 weighs its inside by: the cell beside for its bilinear
-    /// read at the pixel and the flood's cells, [`Plan::flood`], which bound
-    /// the steps of its passes. The flood's share is about one Radius.
+    /// the bilinear step of the two gathers before the last, and the flood's
+    /// cells of the reached field gather 1 weighs its inside by,
+    /// [`Plan::flood`], which bound the steps of its passes. The bilinear
+    /// read of the reached field at a pixel takes the two cells the pixel
+    /// lies among and no cell beside them. The flood's share is about one
+    /// Radius.
     pub fn margin(&self) -> u32 {
-        GATHERS as u32 * self.cells + (GATHERS as u32 - 1) + 1 + self.flood
+        GATHERS as u32 * self.cells + (GATHERS as u32 - 1) + self.flood
     }
 
     /// How far around a pixel the filter reads, in render pixels: the margin,
     /// the cell beside for the bilinear step of the last gather, and the cell
     /// a window may cut at its border. Three boxes of 0.71 Radius and the
     /// flood's Radius make it about 3.13 Radius, and the cells beside add
-    /// five cells.
+    /// four cells.
     pub fn reach(&self) -> u32 {
         (self.margin() + 2) * self.step
     }
@@ -790,11 +792,11 @@ mod tests {
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (6000, 4000), (0, 0), (6000, 4000));
         assert_eq!((plan.step, plan.cells), (4, 11), "60 pixels");
         // The flood spreads 15 cells, the radius in cells: three boxes, the
-        // two cells beside of the gathers, the cell beside of the reached
-        // field and its 15.
+        // two cells beside of the gathers and the flood's 15,
+        // 33 + 2 + 15 = 50, and the reach (50 + 2) * 4 = 208 pixels.
         assert_eq!(plan.flood, 15);
-        assert_eq!(plan.margin(), 51);
-        assert_eq!(plan.reach(), 212);
+        assert_eq!(plan.margin(), 50);
+        assert_eq!(plan.reach(), 208);
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (1800, 1200), (0, 0), (1800, 1200));
         assert_eq!((plan.step, plan.cells), (2, 6), "18 pixels");
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (1100, 700), (0, 0), (1100, 700));
@@ -814,7 +816,7 @@ mod tests {
         assert_eq!((window.step, window.cells), (4, 11));
         assert_eq!(window.grid(), ((255, 128), (226, 176)));
         assert_eq!(reach(&on(0.0, 0.05, 50.0), (6000, 4000)), 0, "off");
-        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 212);
+        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 208);
     }
 
     #[test]
@@ -1226,15 +1228,17 @@ mod tests {
     #[test]
     fn a_window_short_by_the_flood_differs_from_the_full_render() {
         // At Radius 0.012 the cells are 1 pixel, the box 5 cells and the
-        // flood 7 cells, steps 1, 2 and 4. The reach less the flood's cells
-        // ends the window at column 481, one short of the outside that
-        // reaches the block's part of the mask, and the three gathers carry
-        // the difference into what is wanted.
+        // flood 7 cells, steps 1, 2 and 4. The margin is 15 + 2 + 7 = 24, the
+        // reach (24 + 2) * 1 = 26 pixels, and the reach less the flood's
+        // cells 19. That ends the window at column 401 + 60 + 19 = 480, two
+        // short of the outside that reaches the block's part of the mask,
+        // and the three gathers carry the difference into what is wanted.
         let radius = 0.012;
         let plan = Plan::new(&on(100.0, radius, 60.0), full_size(), (0, 0), full_size());
         assert_eq!((plan.step, plan.cells, plan.flood), (1, 5, 7));
         let short = plan.reach() - plan.flood * plan.step;
-        assert_eq!(401 + 60 + short, 481);
+        assert_eq!(short, 19);
+        assert_eq!(401 + 60 + short, 480);
         let (pixels, alpha) = block_at_the_end(full_size());
         let (whole, window) = whole_and_window_of(&pixels, &alpha, full_size(), radius, short);
         let most = whole
