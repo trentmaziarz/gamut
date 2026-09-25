@@ -148,10 +148,10 @@ pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// - a strip of a pass of Refine edges, per texel of the pass (a cell or,
 ///   for the apply, a pixel) what it reads and writes: step squared pixels
 ///   and 3 targets for the moments of the source, 19 for a pass of the
-///   flood, 22 step squared + 1 for a moved gather, the cells a box reads
-///   and writes, 23 for the apply (`texel_cost` in refine.rs; over one tile
-///   the family sums to 52 a pixel of its work, 23 a pixel it writes and
-///   28 c + 63 + 19 k a cell, c the radius of its box in cells and k the
+///   flood, 18 step squared + 1 for a moved gather, the cells a box reads
+///   and writes, 19 for the apply (`texel_cost` in refine.rs; over one tile
+///   the family sums to 44 a pixel of its work, 19 a pixel it writes and
+///   28 c + 66 + 19 k a cell, c the radius of its box in cells and k the
 ///   passes of the flood, with every box in the direct loop);
 /// - a strip of a pass of the edge products, 3 a pixel of each pass of Shift
 ///   edge, step squared + 1 a cell for Feather's cells and 2 r + 2 a cell for

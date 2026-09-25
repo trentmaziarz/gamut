@@ -29,8 +29,10 @@
 //! while the steps sum to at most [`Plan::flood`], k = 6 at Radius 0.05, 5 at
 //! 0.03 and 4 at 0.01 on a longer side of 6000 pixels. The flood passes read
 //! `Ec[I]` from the source's moments `r[0]` and take turns between two
-//! R32Float targets, the last pass writing `flood[0]`, which the gathers and
-//! the apply read bilinearly at each pixel. Each of the three gathers takes
+//! R32Float targets, the last pass writing `flood[0]`, which the first
+//! gather reads bilinearly at each pixel; the solve carries each cell's in the
+//! spare fourth channel of `v[3]`, and the later gathers and the apply mix it
+//! from there with the rest of what was solved. Each of the three gathers takes
 //! four: the moments of `wq` over the cells, their box means across and down,
 //! and the solve in one pass of four targets. The two later gathers take `q`
 //! at each pixel as they sum it, the mask moved by what the gather before
@@ -613,10 +615,11 @@ struct Binds {
     far_one: wgpu::BindGroup,
     /// f0, f2: the box across of a gather.
     gather_across: wgpu::BindGroup,
-    /// s0, s1, s2, f0, f2: the solve.
+    /// s0, s1, s2, f0, f2 and the reached field: the solve, which carries
+    /// each cell's reached field in the fourth channel of v3.
     solve: wgpu::BindGroup,
     /// v0 to v3: a later gather, which moves the mask as it sums, and the
-    /// apply.
+    /// apply; they read the reached field from v3.
     moving: wgpu::BindGroup,
     /// What the block pass before each box reads, the same targets first
     /// and never v0 or v1, which it writes.
@@ -769,19 +772,20 @@ pub(crate) struct RefineWork {
 ///   moments and writes 1, 19;
 /// - the first gather reads the alpha, the working texture and 4 cells of
 ///   the reached field at each pixel and writes 2, 6 cell + 2;
-/// - a moved gather reads 22 a pixel (the alpha, the working texture and 4
-///   bilinear reads of the 4 solved targets and of the reached field) and
-///   writes 1, 22 cell + 1;
+/// - a moved gather reads 18 a pixel (the alpha, the working texture and 4
+///   bilinear reads of the 4 solved targets, the reached field riding in the
+///   fourth) and writes 1, 18 cell + 1;
 /// - a box of t targets reads its cells of each and writes each, t
 ///   (box_reads + 1): 2 c + 1 cells in the direct loop, c its radius, and
 ///   the block sums and the cells left over from blocks;
 /// - a block pass of t targets reads 8 cells of each and writes each, 9 t;
-/// - the solve reads 5 targets and writes 4, 9 (5 + 2 in each of two);
-/// - the apply reads 22 and writes 1 at each pixel, 23.
+/// - the solve reads 5 targets and the reached field and writes 4, 10 (6 + 2
+///   in each of two);
+/// - the apply reads 18 and writes 1 at each pixel, 19.
 ///
 /// Over one tile of p pixels of work in n cells, o pixels of the apply and k
 /// passes of the flood, the fused family with every box in the direct loop
-/// sums to 52 p + 23 o + (28 c + 63 + 19 k) n: the ten boxes read 14
+/// sums to 44 p + 19 o + (28 c + 66 + 19 k) n: the ten boxes read 14
 /// targets.
 fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
     let block = u64::from(BLOCK);
@@ -792,14 +796,14 @@ fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
         Pipe::FloodSeed => cell + 1,
         Pipe::Flood => 19,
         Pipe::GatherFirst => 6 * cell + 2,
-        Pipe::GatherMoved => 22 * cell + 1,
+        Pipe::GatherMoved => 18 * cell + 1,
         Pipe::BoxH2 | Pipe::BoxV2 => 2 * (box_reads + 1),
         Pipe::BoxH1 | Pipe::BoxV1 => box_reads + 1,
         Pipe::BlockH2 | Pipe::BlockV2 => 2 * (block + 1),
         Pipe::BlockH1 | Pipe::BlockV1 => block + 1,
-        Pipe::Solve => 9,
-        Pipe::SolveA | Pipe::SolveB => 7,
-        Pipe::Apply => 23,
+        Pipe::Solve => 10,
+        Pipe::SolveA | Pipe::SolveB => 8,
+        Pipe::Apply => 19,
     }
 }
 /// The pipelines of `refine.wgsl`.
@@ -1193,7 +1197,7 @@ impl RefinePass {
                         "refine gather across",
                         [&f[0], &f[2], &v[0], &v[1], &v[2]],
                     ),
-                    solve: group("refine solve", [&s[0], &s[1], &s[2], &f[0], &f[2]]),
+                    solve: group_with("refine solve", reached, [&s[0], &s[1], &s[2], &f[0], &f[2]]),
                     moving: group_with("refine move", reached, [&v[0], &v[1], &v[2], &v[3], &f[1]]),
                     block_cells: group("refine block cells", [&f[1], g, &v[2], &v[3], &s[2]]),
                     block_source_pair: group(
