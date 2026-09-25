@@ -1196,6 +1196,126 @@ fn a_pan_inside_the_zoomed_window_redraws_no_product_and_matches() {
     );
 }
 
+/// A pan that leaves its window onto one built ahead: in each of the four
+/// directions the window ahead is built in a submit of its own while the
+/// current one still renders, the pan steps inside the current window until
+/// what is seen leaves it, and the render there swaps the frame built ahead
+/// in. It replaces no frame, and its output equals a fresh render of that
+/// window on a graph of its own byte for byte, and the full render at the
+/// golden tolerances.
+#[test]
+fn a_window_built_ahead_and_swapped_in_equals_a_fresh_render_of_it() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let edit = zoomed_edit();
+    let readback = Readback::new(&gpu.device);
+    const FULL: (u32, u32) = (SIZE, SIZE);
+    const PAD: (u32, u32) = (8, 8);
+    const GRID: u32 = 4;
+    const STEP: i64 = 4;
+    let start = (20, 22, 24, 20);
+    let window = gamut_gpu::develop::padded_window(FULL, start, PAD, GRID);
+    let at = |rect: (u32, u32, u32, u32), (dx, dy): (i64, i64)| {
+        (
+            (i64::from(rect.0) + dx) as u32,
+            (i64::from(rect.1) + dy) as u32,
+            rect.2,
+            rect.3,
+        )
+    };
+    for step in [(STEP, 0), (0, STEP), (-STEP, 0), (0, -STEP)] {
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        let first = ViewWindow {
+            full: FULL,
+            window,
+            visible: start,
+        };
+        let before = view_render_of(&mut develop, &gpu, &readback, &edit, &first);
+        assert_eq!(develop.window_replaces(), 1, "the first render replaces");
+        let previous = at(start, (-step.0, -step.1));
+        let ahead = gamut_gpu::develop::window_ahead(FULL, window, previous, start, PAD, GRID)
+            .expect("a pan that moves leaves the window");
+        assert!(develop.build_ahead(&edit, FULL, ahead), "built ahead");
+        assert_eq!(develop.window_ahead(), Some((FULL, ahead)));
+        assert!(
+            !develop.build_ahead(&edit, FULL, ahead),
+            "kept, not built again"
+        );
+        // The window built ahead leaves the current one as it was.
+        let still = view_render_of(&mut develop, &gpu, &readback, &edit, &first);
+        assert_eq!(still, before, "the current window after a build ahead");
+        let mut visible = start;
+        while gamut_gpu::develop::holds(window, visible) {
+            let panned = ViewWindow { visible, ..first };
+            view_render_of(&mut develop, &gpu, &readback, &edit, &panned);
+            visible = at(visible, step);
+        }
+        assert!(
+            gamut_gpu::develop::holds(ahead, visible),
+            "{ahead:?} holds {visible:?}"
+        );
+        let (replaces, swaps) = (develop.window_replaces(), develop.window_swaps());
+        let reached = ViewWindow {
+            full: FULL,
+            window: ahead,
+            visible,
+        };
+        let swapped = view_render_of(&mut develop, &gpu, &readback, &edit, &reached);
+        assert_eq!(
+            develop.window_replaces(),
+            replaces,
+            "the swap replaces no frame"
+        );
+        assert_eq!(
+            develop.window_swaps(),
+            swaps + 1,
+            "the frame built ahead is taken"
+        );
+        assert_eq!(
+            develop.window_ahead(),
+            None,
+            "the frame built ahead is in use"
+        );
+        let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+        fresh.set_source(&photo);
+        let alone = view_render_of(&mut fresh, &gpu, &readback, &edit, &reached);
+        assert_eq!(fresh.window_swaps(), 0);
+        let differing = swapped.iter().zip(&alone).filter(|(a, b)| a != b).count();
+        println!("pan {step:?}: window {window:?}, ahead {ahead:?}, swapped in at {visible:?}");
+        println!(
+            "pan {step:?}: bytes that differ from a fresh render of it: {differing} of {}",
+            alone.len()
+        );
+        assert_eq!(
+            swapped, alone,
+            "the swapped window at {visible:?} for the pan {step:?}"
+        );
+        // The full render: a window of the source is not the whole of it,
+        // so it is held at the golden tolerances.
+        let full = full_render_of(&mut fresh, &gpu, &readback, &edit, &reached);
+        let max = max_difference(&full, &swapped);
+        let mean = full
+            .iter()
+            .zip(&swapped)
+            .map(|(a, b)| f64::from(a.abs_diff(*b)))
+            .sum::<f64>()
+            / full.len() as f64;
+        println!("pan {step:?}: against the full render, max difference {max}, mean {mean:.4}");
+        assert!(
+            max <= MAX_DIFFERENCE && mean <= MEAN_DIFFERENCE,
+            "max difference {max}, mean {mean:.4} for the pan {step:?}"
+        );
+    }
+}
+
 /// The red overlay of a mask under a zoomed window is the overlay the full
 /// render shows there.
 #[test]

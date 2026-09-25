@@ -57,6 +57,8 @@
 //! same size rewrites the planes and reruns passes 2 and 3 without
 //! rebuilding any texture.
 
+use std::cmp::Ordering;
+
 use bytemuck::{Pod, Zeroable};
 use gamut_color::SourceSpace;
 use gamut_color::basic;
@@ -527,6 +529,39 @@ pub struct RefineHold {
     pub branch: &'static str,
 }
 
+/// A frame built ahead of a pan: the head passes of the window the pan will
+/// reach, drawn in a submit of their own while the current frame still
+/// serves every render.
+struct NextFrame {
+    /// The picture size and the padded window of the view it was built for.
+    full: (u32, u32),
+    window: PixelRect,
+    frame: Frame,
+}
+
+/// What [`Develop::render_view`] renders for a view: the arguments of
+/// `render_window`.
+struct ViewGeometry {
+    crop: CropRect,
+    render_size: (u32, u32),
+    output_size: (u32, u32),
+    window: CropRect,
+    sigma_size: (u32, u32),
+    products: CropRect,
+}
+
+/// What the head passes of a frame draw: the render, the part of the source
+/// it covers, the size the sigmas come from, the part the products cover,
+/// and whether the texture layer and the transmission map are wanted.
+struct HeadWork {
+    size: (u32, u32),
+    window: CropRect,
+    sigma_size: (u32, u32),
+    products: CropRect,
+    texture: bool,
+    transmission: bool,
+}
+
 /// Which alpha of a mask the develop pass and the overlay read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Product {
@@ -686,6 +721,13 @@ pub struct Develop {
     readback: Readback,
     source: Option<Source>,
     frame: Option<Frame>,
+    /// A frame built ahead of a pan for the window the pan will reach, kept
+    /// beside `frame` and swapped in when a zoomed view asks for its window.
+    next: Option<NextFrame>,
+    /// How many times a render built its frame and ran the head passes in
+    /// its own submit, and how many times it took a frame built ahead.
+    window_replaces: u64,
+    window_swaps: u64,
     out: Option<Output>,
     generation: u64,
     frame_generation: u64,
@@ -873,6 +915,9 @@ impl Develop {
             readback: Readback::new(device),
             source: None,
             frame: None,
+            next: None,
+            window_replaces: 0,
+            window_swaps: 0,
             out: None,
             generation: 0,
             frame_generation: 0,
@@ -936,6 +981,7 @@ impl Develop {
             ),
         });
         self.frame = None;
+        self.next = None;
         log::info!(
             "develop source set: {}x{} {:?} as {format:?}",
             photo.width,
@@ -977,6 +1023,7 @@ impl Develop {
                 atmosphere: dehaze::WHITE_ATMOSPHERE,
             });
             self.frame = None;
+            self.next = None;
             log::info!(
                 "develop video source set: {}x{} {:?} rotation {rotation} {colour:?}",
                 frame.width(),
@@ -1048,6 +1095,29 @@ impl Develop {
         let slot = frame.masks.get(index)?.as_ref()?;
         let refined = slot.refined.as_ref()?;
         Some((&refined.alpha, (frame.width, frame.height)))
+    }
+
+    /// How many times a render replaced its frame and ran the head passes in
+    /// the same submit: the first render of a window, a jump, a zoom change,
+    /// or a pan that left the window with no frame built ahead for it. A
+    /// test reads it to hold that a pan onto a window built ahead pays none.
+    #[doc(hidden)]
+    pub fn window_replaces(&self) -> u64 {
+        self.window_replaces
+    }
+
+    /// How many times a render took the frame built ahead instead of
+    /// replacing its own.
+    #[doc(hidden)]
+    pub fn window_swaps(&self) -> u64 {
+        self.window_swaps
+    }
+
+    /// The picture size and the padded window of the frame built ahead, when
+    /// one is held. A zoomed viewer asks for this window once what is seen
+    /// leaves the one it renders.
+    pub fn window_ahead(&self) -> Option<((u32, u32), PixelRect)> {
+        self.next.as_ref().map(|next| (next.full, next.window))
     }
 
     /// How many brush layers have been stamped whole since the graph was
@@ -1242,6 +1312,8 @@ impl Develop {
         render_size: (u32, u32),
         output_size: (u32, u32),
     ) -> Option<&wgpu::TextureView> {
+        // Only a zoomed view pans onto a frame built ahead.
+        self.next = None;
         self.render_window(
             edit,
             crop,
@@ -1264,6 +1336,8 @@ impl Develop {
         crop: CropRect,
         output_size: (u32, u32),
     ) -> Option<&wgpu::TextureView> {
+        // Only a zoomed view pans onto a frame built ahead.
+        self.next = None;
         let full = render_size_for_crop(crop, output_size);
         let (full_w, full_h) = (full.0 as f32, full.1 as f32);
         let reach = (basic::blur_radius(basic::base_sigma(full.0, full.1)).max(0) as u32)
@@ -1308,6 +1382,94 @@ impl Develop {
         view: &ViewWindow,
     ) -> Option<&wgpu::TextureView> {
         let full = (view.full.0.max(1), view.full.1.max(1));
+        // A frame built ahead at another zoom serves no view of this one.
+        if self.next.as_ref().is_some_and(|next| next.full != full) {
+            self.next = None;
+        }
+        // The view's window is the frame built ahead when the pan reached
+        // it, and render_window swaps that frame in.
+        let geometry = self.view_geometry(edit, view);
+        self.render_window(
+            edit,
+            geometry.crop,
+            geometry.render_size,
+            geometry.output_size,
+            geometry.window,
+            geometry.sigma_size,
+            geometry.products,
+        )
+    }
+
+    /// Builds the frame of `window`, a padded window of a zoomed view of the
+    /// picture at `full`, ahead of the pan that will reach it. Its head
+    /// passes run now, in a submit of their own, and the current frame keeps
+    /// serving every render until [`render_view`](Self::render_view) asks
+    /// for that window, which then takes this frame instead of replacing
+    /// its own. A frame already held for the same window is kept; one held
+    /// for another is dropped. Whether a frame was built.
+    ///
+    /// The frame holds the head passes of the source content it was built
+    /// from. A video frame that arrives before the swap is drawn into it
+    /// at the swap, as into the current frame at every new video frame.
+    pub fn build_ahead(&mut self, edit: &PhotoEdit, full: (u32, u32), window: PixelRect) -> bool {
+        let full = (full.0.max(1), full.1.max(1));
+        let view = ViewWindow {
+            full,
+            window,
+            visible: window,
+        };
+        let geometry = self.view_geometry(edit, &view);
+        let Some(source) = self.source.as_ref() else {
+            return false;
+        };
+        let (width, height) = (geometry.render_size.0.max(1), geometry.render_size.1.max(1));
+        let same = |f: &Frame| {
+            (f.width, f.height, f.generation) == (width, height, source.generation)
+                && f.window == geometry.window
+                && f.sigma_size == geometry.sigma_size
+        };
+        if self.next.as_ref().is_some_and(|next| same(&next.frame))
+            || self.frame.as_ref().is_some_and(same)
+        {
+            return false;
+        }
+        // The frame held for another window goes first, so no more than two
+        // frames are held at once.
+        self.next = None;
+        let mut frame =
+            self.build_frame(source, width, height, geometry.window, geometry.sigma_size);
+        let (texture, transmission) = head_products_wanted(edit, &mask_twin::active_masks(edit));
+        let work = HeadWork {
+            size: (width, height),
+            window: geometry.window,
+            sigma_size: geometry.sigma_size,
+            products: geometry.products,
+            texture,
+            transmission,
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("develop ahead encoder"),
+            });
+        self.head_passes(&mut encoder, &mut frame, &work);
+        // The uniforms the head passes wrote above are Develop's, shared with
+        // the current frame. This submit reads them before any render writes
+        // them again, and a render writes every one it reads in its own.
+        self.queue.submit(Some(encoder.finish()));
+        self.next = Some(NextFrame {
+            full,
+            window,
+            frame,
+        });
+        true
+    }
+
+    /// What `render_window` renders for a zoomed view: the frame holds the
+    /// window plus the reach of the widest head pass on every side, or of
+    /// Refine edges when a mask's reaches further.
+    fn view_geometry(&self, edit: &PhotoEdit, view: &ViewWindow) -> ViewGeometry {
+        let full = (view.full.0.max(1), view.full.1.max(1));
         let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
         let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
         let reach = head_pass_reach(full).max(self.refine_reach(edit, full));
@@ -1326,15 +1488,14 @@ impl Develop {
             width: w as f32 / frame.0,
             height: h as f32 / frame.1,
         };
-        self.render_window(
-            edit,
-            within((vx, vy, vw, vh)),
-            (x1 - x0, y1 - y0),
-            (vw, vh),
+        ViewGeometry {
+            crop: within((vx, vy, vw, vh)),
+            render_size: (x1 - x0, y1 - y0),
+            output_size: (vw, vh),
             window,
-            full,
-            within((wx, wy, ww, wh)),
-        )
+            sigma_size: full,
+            products: within((wx, wy, ww, wh)),
+        }
     }
 
     /// The shared body: renders `window` of the source at `render_size`
@@ -1366,115 +1527,30 @@ impl Develop {
                 || f.window != window
                 || f.sigma_size != sigma_size
         });
-        let rerun = stale
-            || self
-                .frame
-                .as_ref()
-                .is_some_and(|f| f.content != source.content);
         if stale {
-            self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
+            // A frame built ahead for this window is swapped in: its head
+            // passes ran in a submit of their own. Without one the frame is
+            // replaced and its head passes run in this submit.
+            let ahead = self.next.take_if(|next| {
+                let f = &next.frame;
+                (f.width, f.height, f.generation) == (width, height, source.generation)
+                    && f.window == window
+                    && f.sigma_size == sigma_size
+            });
+            match ahead {
+                Some(next) => {
+                    self.frame = Some(next.frame);
+                    self.window_swaps += 1;
+                }
+                None => {
+                    self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
+                    self.window_replaces += 1;
+                }
+            }
             self.frame_generation += 1;
         }
-        if rerun {
-            let frame = self.frame.as_mut().expect("frame built above");
-            frame.content = source.content;
-            let window_uniform = [window.x, window.y, window.width, window.height];
-            let (head_pipeline, head_label) = match &source.kind {
-                SourceKind::Photo { space, .. } => {
-                    let taps = input_taps((source.width, source.height), window, (width, height));
-                    self.queue.write_buffer(
-                        &self.input_uniform,
-                        0,
-                        bytemuck::bytes_of(&InputUniform {
-                            matrix: matrices::input_matrix(*space).to_wgsl_columns(),
-                            render_size: [width as f32, height as f32],
-                            decode_srgb: 1,
-                            taps,
-                            window: window_uniform,
-                        }),
-                    );
-                    (&self.input.pipeline, "input transform")
-                }
-                SourceKind::Video(planes) => {
-                    self.queue.write_buffer(
-                        &self.video_uniform,
-                        0,
-                        bytemuck::bytes_of(&planes.uniform(window_uniform)),
-                    );
-                    (&self.video.pipeline, "video")
-                }
-            };
-            let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
-            draw(
-                &mut encoder,
-                head_label,
-                head_pipeline,
-                &frame.input_bind,
-                &frame.working.view,
-                None,
-            );
-            // Only the columns under the products region are read by the
-            // vertical pass, and only that region by the develop pass, so
-            // the blur and develop passes are scissored to it plus a margin.
-            let columns = scissor_for(products, (width, height), true);
-            let region = scissor_for(products, (width, height), false);
-            draw(
-                &mut encoder,
-                "blur h",
-                &self.blur.pipeline,
-                &frame.blur_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "blur v",
-                &self.blur.pipeline,
-                &frame.blur_v_bind,
-                &frame.base.view,
-                Some(region),
-            );
-        }
-        // The head-pass products of M3. Each is drawn once when its slider
-        // leaves 0 and again only after the head passes ran or the scissor
-        // moved, never on a plain slider change.
-        let frame = self.frame.as_mut().expect("frame built above");
-        let columns = scissor_for(products, (width, height), true);
-        let region = scissor_for(products, (width, height), false);
-        // The develop passes cover only what the output shows. For a zoomed
-        // viewer that is far less than the products cover, so a slider step
-        // costs what it costs on a fitted picture, and a pan inside the
-        // window develops what came into view and runs no head pass.
-        let seen = scissor_for(crop, (width, height), false);
-        if rerun || frame.products_region != Some(region) {
-            frame.texture_ready = false;
-            frame.transmission_ready = false;
-            frame.products_region = Some(region);
-            frame.developed_for = None;
-            // The moments Refine edges holds of the source are of the
-            // working texture as it was.
-            if let Some(scratch) = frame.refine_scratch.as_mut() {
-                scratch.forget_source();
-            }
-            for mask in frame.masks.iter_mut().flatten() {
-                mask.shape = None;
-                mask.refine = None;
-                if let Some(edged) = mask.edged.as_mut() {
-                    edged.held = None;
-                }
-                // A layer with an auto stroke reads the working texture: it
-                // is stamped again when the head passes ran. One without
-                // reads no source pixel and is kept.
-                if rerun {
-                    mask.layers.forget_auto();
-                }
-            }
-        }
-        // The masks that change the picture, and what each develops with. A
-        // mask that alone turns on texture or dehaze asks for the product
-        // the same way the global slider does.
+        // The masks that change the picture, and the head-pass products they
+        // and the global edit want.
         let masks = mask_twin::active_masks(edit);
         // The overlay shows a mask whether or not it adjusts anything yet,
         // so its alpha is drawn even when the mask itself is not.
@@ -1483,91 +1559,25 @@ impl Develop {
             let mask = edit.masks.get(index)?.sanitised();
             Some((index, mask))
         });
-        let effective: Vec<Adjustments> = masks
-            .iter()
-            .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
-            .collect();
-        let wants_texture = edit.texture != 0.0 || effective.iter().any(|e| e.texture != 0.0);
-        let wants_transmission = edit.dehaze != 0.0 || effective.iter().any(|e| e.dehaze != 0.0);
-        if wants_texture && !frame.texture_ready {
-            let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
-            draw(
-                &mut encoder,
-                "texture blur h",
-                &self.blur.pipeline,
-                &frame.texture_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "texture blur v",
-                &self.blur.pipeline,
-                &frame.texture_v_bind,
-                &frame.texture_base.view,
-                Some(region),
-            );
-            frame.texture_ready = true;
-        }
-        if wants_transmission && !frame.transmission_ready {
-            let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
-            let a = source.atmosphere;
-            for (buffer, direction, stage) in [
-                (&self.minimum_h_uniform, [1, 0], 0),
-                (&self.minimum_v_uniform, [0, 1], 1),
-            ] {
-                self.queue.write_buffer(
-                    buffer,
-                    0,
-                    bytemuck::bytes_of(&MinimumUniform {
-                        direction,
-                        radius,
-                        stage,
-                        atmosphere: [a[0], a[1], a[2], 1.0],
-                    }),
-                );
-            }
-            let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
-            write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
-            // The minimum runs over the whole render: the smoothing reads
-            // the map beyond the scissor on every side.
-            draw(
-                &mut encoder,
-                "minimum h",
-                &self.minimum.pipeline,
-                &frame.minimum_h_bind,
-                &frame.ping.view,
-                None,
-            );
-            draw(
-                &mut encoder,
-                "minimum v",
-                &self.minimum.pipeline,
-                &frame.minimum_v_bind,
-                &frame.transmission.view,
-                None,
-            );
-            draw(
-                &mut encoder,
-                "transmission blur h",
-                &self.blur.pipeline,
-                &frame.smooth_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "transmission blur v",
-                &self.blur.pipeline,
-                &frame.smooth_v_bind,
-                &frame.transmission.view,
-                Some(region),
-            );
-            frame.transmission_ready = true;
-        }
+        let (texture, transmission) = head_products_wanted(edit, &masks);
+        let work = HeadWork {
+            size: (width, height),
+            window,
+            sigma_size,
+            products,
+            texture,
+            transmission,
+        };
+        let mut frame = self.frame.take().expect("frame built above");
+        self.head_passes(&mut encoder, &mut frame, &work);
+        self.frame = Some(frame);
+        let frame = self.frame.as_mut().expect("frame built above");
+        let region = scissor_for(products, (width, height), false);
+        // The develop passes cover only what the output shows. For a zoomed
+        // viewer that is far less than the products cover, so a slider step
+        // costs what it costs on a fitted picture, and a pan inside the
+        // window develops what came into view and runs no head pass.
+        let seen = scissor_for(crop, (width, height), false);
         let curves = &edit.look.curves;
         if !curves.is_identity() && self.curves_uploaded.as_ref() != Some(curves) {
             write_table_row(&self.queue, &self.curve_table, 0, &curve::bake(curves));
@@ -2270,6 +2280,187 @@ impl Develop {
         (target, uniform, bind)
     }
 
+    /// The head passes of `frame`: the input transform and the base blur
+    /// when it does not hold the source content yet, then the texture layer
+    /// and the transmission map when `work` wants them and they were not
+    /// drawn since. They read only the frame and the uniforms they write, so
+    /// a frame built ahead runs them in a submit of its own.
+    fn head_passes(&self, encoder: &mut wgpu::CommandEncoder, frame: &mut Frame, work: &HeadWork) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let (width, height) = work.size;
+        let (window, sigma_size, products) = (work.window, work.sigma_size, work.products);
+        let rerun = frame.content != source.content;
+        if rerun {
+            frame.content = source.content;
+            let window_uniform = [window.x, window.y, window.width, window.height];
+            let (head_pipeline, head_label) = match &source.kind {
+                SourceKind::Photo { space, .. } => {
+                    let taps = input_taps((source.width, source.height), window, (width, height));
+                    self.queue.write_buffer(
+                        &self.input_uniform,
+                        0,
+                        bytemuck::bytes_of(&InputUniform {
+                            matrix: matrices::input_matrix(*space).to_wgsl_columns(),
+                            render_size: [width as f32, height as f32],
+                            decode_srgb: 1,
+                            taps,
+                            window: window_uniform,
+                        }),
+                    );
+                    (&self.input.pipeline, "input transform")
+                }
+                SourceKind::Video(planes) => {
+                    self.queue.write_buffer(
+                        &self.video_uniform,
+                        0,
+                        bytemuck::bytes_of(&planes.uniform(window_uniform)),
+                    );
+                    (&self.video.pipeline, "video")
+                }
+            };
+            let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
+            write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
+            write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
+            draw(
+                encoder,
+                head_label,
+                head_pipeline,
+                &frame.input_bind,
+                &frame.working.view,
+                None,
+            );
+            // Only the columns under the products region are read by the
+            // vertical pass, and only that region by the develop pass, so
+            // the blur and develop passes are scissored to it plus a margin.
+            let columns = scissor_for(products, (width, height), true);
+            let region = scissor_for(products, (width, height), false);
+            draw(
+                encoder,
+                "blur h",
+                &self.blur.pipeline,
+                &frame.blur_h_bind,
+                &frame.ping.view,
+                Some(columns),
+            );
+            draw(
+                encoder,
+                "blur v",
+                &self.blur.pipeline,
+                &frame.blur_v_bind,
+                &frame.base.view,
+                Some(region),
+            );
+        }
+        // The head-pass products of M3. Each is drawn once when its slider
+        // leaves 0 and again only after the head passes ran or the scissor
+        // moved, never on a plain slider change.
+        let columns = scissor_for(products, (width, height), true);
+        let region = scissor_for(products, (width, height), false);
+        if rerun || frame.products_region != Some(region) {
+            frame.texture_ready = false;
+            frame.transmission_ready = false;
+            frame.products_region = Some(region);
+            frame.developed_for = None;
+            // The moments Refine edges holds of the source are of the
+            // working texture as it was.
+            if let Some(scratch) = frame.refine_scratch.as_mut() {
+                scratch.forget_source();
+            }
+            for mask in frame.masks.iter_mut().flatten() {
+                mask.shape = None;
+                mask.refine = None;
+                if let Some(edged) = mask.edged.as_mut() {
+                    edged.held = None;
+                }
+                // A layer with an auto stroke reads the working texture: it
+                // is stamped again when the head passes ran. One without
+                // reads no source pixel and is kept.
+                if rerun {
+                    mask.layers.forget_auto();
+                }
+            }
+        }
+        if work.texture && !frame.texture_ready {
+            let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
+            write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
+            write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
+            draw(
+                encoder,
+                "texture blur h",
+                &self.blur.pipeline,
+                &frame.texture_h_bind,
+                &frame.ping.view,
+                Some(columns),
+            );
+            draw(
+                encoder,
+                "texture blur v",
+                &self.blur.pipeline,
+                &frame.texture_v_bind,
+                &frame.texture_base.view,
+                Some(region),
+            );
+            frame.texture_ready = true;
+        }
+        if work.transmission && !frame.transmission_ready {
+            let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
+            let a = source.atmosphere;
+            for (buffer, direction, stage) in [
+                (&self.minimum_h_uniform, [1, 0], 0),
+                (&self.minimum_v_uniform, [0, 1], 1),
+            ] {
+                self.queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::bytes_of(&MinimumUniform {
+                        direction,
+                        radius,
+                        stage,
+                        atmosphere: [a[0], a[1], a[2], 1.0],
+                    }),
+                );
+            }
+            let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
+            write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
+            write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
+            // The minimum runs over the whole render: the smoothing reads
+            // the map beyond the scissor on every side.
+            draw(
+                encoder,
+                "minimum h",
+                &self.minimum.pipeline,
+                &frame.minimum_h_bind,
+                &frame.ping.view,
+                None,
+            );
+            draw(
+                encoder,
+                "minimum v",
+                &self.minimum.pipeline,
+                &frame.minimum_v_bind,
+                &frame.transmission.view,
+                None,
+            );
+            draw(
+                encoder,
+                "transmission blur h",
+                &self.blur.pipeline,
+                &frame.smooth_h_bind,
+                &frame.ping.view,
+                Some(columns),
+            );
+            draw(
+                encoder,
+                "transmission blur v",
+                &self.blur.pipeline,
+                &frame.smooth_v_bind,
+                &frame.transmission.view,
+                Some(region),
+            );
+            frame.transmission_ready = true;
+        }
+    }
+
     fn build_frame(
         &self,
         source: &Source,
@@ -2656,6 +2847,19 @@ fn write_table_row(queue: &wgpu::Queue, table: &wgpu::Texture, row: u32, tables:
     );
 }
 
+/// Whether the edit wants the texture layer and the transmission map. A mask
+/// that alone turns on texture or dehaze asks for the product the same way
+/// the global slider does.
+fn head_products_wanted(edit: &PhotoEdit, masks: &[(usize, Mask)]) -> (bool, bool) {
+    let effective: Vec<Adjustments> = masks
+        .iter()
+        .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
+        .collect();
+    let wants_texture = edit.texture != 0.0 || effective.iter().any(|e| e.texture != 0.0);
+    let wants_transmission = edit.dehaze != 0.0 || effective.iter().any(|e| e.dehaze != 0.0);
+    (wants_texture, wants_transmission)
+}
+
 /// What a zoomed viewer shows, in pixels of the whole picture rendered at
 /// `full`. Rectangles are x, y, width, height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2690,6 +2894,98 @@ pub fn padded_window(
     let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
     let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
     (x, y, width, height)
+}
+
+/// Where `visible` first lies outside `window` when a pan keeps moving it by
+/// the step from `previous` to `visible`, kept inside `full`. `None` while the
+/// pan does not move, or when it moves only toward edges of `window` that are
+/// edges of `full`, so that it never leaves.
+pub fn pan_exit(
+    full: (u32, u32),
+    window: PixelRect,
+    previous: PixelRect,
+    visible: PixelRect,
+) -> Option<PixelRect> {
+    let step = (
+        i64::from(visible.0) - i64::from(previous.0),
+        i64::from(visible.1) - i64::from(previous.1),
+    );
+    // The steps until the pan passes the edge of the window on one axis.
+    let steps = |step: i64, start: u32, size: u32, low: u32, extent: u32, full: u32| {
+        let (start, size, low, high) = (
+            i64::from(start),
+            i64::from(size),
+            i64::from(low),
+            i64::from(low) + i64::from(extent),
+        );
+        match step {
+            0 => None,
+            s if s > 0 && high < i64::from(full) => Some((high - start - size).max(0) / s + 1),
+            s if s < 0 && low > 0 => Some((start - low).max(0) / -s + 1),
+            _ => None,
+        }
+    };
+    let across = steps(step.0, visible.0, visible.2, window.0, window.2, full.0);
+    let down = steps(step.1, visible.1, visible.3, window.1, window.3, full.1);
+    let taken = match (across, down) {
+        (Some(a), Some(d)) => a.min(d),
+        (Some(n), None) | (None, Some(n)) => n,
+        (None, None) => return None,
+    };
+    let moved = |start: u32, size: u32, step: i64, full: u32| {
+        let last = i64::from(full.saturating_sub(size));
+        (i64::from(start) + taken * step).clamp(0, last) as u32
+    };
+    Some((
+        moved(visible.0, visible.2, step.0, full.0),
+        moved(visible.1, visible.3, step.1, full.1),
+        visible.2,
+        visible.3,
+    ))
+}
+
+/// The window to build ahead of a pan: the padded window of what is seen
+/// where the pan leaves `window` (see [`pan_exit`]), moved half the pad
+/// further in the direction of the pan on each axis it moves along. It
+/// holds that rectangle with half the pad behind it, so a pan whose steps
+/// vary by less than that still leaves `window` inside it, and reaches one
+/// and a half pads ahead of it. `None` when the pan never leaves `window`.
+pub fn window_ahead(
+    full: (u32, u32),
+    window: PixelRect,
+    previous: PixelRect,
+    visible: PixelRect,
+    pad: (u32, u32),
+    grid: u32,
+) -> Option<PixelRect> {
+    let exit = pan_exit(full, window, previous, visible)?;
+    let ahead = |start: u32, size: u32, pan: Ordering, pad: u32, full: u32| match pan {
+        Ordering::Greater => start.saturating_add(pad).min(full.saturating_sub(size)),
+        Ordering::Less => start.saturating_sub(pad),
+        Ordering::Equal => start,
+    };
+    let (x, y) = (
+        ahead(
+            exit.0,
+            exit.2,
+            visible.0.cmp(&previous.0),
+            pad.0 / 2,
+            full.0,
+        ),
+        ahead(
+            exit.1,
+            exit.3,
+            visible.1.cmp(&previous.1),
+            pad.1 / 2,
+            full.1,
+        ),
+    );
+    let moved = padded_window(full, (x, y, exit.2, exit.3), pad, grid);
+    Some(if holds(moved, exit) {
+        moved
+    } else {
+        padded_window(full, exit, pad, grid)
+    })
 }
 
 /// Whether `inner` lies inside `window`.
@@ -3061,11 +3357,89 @@ fn draw_loading(
 mod tests {
     use super::{
         DevelopUniform, FLAG_CURVES, Geometry, MAX_TAPS, MaskComponentUniform, MaskUniform,
-        MinimumUniform, OutputUniform, input_taps, scissor_for,
+        MinimumUniform, OutputUniform, PixelRect, holds, input_taps, padded_window, pan_exit,
+        scissor_for, window_ahead,
     };
     use gamut_core::mask::{Component, LinearGradient, MaskOp, MaskSource, RadialGradient};
     use gamut_core::{Adjustments, CropRect, Mask};
     use std::mem::offset_of;
+
+    /// The window a pan will reach, for each of the four directions of a
+    /// steady pan of 32 pixels a step at 100 percent of a 6000 by 4000 photo
+    /// in a 1280 by 1600 tab: the rectangle seen where the pan first leaves
+    /// the window is the one the steps reach, and the window ahead holds it,
+    /// keeps the cross axis of the window it follows and reaches past that
+    /// window in the pan's direction.
+    #[test]
+    fn a_window_ahead_lies_where_a_pan_leaves_in_each_of_four_directions() {
+        const FULL: (u32, u32) = (6000, 4000);
+        const PAD: (u32, u32) = (640, 800);
+        const GRID: u32 = 64;
+        const STEP: i64 = 32;
+        let visible: PixelRect = (2359, 1199, 1281, 1601);
+        let window = padded_window(FULL, visible, PAD, GRID);
+        assert_eq!(window, (1664, 384, 2624, 3264));
+        let at = |rect: PixelRect, (dx, dy): (i64, i64)| -> PixelRect {
+            (
+                (i64::from(rect.0) + dx) as u32,
+                (i64::from(rect.1) + dy) as u32,
+                rect.2,
+                rect.3,
+            )
+        };
+        // Right, down, left, up: the step, the exit and the window ahead.
+        let cases = [
+            ((STEP, 0), (3031, 1199), (2688, 384, 2624, 3264)),
+            ((0, STEP), (2359, 2063), (1664, 1536, 2624, 2464)),
+            ((-STEP, 0), (1655, 1199), (640, 384, 2624, 3264)),
+            ((0, -STEP), (2359, 367), (1664, 0, 2624, 2432)),
+        ];
+        for (step, exit, expected) in cases {
+            let previous = at(visible, (-step.0, -step.1));
+            let left = pan_exit(FULL, window, previous, visible).expect("the pan leaves");
+            // The steps themselves: the first rectangle outside the window.
+            let mut walked = visible;
+            while holds(window, walked) {
+                walked = at(walked, step);
+            }
+            assert_eq!(left, walked, "exit of the pan {step:?}");
+            assert_eq!((left.0, left.1), exit, "exit of the pan {step:?}");
+            let ahead =
+                window_ahead(FULL, window, previous, visible, PAD, GRID).expect("a window ahead");
+            assert_eq!(ahead, expected, "window ahead of the pan {step:?}");
+            assert!(holds(ahead, left), "{ahead:?} holds the exit {left:?}");
+            assert!(
+                !holds(window, left),
+                "the exit {left:?} is out of {window:?}"
+            );
+            let reach = |rect: PixelRect| match step {
+                (dx, _) if dx > 0 => i64::from(rect.0 + rect.2),
+                (dx, _) if dx < 0 => -i64::from(rect.0),
+                (_, dy) if dy > 0 => i64::from(rect.1 + rect.3),
+                _ => -i64::from(rect.1),
+            };
+            assert!(
+                reach(ahead) > reach(window),
+                "{ahead:?} reaches past {window:?} toward {step:?}"
+            );
+            // The cross axis is the window's own.
+            if step.0 == 0 {
+                assert_eq!((ahead.0, ahead.2), (window.0, window.2));
+            } else {
+                assert_eq!((ahead.1, ahead.3), (window.1, window.3));
+            }
+        }
+        // No step, no window ahead; a pan toward an edge of the picture the
+        // window already touches never leaves it.
+        assert_eq!(
+            window_ahead(FULL, window, visible, visible, PAD, GRID),
+            None
+        );
+        let corner = padded_window(FULL, (0, 0, 1281, 1601), PAD, GRID);
+        let still = (0, 0, 1281, 1601);
+        assert_eq!(pan_exit(FULL, corner, (32, 0, 1281, 1601), still), None);
+        assert_eq!(pan_exit(FULL, corner, (0, 32, 1281, 1601), still), None);
+    }
 
     #[test]
     fn a_window_at_one_source_pixel_a_pixel_takes_one_tap() {
