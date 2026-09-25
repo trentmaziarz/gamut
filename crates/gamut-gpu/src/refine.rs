@@ -2424,91 +2424,129 @@ mod tests {
         }
         let budget = SCRATCH_BUDGET_BYTES;
         let small = 16 * 1024 * 1024;
+        // The sizes below are at CELL_BYTES 232 and the margin of 3 cells a
+        // box, 2 cells beside, 1 cell for the reached field's read and the
+        // flood's cells. The budget holds 402,653,184 / 232 = 1,735,574
+        // cells, a square of 1317 (1317 squared is 1,734,489, 1317 by 1318
+        // is 1,735,806). At 224 bytes and the margin of 3 cells a box and 2
+        // it held 1,797,558 cells, a square of 1340 and one column more.
         let cases = [
             // The 24 megapixel photo: step 4 whole, then step 1 cut at the
-            // rows 1500 columns leave the budget.
+            // rows 1500 columns leave the budget. 0.05 is 300 pixels: step
+            // 4, 53 cells, flood 75, margin 237, floor 538; its grid of 1500
+            // by 1000 is 348,000,000 bytes, whole. 0.0012 is 7.2 pixels:
+            // step 1, 5 cells, flood 7, margin 25, floor 114, grid 6000 by
+            // 4000, side 1317. 1500 by 1317 is 458,316,000 bytes, so the
+            // rows are cut at 402,653,184 / (1500 * 232) = 1157.05: 1157,
+            // 402,636,000 bytes. At 224 the cut was 1198.
             Case {
                 name: "A 0.05 then 0.0012",
                 photo: (6000, 4000),
                 radii: vec![0.05, 0.0012],
                 budget,
-                held: vec![((1500, 1000), 1500), ((1500, 1198), 1198)],
+                held: vec![((1500, 1000), 1500), ((1500, 1157), 1157)],
                 made: 2,
             },
+            // Step 1 first holds 1317 by 1317 (402,401,448 bytes). Step 4
+            // wants 1500 by 1000; 1318 by 1317 is 402,706,992 bytes, over,
+            // so its tiles are cut at 1317 and the scratch is kept. At 224
+            // the held square was 1340 and the cut 1341 by 1340, made.
             Case {
                 name: "A 0.0012 then 0.05",
                 photo: (6000, 4000),
                 radii: vec![0.0012, 0.05],
                 budget,
-                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
-                made: 2,
+                held: vec![((1317, 1317), 1317), ((1317, 1317), 1317)],
+                made: 1,
             },
-            // The worst found: a step 3 grid of 2731 by 658 cells, whole.
+            // The worst found at 224: a step 3 grid of 2731 by 658 cells,
+            // whole at 402,527,552 bytes. At 232 it is 416,903,536 bytes and
+            // not whole: 0.0035 is 28.672 pixels, step 3, 7 cells, flood 9,
+            // margin 33, floor 130, side 1317, 1317 by 658. 0.001 is 8.192
+            // pixels, step 1, 6 cells, flood 8, margin 29, floor 122, and
+            // wants 1317 by 1317, which fits: made again at 1317 by 1317.
+            // At 224 the second plan cut at 658 inside 2731 by 658, kept.
             Case {
                 name: "B 0.0035 then 0.001",
                 photo: (8192, 1974),
                 radii: vec![0.0035, 0.001],
                 budget,
-                held: vec![((2731, 658), 2731), ((2731, 658), 658)],
-                made: 1,
+                held: vec![((1317, 658), 1317), ((1317, 1317), 1317)],
+                made: 2,
             },
+            // 0.05 is 409.6 pixels: step 4, 73 cells, flood 102, margin 324,
+            // floor 712; its grid of 2048 by 494 is whole, and 2048 by 1317
+            // is over, so it is cut at 1317 and kept. 0.0025 is 20.48
+            // pixels: step 2, 7 cells, flood 10, margin 34, floor 132, and
+            // wants 1317 by 987, inside what is held. At 224 every plan kept
+            // 2731 by 658 at sides 2731, 658, 2048 and 658.
             Case {
                 name: "B 0.0035, 0.001, 0.05, 0.0025",
                 photo: (8192, 1974),
                 radii: vec![0.0035, 0.001, 0.05, 0.0025],
                 budget,
                 held: vec![
-                    ((2731, 658), 2731),
-                    ((2731, 658), 658),
-                    ((2731, 658), 2048),
-                    ((2731, 658), 658),
+                    ((1317, 658), 1317),
+                    ((1317, 1317), 1317),
+                    ((1317, 1317), 1317),
+                    ((1317, 1317), 1317),
                 ],
-                made: 1,
+                made: 2,
             },
+            // Step 1 first holds 1317 by 1317; step 3 wants 1317 by 658
+            // inside it. At 224 the second plan cut at 1341, made.
             Case {
                 name: "B 0.001 then 0.0035",
                 photo: (8192, 1974),
                 radii: vec![0.001, 0.0035],
                 budget,
-                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
-                made: 2,
+                held: vec![((1317, 1317), 1317); 2],
+                made: 1,
             },
             // The control: no grid of the largest square photo is whole.
+            // 1317 by 1317 at every step; 1340 by 1340 at 224.
             Case {
                 name: "C 0.05, 0.001, 0.0025, 0.0035",
                 photo: (8192, 8192),
                 radii: vec![0.05, 0.001, 0.0025, 0.0035],
                 budget,
-                held: vec![((1340, 1340), 1340); 4],
+                held: vec![((1317, 1317), 1317); 4],
                 made: 1,
             },
             // Two masks on the 24 megapixel photo, rendered alternately ten
-            // times: made twice, then held.
+            // times: made twice, then held, at the sizes of case A's first
+            // order (1157 rows; 1198 at 224).
             Case {
                 name: "D 0.05 and 0.0012 ten times",
                 photo: (6000, 4000),
                 radii: [0.05, 0.0012].repeat(10),
                 budget,
-                held: [((1500, 1000), 1500), ((1500, 1198), 1198)]
+                held: [((1500, 1000), 1500), ((1500, 1157), 1157)]
                     .into_iter()
-                    .chain([((1500, 1198), 1500), ((1500, 1198), 1198)].repeat(9))
+                    .chain([((1500, 1157), 1500), ((1500, 1157), 1157)].repeat(9))
                     .collect(),
                 made: 2,
             },
-            // The floor branch: at 16 MiB the box of step 4 at 0.049 needs
-            // 278 cells a side, and 278 by 278 passes the budget alone. The
+            // The floor branch: 16 MiB holds 16,777,216 / 232 = 72,315
+            // cells, a square of 268 (268 squared is 71,824, 269 squared is
+            // 72,361). 0.03 is 120 pixels: step 4, 21 cells, flood 30,
+            // margin 96, floor 256, so 268 by 268. 0.049 is 196 pixels: step
+            // 4, 35 cells, flood 49, margin 157, and the box needs a floor of
+            // 157 * 2 + 64 = 378 cells a side; the grid is 320 cells wide,
+            // and 320 by 378 (28,062,720 bytes) passes the budget alone. The
             // same plan three more times keeps what the floor branch made.
+            // At 224 the square was 273 and the floor 278 (margin 107).
             Case {
                 name: "E 0.03 then 0.049 at 16 MiB",
                 photo: (1280, 4000),
                 radii: vec![0.03, 0.049, 0.049, 0.049, 0.049],
                 budget: small,
                 held: vec![
-                    ((273, 273), 273),
-                    ((278, 278), 278),
-                    ((278, 278), 278),
-                    ((278, 278), 278),
-                    ((278, 278), 278),
+                    ((268, 268), 268),
+                    ((320, 378), 378),
+                    ((320, 378), 378),
+                    ((320, 378), 378),
+                    ((320, 378), 378),
                 ],
                 made: 2,
             },

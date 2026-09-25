@@ -4210,16 +4210,21 @@ fn read_r8(gpu: &Headless, view: &wgpu::TextureView, size: (u32, u32)) -> Vec<u8
     bytes
 }
 
-/// The budget of the scratch in the test below: 112,560 cells of 224 bytes,
-/// 335 by 336. Its square side is 335, as 1340 is the default budget's, and
-/// like the default budget it holds one column more than that square.
-const SMALL_SCRATCH_BUDGET: u64 = 335 * 336 * 224;
+/// The budget of the scratch in the test below: 112,560 cells of 232 bytes
+/// (CELL_BYTES), 335 by 336, 26,113,920 bytes. Its square side is 335, about
+/// a quarter of the default budget's 1317, and it holds one column more than
+/// that square. At 224 bytes a cell it was 25,213,440 bytes, the same cells.
+const SMALL_SCRATCH_BUDGET: u64 = 335 * 336 * CELL_BYTES;
+
+/// The bytes one cell of a tile costs the scratch, as `CELL_BYTES` in
+/// refine.rs: fourteen Rgba32Float targets of 16 bytes and two R32Float of 4.
+const CELL_BYTES: u64 = 14 * 16 + 2 * 4;
 
 /// Two refined masks of one frame at different steps share its scratch and
 /// keep it inside the budget, and each draws the refined alpha it draws
 /// alone. The 24 megapixel photo of the timing test at the default budget
 /// ran 212 s on the fallback adapter, so this is its case at a quarter of
-/// each side: a 1500 by 1000 photo under 25,213,440 bytes
+/// each side: a 1500 by 1000 photo under 26,113,920 bytes
 /// ([`SMALL_SCRATCH_BUDGET`]). A Radius of 0.05 is 75 pixels there: cells of
 /// 4, a grid of 375 by 250 (93,750 cells, one tile of 375). One of 0.0012 is
 /// 1.8 pixels: cells of one, a grid of 1500 by 1000, tiled at 335 alone.
@@ -4227,8 +4232,12 @@ const SMALL_SCRATCH_BUDGET: u64 = 335 * 336 * 224;
 /// cuts its tiles at 300, the most rows 375 columns leave: 375 by 300 is
 /// 112,500 cells, and 375 by 301 would be 112,875. After 0.0012, the step 4
 /// mask would want 375 by 335, so it cuts at 336: 336 by 335 is 112,560,
-/// and 337 by 335 would be 112,895. These are the cuts at 1198 and 1341 of
-/// the 24 megapixel photo at the default budget.
+/// and 337 by 335 would be 112,895. The floors, 184 cells at step 4 (margin
+/// 60) and 78 at step 1 (margin 7), lie under both cuts. The first is the
+/// cut at 1157 of the 24 megapixel photo at the default budget. The default
+/// budget holds no column beside its square of 1317 (1318 by 1317 is
+/// 1,735,806 cells, over its 1,735,574), so there the second order keeps
+/// 1317 by 1317; this budget keeps the column, and the cut, of 224 bytes.
 #[test]
 fn two_masks_at_different_steps_hold_their_scratch_inside_the_budget() {
     let _turn = ONE_AT_A_TIME
@@ -4336,7 +4345,7 @@ fn two_masks_at_different_steps_hold_their_scratch_inside_the_budget() {
             (held, side, true, "Cut"),
             "{order}: the scratch of the second mask"
         );
-        let bytes = u64::from(hold.size.0) * u64::from(hold.size.1) * 224;
+        let bytes = u64::from(hold.size.0) * u64::from(hold.size.1) * CELL_BYTES;
         assert!(bytes <= SMALL_SCRATCH_BUDGET, "{order}: {bytes} bytes");
         for (index, mask) in masks.into_iter().enumerate() {
             let differing = alphas[index]
