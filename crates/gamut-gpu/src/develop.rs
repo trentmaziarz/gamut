@@ -1180,10 +1180,19 @@ pub struct Develop {
     /// A frame built ahead of a pan for the window the pan will reach, kept
     /// beside `frame` and swapped in when a zoomed view asks for its window.
     next: Option<NextFrame>,
+    /// The frame a swap took out of use, kept for its textures: the next
+    /// frame built ahead is drawn into them when its size is theirs, so a
+    /// steady pan takes no new device memory once it holds two frames. A
+    /// swap leaves no frame built ahead, and the build that follows takes
+    /// this one or drops it before it makes a frame, so no more than two
+    /// frames of textures are held at once.
+    spare: Option<Frame>,
     /// How many times a render built its frame and ran the head passes in
     /// its own submit, and how many times it took a frame built ahead.
     window_replaces: u64,
     window_swaps: u64,
+    /// How many frames were made with textures of their own.
+    frame_makes: u64,
     /// The texels one slice of a frame built ahead records at most, and how
     /// many slices have been submitted.
     ahead_slice_texels: u64,
@@ -1376,8 +1385,10 @@ impl Develop {
             source: None,
             frame: None,
             next: None,
+            spare: None,
             window_replaces: 0,
             window_swaps: 0,
+            frame_makes: 0,
             ahead_slice_texels: AHEAD_SLICE_TEXELS,
             ahead_slices: 0,
             out: None,
@@ -1444,6 +1455,7 @@ impl Develop {
         });
         self.frame = None;
         self.next = None;
+        self.spare = None;
         log::info!(
             "develop source set: {}x{} {:?} as {format:?}",
             photo.width,
@@ -1486,6 +1498,7 @@ impl Develop {
             });
             self.frame = None;
             self.next = None;
+            self.spare = None;
             log::info!(
                 "develop video source set: {}x{} {:?} rotation {rotation} {colour:?}",
                 frame.width(),
@@ -1597,12 +1610,23 @@ impl Develop {
         self.ahead_slices
     }
 
-    /// Drops the frame built ahead, complete or still building, as a render
-    /// at another zoom drops it. Whether one was held. A test drops it after
-    /// a pan, so the renders it times next hold one frame.
+    /// Drops the frame built ahead, complete or still building, and the
+    /// frame kept for its textures, as a render at another zoom drops them.
+    /// Whether a frame built ahead was held. A test drops it after a pan, so
+    /// the renders it times next hold one frame.
     #[doc(hidden)]
     pub fn drop_ahead(&mut self) -> bool {
+        self.spare = None;
         self.next.take().is_some()
+    }
+
+    /// How many frames were made with textures of their own: a render that
+    /// replaced its frame, and a frame built ahead that found no frame kept
+    /// for its textures of its size. A test reads it to hold that a steady
+    /// pan takes no new frame textures once it holds two frames.
+    #[doc(hidden)]
+    pub fn frame_makes(&self) -> u64 {
+        self.frame_makes
     }
 
     /// Sets how many texels one slice of a frame built ahead records at most,
@@ -1838,6 +1862,7 @@ impl Develop {
     ) -> Option<&wgpu::TextureView> {
         // Only a zoomed view pans onto a frame built ahead.
         self.next = None;
+        self.spare = None;
         self.render_window(
             edit,
             crop,
@@ -1862,6 +1887,7 @@ impl Develop {
     ) -> Option<&wgpu::TextureView> {
         // Only a zoomed view pans onto a frame built ahead.
         self.next = None;
+        self.spare = None;
         let full = render_size_for_crop(crop, output_size);
         let (full_w, full_h) = (full.0 as f32, full.1 as f32);
         let reach = (basic::blur_radius(basic::base_sigma(full.0, full.1)).max(0) as u32)
@@ -1906,9 +1932,17 @@ impl Develop {
         view: &ViewWindow,
     ) -> Option<&wgpu::TextureView> {
         let full = (view.full.0.max(1), view.full.1.max(1));
-        // A frame built ahead at another zoom serves no view of this one.
+        // A frame built ahead at another zoom serves no view of this one,
+        // and a frame kept for its textures is of another size there.
         if self.next.as_ref().is_some_and(|next| next.full != full) {
             self.next = None;
+        }
+        if self
+            .spare
+            .as_ref()
+            .is_some_and(|spare| spare.sigma_size != full)
+        {
+            self.spare = None;
         }
         // The view's window is the frame built ahead when the pan reached
         // it, and render_window swaps that frame in.
@@ -1975,8 +2009,20 @@ impl Develop {
             // The frame held for another window goes first, so no more than
             // two frames are held at once.
             self.next = None;
-            let frame =
-                self.build_frame(source, width, height, geometry.window, geometry.sigma_size);
+            // The frame a swap took out of use is drawn into when its
+            // textures are of this size, and dropped before a frame is made
+            // otherwise.
+            let frame = match self.spare.take() {
+                Some(mut spare) if spare.fits(width, height, source.generation) => {
+                    spare.renew(source, geometry.window, geometry.sigma_size);
+                    spare
+                }
+                spare => {
+                    drop(spare);
+                    self.frame_makes += 1;
+                    self.build_frame(source, width, height, geometry.window, geometry.sigma_size)
+                }
+            };
             let (texture, transmission) =
                 head_products_wanted(edit, &mask_twin::active_masks(edit));
             let passes = HeadPass::plan(frame.content != source.content, texture, transmission);
@@ -2766,11 +2812,18 @@ impl Develop {
             });
             match ahead {
                 Some(next) if next.build.complete() => {
-                    self.frame = Some(next.frame);
+                    // The frame taken out of use keeps its textures for the
+                    // next frame built ahead. No frame is built ahead now,
+                    // so the two are all the frames held.
+                    self.spare = self.frame.replace(next.frame);
                     self.window_swaps += 1;
                 }
                 building => {
                     drop(building);
+                    // A frame is made here, beside the one it replaces: the
+                    // frame kept for its textures goes first.
+                    self.spare = None;
+                    self.frame_makes += 1;
                     self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
                     self.window_replaces += 1;
                 }
@@ -4048,6 +4101,59 @@ fn write_table_row(queue: &wgpu::Queue, table: &wgpu::Texture, row: u32, tables:
             depth_or_array_layers: 1,
         },
     );
+}
+
+impl Frame {
+    /// Whether a frame of `width` by `height` over the source textures of
+    /// `generation` can be drawn into this one: the size and the source are
+    /// its own, and so is the size of each of its seven textures. The
+    /// textures of the masks are of the frame's size as well.
+    fn fits(&self, width: u32, height: u32, generation: u64) -> bool {
+        (self.width, self.height, self.generation) == (width, height, generation)
+            && [
+                &self.working,
+                &self.ping,
+                &self.base,
+                &self.texture_base,
+                &self.transmission,
+                &self.developed,
+                &self.developed_other,
+            ]
+            .iter()
+            .all(|target| (target.width, target.height) == (width, height))
+    }
+
+    /// Makes this frame, which a swap took out of use, the frame of `window`
+    /// of `source` with the sigmas of `sigma_size`, holding what a frame
+    /// [`Develop::build_frame`] makes holds: every key and done flag says
+    /// nothing is drawn. The textures and the bind groups over them are
+    /// kept; their pixels are of the window before, and each is drawn before
+    /// it is read, as on a new frame: the first strip of every head pass
+    /// clears its target, and every mask product is drawn again. The refine
+    /// scratch and the edge scratch are kept while their sizes fit, which
+    /// the passes that lay them out test, and hold no moments of the
+    /// source; a product texture made from here on gets a new id.
+    fn renew(&mut self, source: &Source, window: CropRect, sigma_size: (u32, u32)) {
+        self.window = window;
+        self.sigma_size = sigma_size;
+        // The head passes have not run into these textures for this window.
+        self.content = source.content.wrapping_sub(1);
+        self.texture_ready = false;
+        self.transmission_ready = false;
+        self.products_region = None;
+        self.developed_for = None;
+        self.developed_passes = 0;
+        // The alphas, the refined alphas, the edge products and the moments
+        // of the source.
+        forget_products(self, true);
+        for mask in self.masks.iter_mut().flatten() {
+            // Every brush layer is stamped again: its dabs are placed in the
+            // pixels of the window before.
+            mask.layers.forget();
+            mask.alpha_region = (0, 0, 0, 0);
+            mask.refined_region = (0, 0, 0, 0);
+        }
+    }
 }
 
 /// Forgets what the mask products of `frame` hold of its working texture,

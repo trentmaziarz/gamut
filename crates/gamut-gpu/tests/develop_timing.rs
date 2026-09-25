@@ -27,10 +27,13 @@
 //! in it, are printed for the record. Then a steady pan of 32 source pixels
 //! a frame at 100 percent with the five masks, right, down, left and up,
 //! crosses the edge of the window at least three times, with the window
-//! ahead of it built as the viewer builds it, one slice a frame. It holds
-//! that no crossing replaces the window in one submit, and its p95 and its
-//! maximum are held to the gate. The frame it leaves built ahead is dropped
-//! after it, so the lines after it time renders that hold one frame.
+//! ahead of it built as the viewer builds it, one slice a frame. A warm-up
+//! leg of one crossing comes before it and is not timed, so the pan holds
+//! two frames when the measurement starts. It holds that no crossing
+//! replaces the window in one submit and that no frame of the measured pan
+//! makes textures of its own, and its p95 and its maximum are held to the
+//! gate. The frames it leaves are dropped after it, so the lines after it
+//! time renders that hold one frame.
 //!
 //! The auto brush comes after it: a sixth mask that is a brush of 500 auto
 //! strokes of 50 points, a third of them painted with a pen whose pressure
@@ -141,6 +144,15 @@ fn percentiles(mut times: Vec<f64>) -> (f64, f64, f64) {
 const EDGE_PAN_LEGS: [((i64, i64), u32); 4] =
     [((1, 0), 64), ((0, 1), 36), ((-1, 0), 64), ((0, -1), 36)];
 
+/// The steps of the warm-up leg before the pan across the window edge:
+/// rightward to where the measured pan begins, across the edge of the window
+/// once. The first render of a pan and its first build ahead make the
+/// textures of their frames, and a steady pan is what follows them: once a
+/// swap has left a frame, each window built ahead is drawn into the textures
+/// of the frame the swap before it left. So the warm-up crosses once,
+/// untimed, and the pan is measured from there.
+const WARM_UP_STEPS: u32 = 24;
+
 /// The rectangles seen on each frame of a steady pan from `start` through
 /// `legs`, one [`PAN_STEP`] a frame.
 fn pan_legs(start: PixelRect, legs: &[((i64, i64), u32)]) -> Vec<PixelRect> {
@@ -157,9 +169,14 @@ fn pan_legs(start: PixelRect, legs: &[((i64, i64), u32)]) -> Vec<PixelRect> {
     path
 }
 
-/// What a pan across the edge of the window drew, beside its frame times.
+/// What a pan across the edge of the window drew, beside its frame times,
+/// counted from the end of its warm-up.
 struct EdgePan {
     times: Vec<f64>,
+    /// The frames of the warm-up, and how many of them crossed the edge of
+    /// the window.
+    warm_up_frames: usize,
+    warm_up_crossings: u64,
     /// Frames whose window was not the one of the frame before.
     crossings: u64,
     /// Renders that replaced the frame and ran the head passes in one submit.
@@ -168,31 +185,64 @@ struct EdgePan {
     swaps: u64,
     /// Slices of frames built ahead submitted.
     slices: u64,
+    /// Frames made with textures of their own.
+    frame_makes: u64,
 }
 
-/// A pan through `path` as the zoomed viewer draws it, one UI frame a
-/// rectangle seen, after an untimed render of `start`. Each frame asks for
-/// the window the viewer asks for: the one rendered while it holds what is
-/// seen, else the one built ahead when it holds it, else a new padded one.
-/// It renders that and then drives the build ahead as the viewer does, once
-/// a frame while the pan moves. Each frame is timed from the render to the
-/// device poll after both.
+/// A pan through `warm_up` and then `path` as the zoomed viewer draws it,
+/// one UI frame a rectangle seen, after an untimed render of `start`. Each
+/// frame asks for the window the viewer asks for: the one rendered while it
+/// holds what is seen, else the one built ahead when it holds it, else a new
+/// padded one. It renders that and then drives the build ahead as the viewer
+/// does, once a frame while the pan moves. Each frame of `path` is timed
+/// from the render to the device poll after both, and the counts are taken
+/// over `path` alone; the frames of `warm_up` are drawn the same way and
+/// neither timed nor counted.
 fn pan_across_edge(
     gpu: &Headless,
     develop: &mut Develop,
     edit: &PhotoEdit,
     start: &ViewWindow,
     pad: (u32, u32),
+    warm_up: &[PixelRect],
     path: &[PixelRect],
 ) -> EdgePan {
     let full = start.full;
     timed_view(gpu, develop, edit, start);
-    let (replaces, swaps, slices) = (
+    let (mut window, mut previous) = (start.window, start.visible);
+    let mut crossings = 0;
+    for &visible in warm_up {
+        let asked = if holds(window, visible) {
+            window
+        } else {
+            crossings += 1;
+            develop
+                .window_ahead()
+                .filter(|&(held, ahead)| held == full && holds(ahead, visible))
+                .map_or_else(
+                    || padded_window(full, visible, pad, WINDOW_GRID),
+                    |(_, ahead)| ahead,
+                )
+        };
+        let view = ViewWindow {
+            full,
+            window: asked,
+            visible,
+        };
+        develop.render_view(edit, &view).expect("the source is set");
+        drive_ahead(develop, edit, &view, previous, pad);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        (window, previous) = (asked, visible);
+    }
+    let warm_up_crossings = crossings;
+    let (replaces, swaps, slices, makes) = (
         develop.window_replaces(),
         develop.window_swaps(),
         develop.ahead_slices(),
+        develop.frame_makes(),
     );
-    let (mut window, mut previous) = (start.window, start.visible);
     let mut crossings = 0;
     let mut times = Vec::with_capacity(path.len());
     for &visible in path {
@@ -224,10 +274,13 @@ fn pan_across_edge(
     }
     EdgePan {
         times,
+        warm_up_frames: warm_up.len(),
+        warm_up_crossings,
         crossings,
         replaces: develop.window_replaces() - replaces,
         swaps: develop.window_swaps() - swaps,
         slices: develop.ahead_slices() - slices,
+        frame_makes: develop.frame_makes() - makes,
     }
 }
 
@@ -1153,19 +1206,54 @@ fn develop_at_viewer_size_is_fast_enough() {
         // and up, across the edge of the window, with the window ahead of it
         // built one slice a frame as the viewer builds it. No crossing
         // replaces the window in one submit: each takes the frame built
-        // ahead.
+        // ahead. The first render of a pan and its first build ahead are not
+        // part of a steady pan: they make the textures of the two frames a
+        // steady pan draws into. A warm-up leg rightward to where the pan
+        // begins crosses the edge once before the measurement, untimed, so
+        // the pan holds two frames when the measurement starts, and no
+        // measured frame makes frame textures of its own.
         let path = pan_legs(actual.visible, &EDGE_PAN_LEGS);
         assert!(
             path.iter()
                 .all(|&(x, y, w, h)| x + w <= full.0 && y + h <= full.1),
             "the pan stays inside the photo"
         );
-        let pan = pan_across_edge(&gpu, &mut develop, &painted, &actual, pad, &path);
+        let (x, y, w, h) = actual.visible;
+        let warm_start = (x - WARM_UP_STEPS * PAN_STEP, y, w, h);
+        let warm_up = pan_legs(warm_start, &[((1, 0), WARM_UP_STEPS)]);
+        assert_eq!(
+            warm_up.last(),
+            Some(&actual.visible),
+            "the warm-up ends where the pan begins"
+        );
+        let warm_view = ViewWindow {
+            full,
+            window: padded_window(full, warm_start, pad, WINDOW_GRID),
+            visible: warm_start,
+        };
+        let pan = pan_across_edge(
+            &gpu,
+            &mut develop,
+            &painted,
+            &warm_view,
+            pad,
+            &warm_up,
+            &path,
+        );
+        println!(
+            "warm-up before the steady pan, not timed and not counted: {} frames rightward to where the pan begins, {} crossings",
+            pan.warm_up_frames, pan.warm_up_crossings
+        );
+        assert_eq!(
+            pan.warm_up_crossings, 1,
+            "the warm-up crossed the window edge {} times, not once",
+            pan.warm_up_crossings
+        );
         let frames = pan.times.len();
         let (p50, p95, max) = percentiles(pan.times);
         println!(
-            "steady pan of {PAN_STEP} source pixels a frame across the window edge at 100 percent with the five masks, right, down, left and up, {frames} frames: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {} crossings, {} swaps, {} replaces, {} slices run",
-            pan.crossings, pan.swaps, pan.replaces, pan.slices
+            "steady pan of {PAN_STEP} source pixels a frame across the window edge at 100 percent with the five masks, right, down, left and up, {frames} frames after the warm-up: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {} crossings, {} swaps, {} replaces, {} slices run, {} frame makes",
+            pan.crossings, pan.swaps, pan.replaces, pan.slices, pan.frame_makes
         );
         assert!(
             pan.crossings >= 3,
@@ -1182,11 +1270,17 @@ fn develop_at_viewer_size_is_fast_enough() {
             pan.swaps,
             pan.crossings
         );
+        assert_eq!(
+            pan.frame_makes, 0,
+            "the steady pan after the warm-up made {} frames with textures of their own",
+            pan.frame_makes
+        );
         edge_pan = Some((p95, max));
 
-        // The frame the pan left built ahead is dropped, as a render at
-        // another zoom drops it, so the lines after this one time renders
-        // that hold one frame, as they did before the build ahead.
+        // The frame the pan left built ahead, and the one kept for its
+        // textures, are dropped, as a render at another zoom drops them, so
+        // the lines after this one time renders that hold one frame, as they
+        // did before the build ahead.
         let dropped = develop.drop_ahead();
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())

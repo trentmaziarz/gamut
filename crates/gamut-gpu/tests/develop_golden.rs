@@ -1316,6 +1316,168 @@ fn a_window_built_ahead_and_swapped_in_equals_a_fresh_render_of_it() {
     }
 }
 
+/// A pan across the edge of three windows in a row, driven as the viewer
+/// drives it: after each render the window ahead of the pan is built, in
+/// slices, while the pan steps inside the current window, and the render
+/// where what is seen leaves it swaps that frame in. The frame a swap takes
+/// out of use keeps its textures, and the next window built ahead is drawn
+/// into them, so the pan makes two frames of textures in all: the first
+/// window's and the first window built ahead. At every crossing the swapped
+/// window equals a fresh render of it on a graph of its own, byte for byte,
+/// with every mask product drawn again on the reused frame: the four masks
+/// and a brush mask, then a refined and an edged mask.
+#[test]
+fn a_pan_across_three_windows_draws_each_ahead_into_the_frame_a_swap_left() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    use gamut_gpu::develop::{holds, padded_window, pan_exit, window_ahead};
+    // Wide enough that the frames of the pan stay clear of the left and the
+    // right edge of the picture, where a frame is cut short and so has
+    // another size.
+    let (width, height) = (1600, 600);
+    let photo = blocky_photo(width, height);
+    let readback = Readback::new(&gpu.device);
+    const PAD: (u32, u32) = (40, 30);
+    const GRID: u32 = 8;
+    const STEP: u32 = 8;
+    let full = (width, height);
+    let mut five = everything_global();
+    five.masks = vec![
+        exposure_mask("Linear", linear_source()),
+        exposure_mask("Radial", radial_source()),
+        exposure_mask("Luminance", luminance_source()),
+        exposure_mask("Colour", colour_source()),
+        exposure_mask("Brush", painted_source()),
+    ];
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [0.393, 0.25],
+        radius: [0.049, 0.0327],
+        rotation: 0.0,
+        feather: 12.0,
+    });
+    let brush = brush_source(&[stroke(&[[0.425, 0.05], [0.425, 0.5]], 0.016, 20.0, 100.0)]);
+    let mut edged = everything_global();
+    edged.masks = vec![
+        edged_at(
+            refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
+            0.03,
+            0.02,
+            40.0,
+        ),
+        edged_at(exposure_mask("Brush", brush), -0.03, 0.02, 0.0),
+    ];
+    for (name, edit, texels) in [
+        ("four masks and a brush mask", &five, 400_000),
+        ("a refined and an edged mask", &edged, 200_000),
+    ] {
+        let mut develop = Develop::new(&gpu.device, &gpu.queue);
+        develop.set_source(&photo);
+        develop.set_ahead_slice_texels(texels);
+        let start = (600, 213, 180, 140);
+        let first = ViewWindow {
+            full,
+            window: padded_window(full, start, PAD, GRID),
+            visible: start,
+        };
+        view_render_of(&mut develop, &gpu, &readback, edit, &first);
+        assert_eq!(develop.frame_makes(), 1, "{name}: the first window");
+        let (mut window, mut previous) = (first.window, start);
+        let mut visible = start;
+        let mut crossings = 0;
+        let mut steps = 0;
+        while crossings < 3 {
+            steps += 1;
+            assert!(steps < 1000, "{name}: the pan does not cross three times");
+            visible.0 += STEP;
+            let crossed = !holds(window, visible);
+            let asked = if crossed {
+                develop
+                    .window_ahead()
+                    .filter(|&(held, ahead)| held == full && holds(ahead, visible))
+                    .map(|(_, ahead)| ahead)
+                    .expect("the window built ahead holds what is seen")
+            } else {
+                window
+            };
+            let view = ViewWindow {
+                full,
+                window: asked,
+                visible,
+            };
+            let (replaces, swaps) = (develop.window_replaces(), develop.window_swaps());
+            let shown = view_render_of(&mut develop, &gpu, &readback, edit, &view);
+            if crossed {
+                crossings += 1;
+                assert_eq!(
+                    develop.window_replaces(),
+                    replaces,
+                    "{name}: crossing {crossings} replaces no frame"
+                );
+                assert_eq!(
+                    develop.window_swaps(),
+                    swaps + 1,
+                    "{name}: crossing {crossings} takes the frame built ahead"
+                );
+                let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+                fresh.set_source(&photo);
+                let alone = view_render_of(&mut fresh, &gpu, &readback, edit, &view);
+                let differing = shown.iter().zip(&alone).filter(|(a, b)| a != b).count();
+                println!(
+                    "{name}: crossing {crossings} into {asked:?} at {visible:?}: frame makes {}, bytes that differ from a fresh render of it: {differing} of {}",
+                    develop.frame_makes(),
+                    alone.len()
+                );
+                assert_eq!(
+                    shown, alone,
+                    "{name}: the window swapped in at crossing {crossings}"
+                );
+            }
+            // The build ahead as the viewer drives it: the window held ahead
+            // while it holds where the pan leaves this one, else a new one,
+            // built to its end before the next step.
+            let exit = pan_exit(full, asked, previous, visible);
+            let held = develop
+                .window_ahead()
+                .filter(|&(held, _)| held == full)
+                .map(|(_, ahead)| ahead);
+            let wanted = exit.and_then(|exit| match held {
+                Some(held) if holds(held, exit) => Some(held),
+                _ => window_ahead(full, asked, previous, visible, PAD, GRID),
+            });
+            if let Some(ahead) = wanted {
+                let mut calls = 0;
+                while !develop.build_ahead(edit, full, ahead) && develop.ahead_building() {
+                    calls += 1;
+                    assert!(calls < 100_000, "{name}: the build ahead does not end");
+                }
+            }
+            (window, previous) = (asked, visible);
+        }
+        println!(
+            "{name}: {crossings} crossings in {steps} steps, {} swaps, {} replaces, {} frame makes",
+            develop.window_swaps(),
+            develop.window_replaces(),
+            develop.frame_makes()
+        );
+        assert_eq!(
+            develop.window_replaces(),
+            1,
+            "{name}: only the first window"
+        );
+        assert_eq!(
+            develop.frame_makes(),
+            2,
+            "{name}: the first window and the first window built ahead make frames, and each later one takes the textures a swap left"
+        );
+    }
+}
+
 /// A window built ahead in slices, each in a submit of its own, holds what
 /// the same window built in one submit holds, byte for byte in all seven
 /// textures of its frame. The slices are one row of a pass each, then 3001

@@ -520,6 +520,16 @@ impl Layers {
         self.layers[index].held = Some(held);
     }
 
+    /// Forgets what every layer holds and every stamp not finished, so the
+    /// next update stamps each layer whole: the frame they belong to renders
+    /// another window, where the dabs land on other pixels.
+    pub(crate) fn forget(&mut self) {
+        for layer in &mut self.layers {
+            layer.held = None;
+            layer.stamping = None;
+        }
+    }
+
     /// Forgets what every layer with an auto stroke holds, so the next
     /// update stamps it whole: its dabs read the source, and the source
     /// content is another.
