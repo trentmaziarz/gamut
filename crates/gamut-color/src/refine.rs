@@ -12,7 +12,7 @@
 //! two mean colours, along the one direction of colour that best tells the
 //! classes apart. A pixel at the outside's end leaves the mask, one at the
 //! inside's end joins it, and one between keeps the alpha it had. Over a box
-//! around each place, with `q` the weight of the inside class,
+//! around each place, with `q` the weight of the inside class (`wq` below),
 //!
 //! ```text
 //! mu1 = E[q I] / E[q]            mu0 = (E[I] - E[q I]) / (1 - E[q])
@@ -42,6 +42,23 @@
 //! mask that is soft at the scale of the box is soft on purpose and comes
 //! back as drawn. Where the guide is flat the classes do not separate and
 //! the mask comes back bit for bit.
+//!
+//! A reached field `rf` says how far each place is joined to the outside of
+//! the mask through like colour: seeded on the cell grid by the outside as
+//! drawn and spread in a bounded number of passes, [`reached`]. A pixel
+//! counts in the inside class only as far as the outside does not reach it,
+//!
+//! ```text
+//! keep = 1 - smoothstep(0.7, 1.0, rf)
+//! wq   = q keep + max(q - p, 0) (1 - keep)
+//! ```
+//!
+//! so alpha a move added above the mask as drawn counts inside whether
+//! reached or not. The move comes in only where some of the inside in the
+//! box is unreached, [`gate`], and a pixel leaves the mask only where the
+//! outside reaches it. A stroke drawn much wider than its object gives up
+//! the spill the outside reaches through like colour, and a mask drawn over
+//! one colour on both of its sides holds still.
 //!
 //! The moments are taken on a grid of cells: a cell is [`Plan::step`] pixels
 //! square and lies on the pixel grid of the WHOLE picture at the scale of the
@@ -88,7 +105,8 @@ pub const SOURCE_MOMENTS: usize = 9;
 /// The moments of the mask as drawn in one cell: p and p p.
 pub const MASK_MOMENTS: usize = 2;
 
-/// The moments of one gather in one cell: q and q I (3).
+/// The moments of one gather in one cell: the weight of the inside class
+/// `wq` and `wq I` (3).
 pub const GATHER_MOMENTS: usize = 4;
 
 /// What one gather solves a cell: a (3), s, d2, c, P as rr, rg, rb, gg, gb,
@@ -126,6 +144,23 @@ pub const SHARE_FLOOR: f32 = 1e-6;
 /// The least separation anything is divided by.
 pub const SEPARATION_FLOOR: f32 = 1e-9;
 
+/// The likeness of two cells the reached field spreads between is
+/// `exp(-|Ec[I](x) - Ec[I](n)|^2 / (LIKENESS eps))`.
+pub const LIKENESS: f32 = 2.0;
+
+/// The reached field over which a pixel leaves the inside class.
+pub const KEEP_LOW: f32 = 0.7;
+pub const KEEP_HIGH: f32 = 1.0;
+
+/// The mean of the unreached inside, `E[p keep]` over the box, over which
+/// the move comes in.
+pub const UNREACHED_LOW: f32 = 0.0;
+pub const UNREACHED_HIGH: f32 = 0.02;
+
+/// The reached field over which a pixel may leave the mask.
+pub const LEAVE_LOW: f32 = 0.2;
+pub const LEAVE_HIGH: f32 = 0.5;
+
 /// The eps of the filter at a sensitivity of 0 to 100: a log scale from
 /// [`EPS_LOOSE`] squared to [`EPS_STRICT`] squared.
 pub fn eps(sensitivity: f32) -> f32 {
@@ -159,6 +194,9 @@ pub struct Plan {
     pub step: u32,
     /// The radius of the box in cells.
     pub cells: u32,
+    /// How far the reached field spreads at most, in cells: the radius in
+    /// cells, `floor(r / step)`.
+    pub flood: u32,
     pub eps: f32,
     /// How much of the refined alpha is taken, 0 to 1.
     pub amount: f32,
@@ -171,12 +209,14 @@ impl Plan {
         let radius = refine.radius * full.0.max(full.1) as f32;
         let step = ((radius / PIXELS_A_STEP).floor() as u32).clamp(1, MAX_STEP);
         let cells = ((radius * BOX_OF_RADIUS / step as f32).round() as u32).max(1);
+        let flood = (radius / step as f32).floor() as u32;
         Plan {
             full,
             origin,
             size,
             step,
             cells,
+            flood,
             eps: eps(refine.sensitivity),
             amount: refine.amount / 100.0,
         }
@@ -200,15 +240,20 @@ impl Plan {
     }
 
     /// How many cells around the two a pixel lies among one tile of the GPU
-    /// holds, and the twin reads: a box for each gather, and the cell beside
-    /// for the bilinear step of the two gathers before the last.
+    /// holds, and the twin reads: a box for each gather, the cell beside for
+    /// the bilinear step of the two gathers before the last, and the reached
+    /// field gather 1 weighs its inside by: the cell beside for its bilinear
+    /// read at the pixel and the flood's cells, [`Plan::flood`], which bound
+    /// the steps of its passes. The flood's share is about one Radius.
     pub fn margin(&self) -> u32 {
-        GATHERS as u32 * self.cells + (GATHERS as u32 - 1)
+        GATHERS as u32 * self.cells + (GATHERS as u32 - 1) + 1 + self.flood
     }
 
     /// How far around a pixel the filter reads, in render pixels: the margin,
     /// the cell beside for the bilinear step of the last gather, and the cell
-    /// a window may cut at its border.
+    /// a window may cut at its border. Three boxes of 0.71 Radius and the
+    /// flood's Radius make it about 3.13 Radius, and the cells beside add
+    /// five cells.
     pub fn reach(&self) -> u32 {
         (self.margin() + 2) * self.step
     }
@@ -227,7 +272,8 @@ impl Plan {
 }
 
 /// [`Plan::reach`] of a sanitised refine on a render whose whole picture is
-/// `full` pixels, or 0 while it is off: what a window is padded by.
+/// `full` pixels, or 0 while it is off: what a window is padded by. It holds
+/// the flood's cells of the reached field, so it is about 3.13 Radius.
 pub fn reach(refine: &Refine, full: (u32, u32)) -> u32 {
     if refine.is_off() {
         0
@@ -313,7 +359,18 @@ pub fn source_means(
     store: &dyn Fn(f32) -> f32,
 ) -> Vec<[f32; SOURCE_MOMENTS]> {
     let (_, grid) = plan.grid();
-    let moments = cell_moments(
+    box_mean(&source_cells(guides, plan, store), grid, plan.cells, store)
+}
+
+/// The means of the source's moments over each cell, before the box. The
+/// first three are the cell mean of the guide, `Ec[I]`, which the reached
+/// field compares.
+pub fn source_cells(
+    guides: &[[f32; 3]],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<[f32; SOURCE_MOMENTS]> {
+    cell_moments(
         plan,
         &|i| {
             let g = guides[i];
@@ -330,8 +387,63 @@ pub fn source_means(
             ]
         },
         store,
-    );
-    box_mean(&moments, grid, plan.cells, store)
+    )
+}
+
+/// The reached field on the cell grid, 0 to 1: how far each cell is joined
+/// to the outside of the mask through like colour. `drawn` holds the cell
+/// mean of the mask as drawn, `Ec[p]`, and `colours` the source's cell
+/// moments, whose first three are `Ec[I]`.
+///
+/// The seed is the outside as drawn, `1 - Ec[p]`. Passes of doubling steps
+/// 1, 2, 4, ... cells then spread it while the steps sum to at most
+/// [`Plan::flood`]: a pass keeps at each cell the most of its own value and
+/// of the 8 cells a step away across, down and on the diagonals, each of
+/// those weighed by its likeness `exp(-|Ec[I](x) - Ec[I](n)|^2 / (2 eps))`.
+/// Reads clamp to the edge of the grid and each pass reads the one before,
+/// as two targets of the GPU take turns.
+pub fn reached(
+    drawn: &[[f32; 1]],
+    colours: &[[f32; SOURCE_MOMENTS]],
+    plan: &Plan,
+    store: &dyn Fn(f32) -> f32,
+) -> Vec<f32> {
+    let (_, grid) = plan.grid();
+    let (w, h) = (grid.0 as i32, grid.1 as i32);
+    let scale = LIKENESS * plan.eps;
+    let mut field: Vec<f32> = drawn.iter().map(|cell| store(1.0 - cell[0])).collect();
+    let (mut total, mut step) = (0, 1);
+    while total + step <= plan.flood {
+        let s = step as i32;
+        let mut next = Vec::with_capacity(field.len());
+        for y in 0..h {
+            for x in 0..w {
+                let here = &colours[(y * w + x) as usize];
+                let mut most = field[(y * w + x) as usize];
+                for (dx, dy) in [
+                    (s, 0),
+                    (-s, 0),
+                    (0, s),
+                    (0, -s),
+                    (s, s),
+                    (s, -s),
+                    (-s, s),
+                    (-s, -s),
+                ] {
+                    let n = ((y + dy).clamp(0, h - 1) * w + (x + dx).clamp(0, w - 1)) as usize;
+                    let there = &colours[n];
+                    let (r, g, b) = (here[0] - there[0], here[1] - there[1], here[2] - there[2]);
+                    let like = (-(r * r + g * g + b * b) / scale).exp();
+                    most = most.max(field[n] * like);
+                }
+                next.push(store(most));
+            }
+        }
+        field = next;
+        total += step;
+        step *= 2;
+    }
+    field
 }
 
 /// The means of the moments of the mask as drawn over the box, a cell.
@@ -346,7 +458,8 @@ pub fn mask_means(
 }
 
 /// The means of the moments of one gather over the box, a cell: the weight
-/// `q` of the inside class and the guide weighed by it.
+/// `q` of the inside class and the guide weighed by it. [`gathered`] passes
+/// the weight `wq` the reached field leaves.
 pub fn gather_means(
     q: &[f32],
     guides: &[[f32; 3]],
@@ -375,12 +488,21 @@ pub fn both(mask: &[f32; MASK_MOMENTS]) -> f32 {
     smooth(p.min(1.0 - p), COVER_LOW, COVER_HIGH) * smooth(hardness, HARD_LOW, HARD_HIGH)
 }
 
-/// What one gather solves in one cell from the means of the source's, the
-/// mask's and its own moments, in the order of [`SOLVED`].
+/// How far the move comes in over a box, 0 to 1: [`both`] of the mask's
+/// moments, times how much of the inside the outside does not reach,
+/// `E[p keep]`, which is gather 1's own mean weight. Taken once, in gather 1,
+/// and served to all three: 0 where the whole inside is joined to the
+/// outside, so a mask drawn over like colour on both sides holds still.
+pub fn gate(mask: &[f32; MASK_MOMENTS], unreached: f32) -> f32 {
+    both(mask) * smooth(unreached, UNREACHED_LOW, UNREACHED_HIGH)
+}
+
+/// What one gather solves in one cell from the means of the source's and its
+/// own moments and the [`gate`] of gather 1, in the order of [`SOLVED`].
 pub fn solve(
     source: &[f32; SOURCE_MOMENTS],
-    mask: &[f32; MASK_MOMENTS],
     gather: &[f32; GATHER_MOMENTS],
+    gate: f32,
     eps: f32,
 ) -> [f32; SOLVED] {
     let n1 = gather[0];
@@ -426,7 +548,7 @@ pub fn solve(
         inv[2] * delta[0] + inv[4] * delta[1] + inv[5] * delta[2],
     ];
     let d2 = (delta[0] * a[0] + delta[1] * a[1] + delta[2] * a[2]).max(0.0);
-    let c = smooth(d2, SEPARATE_LOW, SEPARATE_HIGH) * both(mask);
+    let c = smooth(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate;
     let over = d2.max(SEPARATION_FLOOR);
     let mid = [
         (mu1[0] + mu0[0]) / 2.0,
@@ -454,8 +576,10 @@ pub fn solve(
 }
 
 /// The mask as drawn `p` moved at one pixel of guide `g` by what a gather
-/// solved, mixed from the four cells around the pixel.
-pub fn moved(p: f32, g: [f32; 3], v: &[f32; SOLVED]) -> f32 {
+/// solved, mixed from the four cells around the pixel. `reached` is the
+/// reached field at the pixel: a pixel leaves the mask only where the outside
+/// reaches it.
+pub fn moved(p: f32, g: [f32; 3], v: &[f32; SOLVED], reached: f32) -> f32 {
     let along = (v[0] * g[0] + v[1] * g[1] + v[2] * g[2]) - v[3];
     let est = (0.5 + along / v[4].max(SEPARATION_FLOOR)).clamp(0.0, 1.0);
     let e = [g[0] - v[12], g[1] - v[13], g[2] - v[14]];
@@ -465,7 +589,8 @@ pub fn moved(p: f32, g: [f32; 3], v: &[f32; SOLVED]) -> f32 {
         + 2.0 * (v[7] * e[0] * e[1] + v[8] * e[0] * e[2] + v[10] * e[1] * e[2]))
         .max(0.0);
     let on_line = 1.0 - smooth(m, LINE_LOW, LINE_HIGH);
-    let out = on_line * (1.0 - smooth(est, OUT_LOW, OUT_HIGH));
+    let out =
+        on_line * (1.0 - smooth(est, OUT_LOW, OUT_HIGH)) * smooth(reached, LEAVE_LOW, LEAVE_HIGH);
     let into = on_line * smooth(est, IN_LOW, IN_HIGH);
     p + v[5] * (into * (1.0 - p) - out * p)
 }
@@ -479,8 +604,11 @@ pub fn gathered(
     store: &dyn Fn(f32) -> f32,
 ) -> Vec<f32> {
     let ((first_x, first_y), grid) = plan.grid();
-    let source = source_means(guides, plan, store);
+    let colours = source_cells(guides, plan, store);
+    let source = box_mean(&colours, grid, plan.cells, store);
     let mask = mask_means(alpha, plan, store);
+    let drawn = cell_moments(plan, &|i| [alpha[i]], store);
+    let field = reached(&drawn, &colours, plan, store);
     let step = plan.step as f32;
     // Where a pixel lies among the centres of the cells on one axis: the
     // cell before it, the one after, and the share of the second.
@@ -491,31 +619,70 @@ pub fn gathered(
         (clamp(low), clamp(low + 1.0), u - low)
     };
     let width = plan.size.0;
+    // The four cells around a pixel, top left, top right, bottom left and
+    // bottom right, and the shares of the second across and down.
+    let around = |i: usize| {
+        let (x, y) = (i as u32 % width, i as u32 / width);
+        let (x0, x1, fx) = among(x, plan.origin.0, first_x, grid.0);
+        let (y0, y1, fy) = among(y, plan.origin.1, first_y, grid.1);
+        let at = |cx: u32, cy: u32| (cy * grid.0 + cx) as usize;
+        ([at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1)], fx, fy)
+    };
+    // The reached field at each pixel, mixed from the four cells around it,
+    // and how much of the pixel the inside class keeps.
+    let reach: Vec<f32> = (0..alpha.len())
+        .map(|i| {
+            let ([tl, tr, bl, br], fx, fy) = around(i);
+            let top = field[tl] + (field[tr] - field[tl]) * fx;
+            let bottom = field[bl] + (field[br] - field[bl]) * fx;
+            top + (bottom - top) * fy
+        })
+        .collect();
+    let keep: Vec<f32> = reach
+        .iter()
+        .map(|rf| 1.0 - smooth(*rf, KEEP_LOW, KEEP_HIGH))
+        .collect();
     let mut q = alpha.to_vec();
-    for _ in 0..GATHERS {
-        let means = gather_means(&q, guides, plan, store);
+    let mut gates = Vec::new();
+    for gather in 0..GATHERS {
+        // The weight of the inside class: the mask so far where the outside
+        // does not reach it, and alpha a move added above the mask as drawn
+        // whether reached or not. In gather 1 q is p, so this is p keep.
+        let weight: Vec<f32> = q
+            .iter()
+            .zip(alpha)
+            .zip(&keep)
+            .map(|((q, p), keep)| q * keep + (q - p).max(0.0) * (1.0 - keep))
+            .collect();
+        let means = gather_means(&weight, guides, plan, store);
+        if gather == 0 {
+            // Gather 1's own mean weight is E[p keep].
+            gates = means
+                .iter()
+                .zip(&mask)
+                .map(|(own, mask)| store(gate(mask, own[0])))
+                .collect();
+        }
         let solved: Vec<[f32; SOLVED]> = means
             .iter()
             .enumerate()
-            .map(|(cell, gather)| solve(&source[cell], &mask[cell], gather, plan.eps).map(store))
+            .map(|(cell, gather)| solve(&source[cell], gather, gates[cell], plan.eps).map(store))
             .collect();
         q = alpha
             .iter()
             .zip(guides)
+            .zip(&reach)
             .enumerate()
-            .map(|(i, (p, g))| {
-                let (x, y) = (i as u32 % width, i as u32 / width);
-                let (x0, x1, fx) = among(x, plan.origin.0, first_x, grid.0);
-                let (y0, y1, fy) = among(y, plan.origin.1, first_y, grid.1);
-                let at = |cx: u32, cy: u32| &solved[(cy * grid.0 + cx) as usize];
-                let (tl, tr, bl, br) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+            .map(|(i, ((p, g), rf))| {
+                let ([tl, tr, bl, br], fx, fy) = around(i);
+                let (tl, tr, bl, br) = (&solved[tl], &solved[tr], &solved[bl], &solved[br]);
                 let mut mixed = [0.0f32; SOLVED];
                 for (c, value) in mixed.iter_mut().enumerate() {
                     let top = tl[c] + (tr[c] - tl[c]) * fx;
                     let bottom = bl[c] + (br[c] - bl[c]) * fx;
                     *value = top + (bottom - top) * fy;
                 }
-                store(moved(*p, *g, &mixed))
+                store(moved(*p, *g, &mixed, *rf))
             })
             .collect();
     }
@@ -622,8 +789,12 @@ mod tests {
         // A cell step for every 8 pixels of radius, a box of 0.71 radius.
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (6000, 4000), (0, 0), (6000, 4000));
         assert_eq!((plan.step, plan.cells), (4, 11), "60 pixels");
-        assert_eq!(plan.margin(), 35);
-        assert_eq!(plan.reach(), 148);
+        // The flood spreads 15 cells, the radius in cells: three boxes, the
+        // two cells beside of the gathers, the cell beside of the reached
+        // field and its 15.
+        assert_eq!(plan.flood, 15);
+        assert_eq!(plan.margin(), 51);
+        assert_eq!(plan.reach(), 212);
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (1800, 1200), (0, 0), (1800, 1200));
         assert_eq!((plan.step, plan.cells), (2, 6), "18 pixels");
         let plan = Plan::new(&on(100.0, 0.01, 50.0), (1100, 700), (0, 0), (1100, 700));
@@ -643,7 +814,7 @@ mod tests {
         assert_eq!((window.step, window.cells), (4, 11));
         assert_eq!(window.grid(), ((255, 128), (226, 176)));
         assert_eq!(reach(&on(0.0, 0.05, 50.0), (6000, 4000)), 0, "off");
-        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 148);
+        assert_eq!(reach(&on(100.0, 0.01, 50.0), (6000, 4000)), 212);
     }
 
     #[test]
@@ -680,8 +851,44 @@ mod tests {
         }
     }
 
+    /// Diagonal stripes of many colours over the whole picture, one colour
+    /// along each diagonal x + y, under a hard band of mask drawn across
+    /// them: every pixel of the band has its own colour on the outside a few
+    /// pixels up or down its diagonal.
     #[test]
-    fn a_loose_alpha_snaps_onto_a_step_of_the_guide() {
+    fn a_mask_the_outside_reaches_everywhere_comes_back_as_drawn() {
+        let size = (160, 60);
+        let geometry = Geometry::full(size, size);
+        let wave = |d: f32, rate: f32, phase: f32| 0.5 + 0.5 * (d * rate + phase).sin();
+        let pixels: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| {
+                let d = (i % size.0 + i / size.0) as f32;
+                [
+                    0.05 + 0.4 * wave(d, 0.45, 0.0),
+                    0.05 + 0.3 * wave(d, 0.31, 1.0),
+                    0.05 + 0.5 * wave(d, 0.23, 2.0),
+                ]
+            })
+            .collect();
+        // A band 10 rows high that stops 20 columns short of either side:
+        // every pixel of it lies at most 5 rows from the outside, and the
+        // diagonal to its own colour there stays inside the picture.
+        let (rows, columns) = (25..35, 20..140);
+        let alpha: Vec<f32> = (0..size.0 * size.1)
+            .map(|i| {
+                let inside = rows.contains(&(i / size.0)) && columns.contains(&(i % size.0));
+                if inside { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let refine = on(100.0, 0.05, 50.0);
+        let out = refined(&alpha, &pixels, &geometry, &refine, IDENTITY);
+        let moved = out.iter().zip(&alpha).filter(|(a, b)| a != b).count();
+        assert!(same_bits(&out, &alpha), "{moved} pixels moved");
+    }
+
+    // The growth into the unreached gap is partial under the connectivity prior, ruled 2026-09-24 (a2_grow_rt7, case 8's gap 0.26/0.21); the figures come from lead_a2.py.
+    #[test]
+    fn a_loose_alpha_short_of_a_step_grows_as_the_ruled_design_does() {
         let size = (200, 16);
         let geometry = Geometry::full(size, size);
         let pixels = step_guide(size, 0.03, 0.5);
@@ -708,12 +915,17 @@ mod tests {
         for x in edge - 6..edge {
             assert!(row(x) > 0.9, "the kept side at {x} is left at {}", row(x));
         }
-        // A mask drawn short of the edge grows up to it.
+        // A mask drawn short of the edge grows into the gap as far as the
+        // ruled design grows it: row 8 from column 94 to 100.
         let short = ramp_alpha(size, edge as f32 - 4.0, 3.0);
         let grown = refined(&short, &pixels, &geometry, &refine, IDENTITY);
-        for x in edge - 6..edge {
+        let ruled = [1.0, 0.7503, 0.6278, 0.0, 0.0, 0.0, 0.0];
+        for (x, want) in (edge - 6..=edge).zip(ruled) {
             let got = grown[(8 * size.0 + x) as usize];
-            assert!(got > 0.9, "short of the edge at {x}: {got}");
+            assert!(
+                (got - want).abs() < 1e-3,
+                "short of the edge at {x}: {got}, not {want}"
+            );
         }
         assert!(grown[(8 * size.0 + edge) as usize] < 0.1);
         // Half the amount goes half the way.
@@ -742,7 +954,7 @@ mod tests {
         let mask = mask_means(&alpha, &plan, IDENTITY);
         let gather = gather_means(&alpha, &guides, &plan, IDENTITY);
         let cell = (8 * grid.0 + edge) as usize;
-        let solved = solve(&source[cell], &mask[cell], &gather[cell], plan.eps);
+        let solved = solve(&source[cell], &gather[cell], both(&mask[cell]), plan.eps);
         assert!(solved[5] > 0.99, "the move is allowed here: {}", solved[5]);
         let place = |g: [f32; 3]| {
             let along = (solved[0] * g[0] + solved[1] * g[1] + solved[2] * g[2]) - solved[3];
@@ -760,8 +972,8 @@ mod tests {
         // leaves the mask. The object stays.
         let (est, m) = place(guide(blue));
         assert!(est < OUT_LOW && m < LINE_LOW, "the field: {est}, {m}");
-        assert!(moved(1.0, guide(blue), &solved) < 0.01);
-        assert!(moved(1.0, guide(dark), &solved) > 0.99);
+        assert!(moved(1.0, guide(blue), &solved, 1.0) < 0.01);
+        assert!(moved(1.0, guide(dark), &solved, 1.0) > 0.99);
         // A bright warm colour, a sunlit face of the object: along the line
         // it lies at the outside's end too, and off the line it is far from
         // both classes. It keeps the alpha it was given, whatever that was.
@@ -770,7 +982,7 @@ mod tests {
         assert!(est < OUT_LOW, "along the line the warm colour reads {est}");
         assert!(m > LINE_HIGH, "off the line the warm colour reads {m}");
         for p in [1.0, 0.4, 0.0] {
-            assert_eq!(moved(p, warm, &solved), p);
+            assert_eq!(moved(p, warm, &solved, 1.0), p);
         }
     }
 
@@ -884,9 +1096,14 @@ mod tests {
             let out = refined(&full, &busy_pixels, &geometry, &refine, IDENTITY);
             assert!(same_bits(&out, &full), "a mask of all 1 comes back");
         }
-        let solved = solve(&[0.0; SOURCE_MOMENTS], &[0.0; 2], &[0.0; 4], eps(100.0));
+        let solved = solve(
+            &[0.0; SOURCE_MOMENTS],
+            &[0.0; 4],
+            gate(&[0.0; 2], 0.0),
+            eps(100.0),
+        );
         assert!(solved.iter().all(|v| v.is_finite()));
-        assert!(moved(0.5, [0.0; 3], &solved).is_finite());
+        assert!(moved(0.5, [0.0; 3], &solved, 1.0).is_finite());
     }
 
     /// The refined alpha of one rectangle of the busy picture, from the whole
@@ -895,10 +1112,21 @@ mod tests {
     fn whole_and_window(radius: f32, pad: u32) -> (Vec<f32>, Vec<f32>) {
         let full = (640, 480);
         let (pixels, alpha) = busy(full);
+        whole_and_window_of(&pixels, &alpha, full, radius, pad)
+    }
+
+    /// [`whole_and_window`] of any picture of 640 x 480.
+    fn whole_and_window_of(
+        pixels: &[[f32; 3]],
+        alpha: &[f32],
+        full: (u32, u32),
+        radius: f32,
+        pad: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
         let refine = on(100.0, radius, 60.0);
         let whole = refined(
-            &alpha,
-            &pixels,
+            alpha,
+            pixels,
             &Geometry::full(full, full),
             &refine,
             IDENTITY,
@@ -951,14 +1179,73 @@ mod tests {
                 "the mask has an edge in what is wanted"
             );
             assert!(same_bits(&whole, &window), "radius {radius}");
-            // One box less and the window cuts what the filter reads.
-            let short = plan.reach() - plan.cells * plan.step;
-            let (whole, window) = whole_and_window(radius, short);
-            assert!(
-                !same_bits(&whole, &window),
-                "radius {radius}, {short} pixels"
-            );
+            // The same on a picture whose reached field carries its whole
+            // flood toward the window's edge.
+            let (pixels, alpha) = block_at_the_end(full_size());
+            let (whole, window) =
+                whole_and_window_of(&pixels, &alpha, full_size(), radius, plan.reach());
+            assert!(same_bits(&whole, &window), "the block at radius {radius}");
         }
+    }
+
+    fn full_size() -> (u32, u32) {
+        (640, 480)
+    }
+
+    /// Stripes along the rows, one colour a row, under a hard rectangle of
+    /// mask from column 100 to 481 whose top edge is a ramp 3 pixels wide
+    /// about row 210. From row 210 down, the rectangle's last 8 columns and
+    /// the outside to its right are one flat colour, so the outside reaches
+    /// that part of the mask along its rows from the right and from nowhere
+    /// else.
+    fn block_at_the_end(full: (u32, u32)) -> (Vec<[f32; 3]>, Vec<f32>) {
+        let wave = |d: f32, rate: f32, phase: f32| 0.5 + 0.5 * (d * rate + phase).sin();
+        let end = 482;
+        let mut pixels = Vec::new();
+        let mut alpha = Vec::new();
+        for y in 0..full.1 {
+            for x in 0..full.0 {
+                let d = y as f32;
+                pixels.push(if x + 8 >= end && (210..330).contains(&y) {
+                    [0.3, 0.35, 0.6]
+                } else {
+                    [
+                        0.05 + 0.4 * wave(d, 1.7, 0.0),
+                        0.05 + 0.3 * wave(d, 2.3, 1.0),
+                        0.05 + 0.5 * wave(d, 2.9, 2.0),
+                    ]
+                });
+                let inside = (100..end).contains(&x) && (150..330).contains(&y);
+                let top = ((y as f32 + 0.5 - 210.0) / 3.0 + 0.5).clamp(0.0, 1.0);
+                alpha.push(if inside { top } else { 0.0 });
+            }
+        }
+        (pixels, alpha)
+    }
+
+    #[test]
+    fn a_window_short_by_the_flood_differs_from_the_full_render() {
+        // At Radius 0.012 the cells are 1 pixel, the box 5 cells and the
+        // flood 7 cells, steps 1, 2 and 4. The reach less the flood's cells
+        // ends the window at column 481, one short of the outside that
+        // reaches the block's part of the mask, and the three gathers carry
+        // the difference into what is wanted.
+        let radius = 0.012;
+        let plan = Plan::new(&on(100.0, radius, 60.0), full_size(), (0, 0), full_size());
+        assert_eq!((plan.step, plan.cells, plan.flood), (1, 5, 7));
+        let short = plan.reach() - plan.flood * plan.step;
+        assert_eq!(401 + 60 + short, 481);
+        let (pixels, alpha) = block_at_the_end(full_size());
+        let (whole, window) = whole_and_window_of(&pixels, &alpha, full_size(), radius, short);
+        let most = whole
+            .iter()
+            .zip(&window)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            most > 1e-4,
+            "the window short by {short} pixels differs by {most}"
+        );
     }
 
     #[test]
@@ -970,6 +1257,7 @@ mod tests {
             size: (10, 4),
             step: 4,
             cells: 1,
+            flood: 1,
             eps: eps(50.0),
             amount: 1.0,
         };
