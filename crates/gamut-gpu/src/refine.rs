@@ -13,27 +13,24 @@
 //! a pass; Gamut asks the adapter for up to 64
 //! ([`crate::video::wanted_limits`]), which is four.
 //!
-//! A tile is drawn in 18 + 2 + k passes, k the flood's passes below. Five
+//! A tile is drawn in 18 + 1 + k passes, k the flood's passes below. Five
 //! take the moments of the source, in one pass of three targets, and their
 //! box means; they depend on no mask and no gather, so they are kept while
 //! the source, the radius and the tile stay the same, and a tile then costs
-//! 13 + 2 + k. The moments themselves depend on the side of a cell and the
+//! 13 + 1 + k. The moments themselves depend on the side of a cell and the
 //! grid alone, never on the radius of the box, and keep targets of their own:
 //! a Radius step that keeps the side of a cell draws the four box means of the
-//! source over them and not the moments, 17 + 2 + k passes. The moments are
+//! source over them and not the moments, 17 + 1 + k passes. The moments are
 //! taken over the cells the gathers work over, joined with the cells already
 //! held: a refine over cells they cover takes none, and a refine over cells
 //! they partly cover takes them over the strips it adds, at most four
-//! rectangles. The reached field of the mask then takes 2 + k: a seed pass,
-//! `1 - Ec[p]` a cell, one pass a doubling step of 1, 2, 4, ... cells
+//! rectangles. The reached field of the mask then takes 1 + k: a seed pass,
+//! `1 - Ec[p]` a cell, and one pass a doubling step of 1, 2, 4, ... cells
 //! while the steps sum to at most [`Plan::flood`], k = 6 at Radius 0.05, 5 at
 //! 0.03 and 4 at 0.01 on a longer side of 6000 pixels. The flood passes read
 //! `Ec[I]` from the source's moments `r[0]` and take turns between two
-//! R32Float targets, the last pass writing `flood[0]`, and one pass after
-//! them. That pass mixes `flood[0]` bilinearly at each pixel the cells of the
-//! tile lie over, into an R32Float target of the render's pixels, `reach`,
-//! so the gathers and the apply read one texel a pixel in place of the four
-//! cells around it and their mix. Each of the three gathers takes
+//! R32Float targets, the last pass writing `flood[0]`, which the gathers and
+//! the apply read bilinearly at each pixel. Each of the three gathers takes
 //! four: the moments of `wq` over the cells, their box means across and down,
 //! and the solve in one pass of four targets. The two later gathers take `q`
 //! at each pixel as they sum it, the mask moved by what the gather before
@@ -43,8 +40,8 @@
 //! A device that draws into no more than 32 bytes a sample, such as one made
 //! with wgpu's default limits, draws the moments of the source in a pass of
 //! two targets and a pass of one, and the solve in two passes of two: the
-//! source takes six, a gather five, and a tile 22 + 2 + k, or 16 + 2 + k with
-//! the moments of the source held and 20 + 2 + k on a Radius step that keeps
+//! source takes six, a gather five, and a tile 22 + 1 + k, or 16 + 1 + k with
+//! the moments of the source held and 20 + 1 + k on a Radius step that keeps
 //! the side of a cell.
 //! The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both offer 128 bytes, so
 //! both draw the fused source and the fused solve.
@@ -53,12 +50,12 @@
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 28 + 2 + k passes, 19 + 2 + k with the moments of the
-//! source held, and 27 + 2 + k on a Radius step that keeps the side of a
+//! ten block passes: 28 + 1 + k passes, 19 + 1 + k with the moments of the
+//! source held, and 27 + 1 + k on a Radius step that keeps the side of a
 //! cell, whose four box means of the source each draw their block pass (32,
-//! 22 and 30, each + 2 + k, with the source and the solve drawn in two passes
-//! each). At Radius 0.05 on a longer side of 6000 pixels, k = 6: 36, 27 and
-//! 35. A box keeps its cells, each held at
+//! 22 and 30, each + 1 + k, with the source and the solve drawn in two passes
+//! each). At Radius 0.05 on a longer side of 6000 pixels, k = 6: 35, 26 and
+//! 34. A box keeps its cells, each held at
 //! the edges as before; only the order of the sum changes. A smaller box
 //! sums every cell in the direct loop, which measured no slower (see
 //! [`BLOCK_TAPS`]): a block pass is a pass of its own, and a box of few cells
@@ -93,15 +90,6 @@ const FLOOD_BYTES: u64 = 4;
 /// How many flood targets a scratch holds: a pass of the flood reads one and
 /// writes the other.
 const FLOOD_TARGETS: usize = 2;
-
-/// The format of the reached field at each pixel of the render, one number a
-/// pixel. It is R32Float, as the flood targets are, so the gathers and the
-/// apply read the bilinear mix of the four cells around a pixel as a 32 bit
-/// float, the number the twin's `reach` holds there, and no store rounds it.
-/// The target is the render's size, 4 bytes a pixel, and is not counted in
-/// [`CELL_BYTES`]: at the window of 3104 by 3744 pixels it is
-/// 3104 * 3744 * 4 = 46,485,504 bytes.
-pub(crate) const REACH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 /// The most bytes the scratch of a frame takes, its targets of cells, unless
 /// one box needs more.
@@ -381,33 +369,6 @@ fn block_area(area: Rect, down: bool, reach: u32, count: (u32, u32)) -> Rect {
     }
 }
 
-/// The pixels of the render the cells `work` of a tile lie over, held inside
-/// the render: the pixels the gathers sum over those cells, which hold the
-/// pixels the apply writes, `out`. The pass after the flood writes the
-/// reached field at each of them.
-pub(crate) fn work_pixels(plan: &Plan, tile: &Tile) -> Rect {
-    let axis = |first: u32, start: u32, count: u32, origin: u32, size: u32| {
-        let low = ((first + start) * plan.step).max(origin) - origin;
-        let high = ((first + start + count) * plan.step).min(origin + size) - origin;
-        (low, high.max(low) - low)
-    };
-    let (x, width) = axis(
-        tile.first.0,
-        tile.work.0,
-        tile.work.2,
-        plan.origin.0,
-        plan.size.0,
-    );
-    let (y, height) = axis(
-        tile.first.1,
-        tile.work.1,
-        tile.work.3,
-        plan.origin.1,
-        plan.size.1,
-    );
-    (x, y, width, height)
-}
-
 /// The cells one axis of a span of pixels of the render needs: the cells its
 /// pixels lie among (the one before the first centre, the one after the
 /// last) and the margin around them, inside the grid. First cell and count.
@@ -585,12 +546,6 @@ pub(crate) struct Scratch {
     /// The reached field of the mask, R32Float: the passes of the flood take
     /// turns between the two and the last writes `flood[0]`.
     flood: [FloatTarget; FLOOD_TARGETS],
-    /// The reached field at each pixel of the render, R32Float: one pass
-    /// after the flood writes it over the pixels the cells of a tile lie
-    /// over, and the gathers and the apply read one texel a pixel.
-    reach: FloatTarget,
-    /// The pixels `reach` holds, the size of the render.
-    reach_size: (u32, u32),
     /// The cells a side the targets of cells hold.
     size: (u32, u32),
     held: Option<Held>,
@@ -638,8 +593,8 @@ pub(crate) struct Refined {
 /// in the group of a pass that writes it; `v` fills the places a pass does
 /// not read. The groups a box reads hold v0 and v1 third and fourth, where a
 /// box of blocks reads the sums of its block pass. Binding 3 holds the
-/// reached field at each pixel, `reach`, in the groups of the passes that
-/// read it and the alpha in every other.
+/// reached field, `flood[0]`, in the groups of the passes that read it and
+/// the alpha in every other.
 struct Binds {
     /// f1, g: the passes over the pixels of a cell, which read no target of
     /// cells but the reached field, and the box down of a gather.
@@ -648,8 +603,7 @@ struct Binds {
     /// either flood target.
     seed: wgpu::BindGroup,
     /// flood0 or flood1, then r0: a pass of the flood that reads that flood
-    /// target and writes the other. `flood_from[0]` is also the group of the
-    /// pass that writes `reach` from flood0.
+    /// target and writes the other.
     flood_from: [wgpu::BindGroup; FLOOD_TARGETS],
     /// r0, r1 and r2: the box across of the source's moments.
     source_pair: wgpu::BindGroup,
@@ -683,7 +637,6 @@ enum Pipe {
     SourceB,
     FloodSeed,
     Flood,
-    Reach,
     GatherFirst,
     GatherMoved,
     BoxH2,
@@ -732,7 +685,6 @@ enum Place {
     G,
     V(usize),
     Flood(usize),
-    Reach,
     Refined,
 }
 
@@ -815,23 +767,21 @@ pub(crate) struct RefineWork {
 ///   cell + 1;
 /// - a pass of the flood reads 9 cells of the field and 9 of the source's
 ///   moments and writes 1, 19;
-/// - the reached field at each pixel reads 4 cells of the field and writes
-///   1, 5;
-/// - the first gather reads the alpha, the working texture and the reached
-///   field at each pixel and writes 2, 3 cell + 2;
-/// - a moved gather reads 19 a pixel (the alpha, the working texture, 4
-///   bilinear reads of the 4 solved targets and the reached field) and
-///   writes 1, 19 cell + 1;
+/// - the first gather reads the alpha, the working texture and 4 cells of
+///   the reached field at each pixel and writes 2, 6 cell + 2;
+/// - a moved gather reads 22 a pixel (the alpha, the working texture and 4
+///   bilinear reads of the 4 solved targets and of the reached field) and
+///   writes 1, 22 cell + 1;
 /// - a box of t targets reads its cells of each and writes each, t
 ///   (box_reads + 1): 2 c + 1 cells in the direct loop, c its radius, and
 ///   the block sums and the cells left over from blocks;
 /// - a block pass of t targets reads 8 cells of each and writes each, 9 t;
 /// - the solve reads 5 targets and writes 4, 9 (5 + 2 in each of two);
-/// - the apply reads 19 and writes 1 at each pixel, 20.
+/// - the apply reads 22 and writes 1 at each pixel, 23.
 ///
 /// Over one tile of p pixels of work in n cells, o pixels of the apply and k
 /// passes of the flood, the fused family with every box in the direct loop
-/// sums to 46 p + 20 o + (28 c + 63 + 19 k) n: the ten boxes read 14
+/// sums to 52 p + 23 o + (28 c + 63 + 19 k) n: the ten boxes read 14
 /// targets.
 fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
     let block = u64::from(BLOCK);
@@ -841,16 +791,15 @@ fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
         Pipe::SourceB => cell + 1,
         Pipe::FloodSeed => cell + 1,
         Pipe::Flood => 19,
-        Pipe::Reach => 5,
-        Pipe::GatherFirst => 3 * cell + 2,
-        Pipe::GatherMoved => 19 * cell + 1,
+        Pipe::GatherFirst => 6 * cell + 2,
+        Pipe::GatherMoved => 22 * cell + 1,
         Pipe::BoxH2 | Pipe::BoxV2 => 2 * (box_reads + 1),
         Pipe::BoxH1 | Pipe::BoxV1 => box_reads + 1,
         Pipe::BlockH2 | Pipe::BlockV2 => 2 * (block + 1),
         Pipe::BlockH1 | Pipe::BlockV1 => block + 1,
         Pipe::Solve => 9,
         Pipe::SolveA | Pipe::SolveB => 7,
-        Pipe::Apply => 20,
+        Pipe::Apply => 23,
     }
 }
 /// The pipelines of `refine.wgsl`.
@@ -866,8 +815,6 @@ pub(crate) struct RefinePass {
     flood_seed: wgpu::RenderPipeline,
     /// Every pass of the flood, its step in the uniform.
     flood: wgpu::RenderPipeline,
-    /// The reached field at each pixel, after the flood.
-    reach: wgpu::RenderPipeline,
     gather_first: wgpu::RenderPipeline,
     gather_moved: wgpu::RenderPipeline,
     box_h2: wgpu::RenderPipeline,
@@ -1005,7 +952,6 @@ impl RefinePass {
             source_b: split("fs_source_b", &one),
             flood_seed: pipeline("fs_flood_seed", &[FLOOD_FORMAT]),
             flood: pipeline("fs_flood", &[FLOOD_FORMAT]),
-            reach: pipeline("fs_reach", &[REACH_FORMAT]),
             gather_first: pipeline("fs_gather_first", &pair),
             gather_moved: pipeline("fs_gather_moved", &one),
             box_h2: pipeline("fs_box_h2", &pair),
@@ -1163,23 +1109,12 @@ impl RefinePass {
                 g: float("refine mask means"),
                 v: [0; SOLVED_TARGETS].map(|_| float("refine solved")),
                 flood: [0; FLOOD_TARGETS].map(|_| field("refine flood")),
-                reach: reach_target(device, plan.size),
-                reach_size: plan.size,
                 size,
                 held: None,
                 id: self.scratches,
             });
         }
         let scratch = scratch.as_mut().expect("made above");
-        // Every plan of a frame has the render's size, so the reached field
-        // a pixel is made again only when a scratch is carried to a render of
-        // another size; its bind groups are then made again too.
-        if scratch.reach_size != plan.size {
-            self.scratches += 1;
-            scratch.reach = reach_target(device, plan.size);
-            scratch.reach_size = plan.size;
-            scratch.id = self.scratches;
-        }
         let tiles = tiles(plan, over, hold.side);
         // A tile takes one uniform for its passes and one for each pass of
         // the flood, which carries its step.
@@ -1234,7 +1169,7 @@ impl RefinePass {
                 |label: &str, textures: [&FloatTarget; 5]| group_with(label, alpha, textures);
             let (r, s, f, g, v) = (&scratch.r, &scratch.s, &scratch.f, &scratch.g, &scratch.v);
             let flood = &scratch.flood;
-            let reached = &scratch.reach.view;
+            let reached = &flood[0].view;
             refined.binds = Some((
                 scratch.id,
                 Binds {
@@ -1498,17 +1433,6 @@ impl RefinePass {
                 );
             }
             at.set(offset);
-            // The reached field at each pixel the work lies over, from
-            // flood0, once: the gathers and the apply read one texel of it a
-            // pixel in place of the four cells around the pixel.
-            pass(
-                "refine reach",
-                Pipe::Reach,
-                Group::FloodFrom(0),
-                &[Place::Reach],
-                work_pixels(plan, tile),
-                None,
-            );
             for gather in 0..GATHERS {
                 if gather == 0 {
                     // With the moments of the mask itself, which the solve
@@ -1643,7 +1567,6 @@ impl RefinePass {
             Pipe::SourceB => self.source_b.as_ref().expect("made without a fused source"),
             Pipe::FloodSeed => &self.flood_seed,
             Pipe::Flood => &self.flood,
-            Pipe::Reach => &self.reach,
             Pipe::GatherFirst => &self.gather_first,
             Pipe::GatherMoved => &self.gather_moved,
             Pipe::BoxH2 => &self.box_h2,
@@ -1687,7 +1610,6 @@ impl RefinePass {
                 Place::G => &scratch.g.view,
                 Place::V(i) => &scratch.v[i].view,
                 Place::Flood(i) => &scratch.flood[i].view,
-                Place::Reach => &scratch.reach.view,
                 Place::Refined => &refined.alpha,
             })
             .collect();
@@ -1709,20 +1631,6 @@ impl RefinePass {
 
 struct MadeTarget {
     view: wgpu::TextureView,
-}
-
-/// The reached field at each pixel of a render of `size` pixels.
-fn reach_target(device: &wgpu::Device, size: (u32, u32)) -> FloatTarget {
-    FloatTarget {
-        view: target(
-            device,
-            "refine reached field a pixel",
-            REACH_FORMAT,
-            size.0,
-            size.1,
-        )
-        .view,
-    }
 }
 
 fn target(
@@ -2016,12 +1924,6 @@ mod tests {
         assert_eq!(FLOOD_FORMAT.target_pixel_byte_cost(), Some(4));
         assert_eq!(FLOOD_BYTES, 4);
         assert_eq!(FLOOD_TARGETS, 2);
-        // The reached field at each pixel is one 32 bit float a pixel of the
-        // render, outside the budget of the cells: 46,485,504 bytes at the
-        // window of 3104 by 3744 pixels.
-        let reach_bytes = REACH_FORMAT.target_pixel_byte_cost();
-        assert_eq!(reach_bytes, Some(4));
-        assert_eq!(3104 * 3744 * reach_bytes.map_or(0, u64::from), 46_485_504);
     }
 
     /// The passes of the flood step 1, 2, 4, ... cells while the steps sum to
@@ -2153,14 +2055,6 @@ mod tests {
                     tile.work.0 + tile.work.2 <= tile.count.0
                         && tile.work.1 + tile.work.3 <= tile.count.1,
                     "{tile:?}"
-                );
-                // The pass after the flood writes the reached field at every
-                // pixel the apply reads it at, inside the render.
-                let pixels = work_pixels(&plan, tile);
-                assert!(holds(pixels, tile.out), "{tile:?}: {pixels:?}");
-                assert!(
-                    pixels.0 + pixels.2 <= plan.size.0 && pixels.1 + pixels.3 <= plan.size.1,
-                    "{tile:?}: {pixels:?}"
                 );
                 for y in tile.out.1..tile.out.1 + tile.out.3 {
                     for x in tile.out.0..tile.out.0 + tile.out.2 {

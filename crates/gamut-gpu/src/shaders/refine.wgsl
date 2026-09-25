@@ -43,11 +43,6 @@
 //                                 cells while the steps sum to at most the
 //                                 flood of the plan, from one flood target
 //                                 into the other, the last into flood 0
-//     fs_reach                    the reached field at each pixel the
-//                                 cells of the tile lie over, mixed from the
-//                                 four cells around it, into a target of
-//                                 the render's pixels that the gathers and
-//                                 the apply read one texel of
 //   each of the three gathers
 //     fs_gather_first             the means of wq and wq I over each cell,
 //       / fs_gather_moved         and of p, p p and p keep with the first; a
@@ -98,10 +93,9 @@ struct Uniform {
 @group(0) @binding(0) var<uniform> u: Uniform;
 @group(0) @binding(1) var working: texture_2d<f32>;
 @group(0) @binding(2) var alpha: texture_2d<f32>;
-// The reached field at each pixel of the render, written by fs_reach from
-// flood 0 after the last pass of fs_flood: read by fs_gather_first,
-// fs_gather_moved and fs_apply, one texel a pixel. A group whose pass reads
-// no reached field binds the alpha here.
+// The reached field on the cell grid, flood 0 after the last pass of
+// fs_flood: read by fs_gather_first, fs_gather_moved and fs_apply. A group
+// whose pass reads no reached field binds the alpha here.
 @group(0) @binding(3) var reached_field: texture_2d<f32>;
 @group(0) @binding(4) var tex_a: texture_2d<f32>;
 @group(0) @binding(5) var tex_b: texture_2d<f32>;
@@ -323,21 +317,12 @@ fn fs_flood(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(most, 0.0, 0.0, 0.0);
 }
 
-// The reached field at each pixel of the render the cells of the tile lie
-// over, mixed from the four cells around it as the twin's `reach` mixes it:
-// `tex_a` holds flood 0 after the last pass of the flood. Written once a
-// mask and a tile, so the gathers and the apply read one texel a pixel.
-@fragment
-fn fs_reach(in: VertexOutput) -> @location(0) vec4<f32> {
-    let pixel = vec2<u32>(in.position.xy);
+// The reached field at the pixel `pixel` of the render, mixed from the four
+// cells around it.
+fn reached_at(pixel: vec2<u32>) -> f32 {
     let x = among(pixel.x, u.origin.x, u.grid_first.x, u.grid_count.x, u.tile_first.x);
     let y = among(pixel.y, u.origin.y, u.grid_first.y, u.grid_count.y, u.tile_first.y);
-    return vec4<f32>(mixed(tex_a, x, y).r, 0.0, 0.0, 0.0);
-}
-
-// The reached field at the pixel `pixel` of the render, as fs_reach wrote it.
-fn reached_at(pixel: vec2<u32>) -> f32 {
-    return textureLoad(reached_field, vec2<i32>(pixel), 0).r;
+    return mixed(reached_field, x, y).r;
 }
 
 // How much of a pixel the inside class keeps where the reached field is `rf`.
@@ -745,7 +730,7 @@ fn moved(pixel: vec2<u32>) -> vec3<f32> {
     let g = acescct_encode(textureLoad(working, at, 0).rgb);
     let x = among(pixel.x, u.origin.x, u.grid_first.x, u.grid_count.x, u.tile_first.x);
     let y = among(pixel.y, u.origin.y, u.grid_first.y, u.grid_count.y, u.tile_first.y);
-    let rf = reached_at(pixel);
+    let rf = mixed(reached_field, x, y).r;
     let a_s = mixed(tex_a, x, y);
     let d2_c_p = mixed(tex_b, x, y);
     let rest = mixed(tex_c, x, y);

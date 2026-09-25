@@ -1447,9 +1447,8 @@ fn develop_at_viewer_size_is_fast_enough() {
     // 0.05, whose boxes of 14 cells draw a block pass each. Stepped: 17 at
     // 0.01, 0.012 and 0.04 (a box of 11 cells, no block pass), 27 at 0.05,
     // each count before the flood. The flood adds its seed and 6 passes at
-    // 0.05, and one pass writes the reached field at each pixel, so the
-    // timing line, a Radius step from 0.05 to 0.049, draws 27 + 1 + 6 + 1 =
-    // 35 passes.
+    // 0.05, so the timing line, a Radius step from 0.05 to 0.049, draws
+    // 27 + 1 + 6 = 34 passes.
     // "Taken again" below is that step, and its difference from the held
     // line is the four box means of the source.
     let ends: &[(f32, f32)] = if on_gpu {
