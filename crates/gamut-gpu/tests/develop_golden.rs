@@ -1308,6 +1308,12 @@ fn the_overlay_of_a_mask_matches_and_stays_out_of_an_export() {
 /// The overlay of `idle`, a mask that adjusts nothing and covers the middle
 /// of the photo but not its first pixel.
 fn check_overlay(idle: Mask) {
+    check_overlay_at(idle, (SIZE * 55 / 100, SIZE * 45 / 100));
+}
+
+/// [`check_overlay`] of a mask that covers pixel `inside` (column, row) but
+/// not the first pixel of the photo.
+fn check_overlay_at(idle: Mask, inside: (u32, u32)) {
     let _turn = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1344,7 +1350,7 @@ fn check_overlay(idle: Mask) {
     assert_the_overlay_matches("overlay", &photo, &edit, 1, &overlaid);
 
     // Red where the mask is, the plain picture where it is not.
-    let centre = (SIZE * (SIZE * 45 / 100) + SIZE * 55 / 100) as usize;
+    let centre = (SIZE * inside.1 + inside.0) as usize;
     assert!(
         overlaid[centre][0] > plain[centre][0],
         "red inside the mask"
@@ -1373,7 +1379,10 @@ fn check_overlay(idle: Mask) {
 /// Holds `overlaid`, a render of `edit` on `photo` with the overlay of mask
 /// `shown` on, to the twin within the golden tolerances. The reference is the
 /// developed picture through the output transform, with the overlay of that
-/// mask between the clip and the curve.
+/// mask between the clip and the curve. The overlay shows the alpha itself,
+/// and near black one code of alpha is five or six of the output, so the
+/// reference takes each path of [`stored_alpha_paths`] and holds each pixel
+/// to the path closest to it.
 fn assert_the_overlay_matches(
     name: &str,
     photo: &Photo,
@@ -1389,25 +1398,13 @@ fn assert_the_overlay_matches(
         .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source))
         .collect();
     let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
-    // The overlay shows the alpha itself, and near black one code of alpha
-    // is six of the output, so the reference takes the unorm store at every
-    // step the conversion is allowed.
-    let reference = |rounding: Rounding, step: f32| -> Vec<[u8; 3]> {
+    let references_at = |rounding: Rounding| -> Vec<Vec<[u8; 3]>> {
         let stored: Vec<[f32; 3]> = linear
             .iter()
             .map(|px| px.map(|c| half(c, rounding)))
             .collect();
         let store = |v: f32| half(v, rounding);
-        let alphas: Vec<f32> = mask_twin::alpha_image_before_the_store(
-            &edit.masks[shown],
-            &stored,
-            &geometry,
-            None,
-            &store,
-        )
-        .into_iter()
-        .map(|alpha| mask_twin::stored_alpha_stepping(alpha, step))
-        .collect();
+        let paths = stored_alpha_paths(&edit.masks[shown], &stored, &geometry, &store);
         let luma: Vec<f32> = stored.iter().map(|px| basic::luma(*px)).collect();
         let base = basic::gaussian_stored(&luma, SIZE, SIZE, basic::base_sigma(SIZE, SIZE), &store);
         let clear = vec![1.0; stored.len()];
@@ -1419,46 +1416,131 @@ fn assert_the_overlay_matches(
             geometry,
             proxy: None,
         };
-        mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
-            .into_iter()
-            .zip(alphas)
-            .map(|(px, alpha)| {
-                let srgb = matrices::rec2020_to_srgb()
-                    .apply(px)
-                    .map(|c| c.clamp(0.0, 1.0));
-                mask_twin::overlay(srgb, alpha).map(transfer::linear_to_srgb8)
+        let srgb: Vec<[f32; 3]> =
+            mask_twin::develop_image_with(&image, edit, [1.0; 3], &store, &store)
+                .into_iter()
+                .map(|px| {
+                    matrices::rec2020_to_srgb()
+                        .apply(px)
+                        .map(|c| c.clamp(0.0, 1.0))
+                })
+                .collect();
+        paths
+            .iter()
+            .map(|alphas| {
+                srgb.iter()
+                    .zip(alphas)
+                    .map(|(px, alpha)| {
+                        mask_twin::overlay(*px, *alpha).map(transfer::linear_to_srgb8)
+                    })
+                    .collect()
             })
             .collect()
     };
-    let tolerance = mask_twin::UNORM_STEP_TOLERANCE;
     let references: Vec<Vec<[u8; 3]>> = [Rounding::Nearest, Rounding::TowardZero]
         .into_iter()
-        .flat_map(|rounding| [-tolerance, 0.0, tolerance].map(|step| reference(rounding, step)))
+        .flat_map(references_at)
         .collect();
     let mut max = 0;
     let mut sum = 0u64;
     let mut worst = (0usize, [0u8; 3], [0u8; 3]);
     for (i, g) in overlaid.iter().enumerate() {
-        for k in 0..3 {
-            let d = references
-                .iter()
-                .map(|r| (i32::from(r[i][k]) - i32::from(g[k])).abs())
-                .min()
-                .expect("six references");
-            if d > max {
-                max = d;
-                worst = (i, references[0][i], *g);
-            }
-            sum += d as u64;
+        // One path per pixel: the one whose largest channel difference is the
+        // smallest, then whose sum is.
+        let (d, closest) = references
+            .iter()
+            .map(|r| {
+                let d = [0, 1, 2].map(|k| (i32::from(r[i][k]) - i32::from(g[k])).abs());
+                (d, r[i])
+            })
+            .min_by_key(|(d, _)| (d.iter().max().copied(), d.iter().sum::<i32>()))
+            .expect("at least six references");
+        let largest = d.iter().max().copied().unwrap_or(0);
+        if largest > max {
+            max = largest;
+            worst = (i, closest, *g);
         }
+        sum += d.iter().sum::<i32>() as u64;
     }
     let mean = sum as f64 / (overlaid.len() * 3) as f64;
     println!(
-        "{name}: max {max} at pixel {} (cpu {:?}, gpu {:?}), mean {mean:.3}",
-        worst.0, worst.1, worst.2
+        "{name}: max {max} at pixel {} (cpu {:?}, gpu {:?}), mean {mean:.3}, {} references",
+        worst.0,
+        worst.1,
+        worst.2,
+        references.len()
     );
     assert!(max <= MAX_DIFFERENCE, "{name}: max difference {max}");
     assert!(mean <= MEAN_DIFFERENCE, "{name}: mean difference {mean}");
+}
+
+/// The alpha of `mask` over every pixel as the GPU may hold it, one path for
+/// each step a GPU may take at each r8unorm store on the mask path: the alpha
+/// of the components (the "mask alpha" target of develop.rs), the refined
+/// alpha while Refine edges is on (the refined target of refine.rs), and the
+/// finished alpha while an edge control is on (the finished alpha of edge.rs,
+/// or the shifted alpha while Shift edge alone is on). Each store is taken at
+/// -0.1, 0 and +0.1 of a code, the whole of
+/// [`mask_twin::UNORM_STEP_TOLERANCE`]: an alpha beside a half code may land
+/// on either code at each store, and Contrast multiplies a code taken before
+/// it by its gain. The arithmetic between the stores is the twin's, in the
+/// order of [`mask_twin::alpha_image_before_the_store`]. The path with no
+/// step, the middle one, equals the twin's stored alpha. Shift edge moves
+/// whole codes only, so the shifted alpha under Feather or Contrast takes no
+/// step of its own.
+fn stored_alpha_paths(
+    mask: &Mask,
+    pixels: &[[f32; 3]],
+    geometry: &Geometry,
+    layer_store: &dyn Fn(f32) -> f32,
+) -> Vec<Vec<f32>> {
+    let tolerance = mask_twin::UNORM_STEP_TOLERANCE;
+    let steps = [-tolerance, 0.0, tolerance];
+    let stepped = |alpha: &[f32], step: f32| -> Vec<f32> {
+        alpha
+            .iter()
+            .map(|alpha| mask_twin::stored_alpha_stepping(*alpha, step))
+            .collect()
+    };
+    let mask = mask.sanitised();
+    let mut drawn = mask.clone();
+    drawn.refine = Refine::default();
+    drawn.edge = Edge::default();
+    let components =
+        mask_twin::alpha_image_before_the_store(&drawn, pixels, geometry, None, layer_store);
+    let mut paths = Vec::new();
+    for components_step in steps {
+        let alpha = stepped(&components, components_step);
+        if mask.refine.is_off() && mask.edge.is_off() {
+            paths.push(alpha);
+            continue;
+        }
+        let refined = if mask.refine.is_off() {
+            vec![alpha]
+        } else {
+            let refined =
+                gamut_color::refine::refined(&alpha, pixels, geometry, &mask.refine, &|m| m);
+            if mask.edge.is_off() {
+                paths.extend(steps.map(|step| stepped(&refined, step)));
+                continue;
+            }
+            steps.map(|step| stepped(&refined, step)).to_vec()
+        };
+        for held in refined {
+            let finished = gamut_color::edge::finished(&held, geometry, &mask.edge, &|c| c);
+            paths.extend(steps.map(|step| stepped(&finished, step)));
+        }
+    }
+    let twin: Vec<f32> =
+        mask_twin::alpha_image_before_the_store(&mask, pixels, geometry, None, layer_store)
+            .into_iter()
+            .map(mask_twin::stored_alpha)
+            .collect();
+    assert!(
+        paths[paths.len() / 2] == twin,
+        "the path with no step is the twin's stored alpha"
+    );
+    paths
 }
 
 fn stroke(points: &[[f32; 2]], size: f32, feather: f32, flow: f32) -> Stroke {
@@ -4684,6 +4766,23 @@ fn the_overlay_of_an_edged_mask_matches_and_stays_out_of_an_export() {
         0.0,
         0.0,
     ));
+}
+
+/// The overlay of an edged refined mask whose rim spills into the near-black
+/// band, where one code of alpha is five or six codes of the overlay. The
+/// raw alpha, the refined alpha and the finished alpha are each an r8unorm
+/// store, and an alpha beside a half code may land on either code at each.
+#[test]
+fn the_overlay_of_an_edged_refined_mask_over_the_band_matches() {
+    check_overlay_at(
+        edged_at(
+            refined(Mask::new("Idle", radial_over_the_band())),
+            0.02,
+            0.01,
+            50.0,
+        ),
+        (SIZE / 2, SIZE * 78 / 100),
+    );
 }
 
 /// A mask whose three edge keys are in the file at 0, or at values sanitising
