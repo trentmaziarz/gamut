@@ -210,7 +210,8 @@ pub(crate) enum Branch {
     /// maximum fits the budget.
     Cut,
     /// No side from the plan's floor up fits beside the held size: the
-    /// scratch is made again at the plan's wanted cells.
+    /// scratch is made again at the plan's wanted cells, or kept as it is
+    /// when it already holds them, as after a make by this branch.
     Floor,
 }
 
@@ -234,9 +235,12 @@ pub(crate) struct Hold {
 /// than be made again for each: the per-axis maximum of the held size and
 /// what the plan wants when that fits the budget. When it does not, the
 /// plan's tiles are cut at the largest side from its floor up whose maximum
-/// fits, and the scratch keeps its size or grows inside the budget. Only
-/// when no side does is the scratch made again at what the plan wants,
-/// which may be smaller than what was held.
+/// fits, and the scratch keeps its size or grows inside the budget. When no
+/// side does, a scratch that already holds what the plan wants at
+/// [`tile_side`] on both axes is kept as it is, over the budget, and the
+/// tiles are cut at that side: a plan repeated after a floor branch makes
+/// nothing again. Only otherwise is the scratch made again at what the plan
+/// wants, which may be smaller than what was held.
 pub(crate) fn hold(held: Option<(u32, u32)>, plan: &Plan, budget: u64) -> Hold {
     let (_, grid) = plan.grid();
     let most = tile_side(plan, budget);
@@ -266,6 +270,14 @@ pub(crate) fn hold(held: Option<(u32, u32)>, plan: &Plan, budget: u64) -> Hold {
     };
     if fits(joined(most)) {
         return grown(most, Branch::Fits);
+    }
+    if joined(most) == held {
+        return Hold {
+            size: held,
+            side: most,
+            made: false,
+            branch: Branch::Floor,
+        };
     }
     let floor = tile_floor(plan);
     if !fits(joined(floor)) {
@@ -1838,10 +1850,10 @@ mod tests {
     /// Walks `radii` in order on a photo of `photo` pixels, rendered whole,
     /// through [`hold`] under `budget`, and checks after each plan that the
     /// scratch is inside the budget (or, after a floor branch, made at what
-    /// the plan wants), that it holds what the plan wants at the side its
-    /// tiles are cut at, that the side lies from the plan's floor to
-    /// [`tile_side`], and that the scratch shrinks only when the floor
-    /// branch makes it again.
+    /// the plan wants or kept as held at [`tile_side`]), that it holds what
+    /// the plan wants at the side its tiles are cut at, that the side lies
+    /// from the plan's floor to [`tile_side`], and that the scratch shrinks
+    /// only when the floor branch makes it again.
     fn walk(name: &str, photo: (u32, u32), radii: &[f32], budget: u64, print: bool) -> Walk {
         let mut out = Walk {
             steps: Vec::new(),
@@ -1868,10 +1880,16 @@ mod tests {
             let mut broken = Vec::new();
             if hold.branch == Branch::Floor {
                 out.floors += 1;
-                if !hold.made || hold.size != wanted {
+                if hold.made && hold.size != wanted {
                     broken.push(format!(
                         "the floor branch holds {:?}, not a scratch made at {wanted:?}",
                         hold.size
+                    ));
+                }
+                if !hold.made && (Some(hold.size) != held || hold.side != most) {
+                    broken.push(format!(
+                        "the floor branch keeps {:?} at side {}, not {held:?} at {most}",
+                        hold.size, hold.side
                     ));
                 }
             } else if bytes > budget {
@@ -2016,13 +2034,20 @@ mod tests {
                 made: 2,
             },
             // The floor branch: at 16 MiB the box of step 4 at 0.049 needs
-            // 278 cells a side, and 278 by 278 passes the budget alone.
+            // 278 cells a side, and 278 by 278 passes the budget alone. The
+            // same plan three more times keeps what the floor branch made.
             Case {
                 name: "E 0.03 then 0.049 at 16 MiB",
                 photo: (1280, 4000),
-                radii: vec![0.03, 0.049],
+                radii: vec![0.03, 0.049, 0.049, 0.049, 0.049],
                 budget: small,
-                held: vec![((273, 273), 273), ((278, 278), 278)],
+                held: vec![
+                    ((273, 273), 273),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                ],
                 made: 2,
             },
         ];
@@ -2055,11 +2080,27 @@ mod tests {
             broken.push(format!("D: made {} times over ten renders", alternate.made));
         }
         // Case E's second plan is the floor branch, made again at what it
-        // wants and over the small budget, as one box needs.
-        let floor = walk("E", (1280, 4000), &[0.03, 0.049], small, false);
+        // wants and over the small budget, as one box needs. The same plan
+        // after it keeps that scratch as it is.
+        let floor = walk(
+            "E",
+            (1280, 4000),
+            &[0.03, 0.049, 0.049, 0.049, 0.049],
+            small,
+            false,
+        );
         let last = floor.steps[1];
         if (last.branch, last.made) != (Branch::Floor, true) {
             broken.push(format!("E: plan 2 is {last:?}, not the floor branch"));
+        }
+        for (index, kept) in floor.steps.iter().enumerate().skip(2) {
+            if kept.made || kept.size != last.size {
+                broken.push(format!(
+                    "E: plan {} is {kept:?}, not {:?} kept",
+                    index + 1,
+                    last.size
+                ));
+            }
         }
 
         // The sweep: every order of four radii, 12, 20 and 28 pixels and 0.05
