@@ -179,6 +179,31 @@ pub(crate) fn stamp(brush: &Brush, geometry: &Geometry, first: (usize, usize)) -
     out
 }
 
+/// What stamping `dab` into a layer of `geometry` costs a slice of a frame
+/// built ahead, in texels read and written, as
+/// [`crate::develop::AHEAD_SLICE_TEXELS`] counts them: each pixel of the
+/// dab's quad inside the frame counts 2 (the blend reads the layer and writes
+/// it), and 3 for an auto dab, whose fragment also reads the working texture.
+/// The clear of a layer stamped whole counts 1 a pixel of the frame, and is
+/// counted by [`Layers::stamp_batch`] with the first batch.
+fn dab_texels(dab: &DabInstance, auto: bool, geometry: &Geometry) -> u64 {
+    let aspect = geometry.aspect();
+    let window = geometry.window;
+    let (width, height) = (geometry.size.0 as f32, geometry.size.1 as f32);
+    let pixel = [window.width / width, window.height / height];
+    let per_pixel = if auto { 3 } else { 2 };
+    let radius = dab.brush[0];
+    let reach = [radius / aspect[0] + pixel[0], radius / aspect[1] + pixel[1]];
+    let span = |centre: f32, reach: f32, start: f32, pixel: f32, size: f32| {
+        let low = ((centre - reach - start) / pixel).floor().clamp(0.0, size);
+        let high = ((centre + reach - start) / pixel).ceil().clamp(0.0, size);
+        (high - low) as u64
+    };
+    let across = span(dab.centre[0], reach[0], window.x, pixel[0], width);
+    let down = span(dab.centre[1], reach[1], window.y, pixel[1], height);
+    across * down * per_pixel
+}
+
 /// How a brush differs from the one a layer holds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Change {
@@ -372,12 +397,45 @@ impl BrushPass {
     }
 }
 
+/// The key of a layer: the brush it holds and the dabs of its last stroke.
+pub(crate) type LayerHeld = (Brush, usize);
+
 struct Layer {
     view: wgpu::TextureView,
     /// The brush the layer holds and the dabs of its last stroke, or `None`
     /// when nothing was drawn yet.
-    held: Option<(Brush, usize)>,
+    held: Option<LayerHeld>,
     dabs: Option<(wgpu::Buffer, u64)>,
+    /// A stamp drawn a batch of dabs at a time and not finished, while the
+    /// key claims nothing.
+    stamping: Option<Stamping>,
+}
+
+/// A stamp of a layer of a frame built ahead, drawn a batch of dabs at a
+/// time by [`Layers::stamp_batch`], each batch in a submit of its own. The
+/// dabs build in order in the layer, so the batches drawn one after another
+/// leave it as one draw of every dab does.
+struct Stamping {
+    /// The key the layer holds once every dab is drawn.
+    held: LayerHeld,
+    stamp: Stamp,
+    /// The layer is cleared before the first dab: the brush is stamped whole
+    /// and not by the dabs added since the brush it holds.
+    whole: bool,
+    /// Whether the first batch was drawn, with the clear of a whole stamp.
+    begun: bool,
+    /// How many dabs the batches drew, in order.
+    drawn: u32,
+}
+
+/// What a batch of a stamp drew: the layer's draw once its last dab is
+/// drawn and [`Drawn::Nothing`] before, whether it recorded a pass, what it
+/// cost in texels read and written, and whether every dab is drawn.
+pub(crate) struct Batch {
+    pub(crate) drawn: Drawn,
+    pub(crate) recorded: bool,
+    pub(crate) texels: u64,
+    pub(crate) done: bool,
 }
 
 /// The layers of the brush components of one mask on one frame: one array
@@ -426,6 +484,7 @@ impl Layers {
                 }),
                 held: None,
                 dabs: None,
+                stamping: None,
             })
             .collect();
         Layers {
@@ -439,6 +498,38 @@ impl Layers {
         self.layers.len()
     }
 
+    /// Whether layer `index` holds `brush`, so an update would stamp
+    /// nothing.
+    pub(crate) fn holds(&self, index: usize, brush: &Brush) -> bool {
+        self.layers[index]
+            .held
+            .as_ref()
+            .is_some_and(|(held, _)| held == brush)
+    }
+
+    /// Takes the key of layer `index` out, so the layer claims nothing
+    /// until [`Layers::hold`] sets it again: a frame built ahead stamps a
+    /// layer in a slice and sets the key once the slice's commands are
+    /// submitted.
+    pub(crate) fn take_held(&mut self, index: usize) -> Option<LayerHeld> {
+        self.layers[index].held.take()
+    }
+
+    /// Sets the key [`Layers::take_held`] took out.
+    pub(crate) fn hold(&mut self, index: usize, held: LayerHeld) {
+        self.layers[index].held = Some(held);
+    }
+
+    /// Forgets what every layer holds and every stamp not finished, so the
+    /// next update stamps each layer whole: the frame they belong to renders
+    /// another window, where the dabs land on other pixels.
+    pub(crate) fn forget(&mut self) {
+        for layer in &mut self.layers {
+            layer.held = None;
+            layer.stamping = None;
+        }
+    }
+
     /// Forgets what every layer with an auto stroke holds, so the next
     /// update stamps it whole: its dabs read the source, and the source
     /// content is another.
@@ -450,6 +541,14 @@ impl Layers {
                 .is_some_and(|(brush, _)| has_auto(brush))
             {
                 layer.held = None;
+            }
+            // A stamp not finished of such a brush is drawn again whole.
+            if layer
+                .stamping
+                .as_ref()
+                .is_some_and(|stamping| has_auto(&stamping.held.0))
+            {
+                layer.stamping = None;
             }
         }
     }
@@ -468,6 +567,9 @@ impl Layers {
         geometry: &Geometry,
         auto: Option<AutoInputs>,
     ) -> Drawn {
+        // A render's update draws the layer whole or by its new dabs; a stamp
+        // a frame built ahead left unfinished is drawn again from the start.
+        self.layers[index].stamping = None;
         let layer = &mut self.layers[index];
         let how = match &layer.held {
             Some((held, last_dabs)) => change(held, *last_dabs, brush),
@@ -488,6 +590,181 @@ impl Layers {
         if !whole && stamped.dabs.is_empty() {
             return Drawn::Appended(None);
         }
+        self.upload(index, device, queue, pass, &stamped, geometry, auto);
+        let dabs = 0..stamped.dabs.len() as u32;
+        self.record(index, encoder, pass, &stamped, dabs, whole);
+        if whole {
+            Drawn::Whole
+        } else {
+            Drawn::Appended(stamped.reach)
+        }
+    }
+
+    /// Brings layer `index` of a frame built ahead to `brush` by a batch of
+    /// its dabs: those the texels of `budget` pay for, at least one when
+    /// `first` (the slice has drawn nothing yet), counted as
+    /// [`dab_texels`] counts them and, before the first dab of a whole stamp,
+    /// 1 a pixel of the frame for the clear. The first batch lays the stamp
+    /// out as [`update`](Self::update) would draw it, whole or by the dabs
+    /// added since, and takes the key out, so the layer claims nothing until
+    /// the last batch sets it again; each later batch draws the next dabs in
+    /// order over what the batches before left. A brush other than the one
+    /// being stamped starts again. `None` when the budget pays for nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stamp_batch(
+        &mut self,
+        index: usize,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &mut BrushPass,
+        brush: &Brush,
+        geometry: &Geometry,
+        auto: Option<AutoInputs>,
+        budget: u64,
+        first: bool,
+    ) -> Option<Batch> {
+        let layer = &mut self.layers[index];
+        if layer
+            .stamping
+            .as_ref()
+            .is_some_and(|stamping| stamping.held.0 != *brush)
+        {
+            layer.stamping = None;
+        }
+        if layer.stamping.is_none() {
+            let how = match &layer.held {
+                Some((held, last_dabs)) => change(held, *last_dabs, brush),
+                None => Change::Other,
+            };
+            let first_dab = match how {
+                Change::Same => {
+                    return Some(Batch {
+                        drawn: Drawn::Nothing,
+                        recorded: false,
+                        texels: 0,
+                        done: true,
+                    });
+                }
+                Change::Grown(stroke, dab) => (stroke, dab),
+                Change::Other => (0, 0),
+            };
+            let stamped = stamp(brush, geometry, first_dab);
+            let last_dabs = brush.strokes.last().map_or(0, |stroke| {
+                twin::placed_dabs(stroke, geometry.aspect()).len()
+            });
+            let held = (brush.clone(), last_dabs);
+            let whole = how == Change::Other;
+            if !whole && stamped.dabs.is_empty() {
+                layer.held = Some(held);
+                return Some(Batch {
+                    drawn: Drawn::Appended(None),
+                    recorded: false,
+                    texels: 0,
+                    done: true,
+                });
+            }
+            // What the layer holds is being drawn again: it claims nothing
+            // until the last batch.
+            layer.held = None;
+            layer.stamping = Some(Stamping {
+                held,
+                stamp: stamped,
+                whole,
+                begun: false,
+                drawn: 0,
+            });
+        }
+        let stamping = layer.stamping.as_ref().expect("laid out above");
+        let total = stamping.stamp.dabs.len() as u32;
+        let clear = if stamping.whole && !stamping.begun {
+            u64::from(geometry.size.0) * u64::from(geometry.size.1)
+        } else {
+            0
+        };
+        if !first && clear > budget {
+            return None;
+        }
+        let auto_at = |dab: u32| {
+            stamping
+                .stamp
+                .runs
+                .iter()
+                .any(|run| run.auto && run.range.contains(&dab))
+        };
+        let (mut texels, mut end) = (clear, stamping.drawn);
+        while end < total {
+            let cost = dab_texels(&stamping.stamp.dabs[end as usize], auto_at(end), geometry);
+            // A batch forced to draw draws one dab at least.
+            let forced = first && end == stamping.drawn;
+            if !forced && texels + cost > budget {
+                break;
+            }
+            texels += cost;
+            end += 1;
+        }
+        if stamping.begun && end == stamping.drawn {
+            return None;
+        }
+        let stamping = self.layers[index].stamping.take().expect("laid out above");
+        if stamping.begun {
+            // The dabs are in the buffer since the first batch. A render
+            // between two batches may have written another geometry, and
+            // the inputs of the auto dabs may be others.
+            pass.set_geometry(queue, geometry);
+            self.auto_inputs(device, pass, &stamping.stamp, auto);
+        } else {
+            self.upload(index, device, queue, pass, &stamping.stamp, geometry, auto);
+        }
+        let clear = stamping.whole && !stamping.begun;
+        self.record(
+            index,
+            encoder,
+            pass,
+            &stamping.stamp,
+            stamping.drawn..end,
+            clear,
+        );
+        let done = end == total;
+        let layer = &mut self.layers[index];
+        let drawn = if !done {
+            layer.stamping = Some(Stamping {
+                begun: true,
+                drawn: end,
+                ..stamping
+            });
+            Drawn::Nothing
+        } else {
+            layer.held = Some(stamping.held);
+            if stamping.whole {
+                Drawn::Whole
+            } else {
+                Drawn::Appended(stamping.stamp.reach)
+            }
+        };
+        Some(Batch {
+            drawn,
+            recorded: true,
+            texels,
+            done,
+        })
+    }
+
+    /// Writes the dabs of `stamped` into the dab buffer of layer `index`,
+    /// the geometry into the uniform, and makes the bind group of the auto
+    /// pipelines when the stamp holds an auto dab and the inputs changed.
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        &mut self,
+        index: usize,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut BrushPass,
+        stamped: &Stamp,
+        geometry: &Geometry,
+        auto: Option<AutoInputs>,
+    ) {
+        let layer = &mut self.layers[index];
         let bytes: &[u8] = bytemuck::cast_slice(&stamped.dabs);
         if layer
             .dabs
@@ -506,6 +783,18 @@ impl Layers {
         let (buffer, _) = layer.dabs.as_ref().expect("made above");
         queue.write_buffer(buffer, 0, bytes);
         pass.set_geometry(queue, geometry);
+        self.auto_inputs(device, pass, stamped, auto);
+    }
+
+    /// Makes the bind group of the auto pipelines when `stamped` holds an
+    /// auto dab and the one held was made for other inputs.
+    fn auto_inputs(
+        &mut self,
+        device: &wgpu::Device,
+        pass: &BrushPass,
+        stamped: &Stamp,
+        auto: Option<AutoInputs>,
+    ) {
         if stamped.runs.iter().any(|run| run.auto) {
             let inputs = auto.expect("a brush with an auto stroke is given its inputs");
             if self
@@ -534,8 +823,22 @@ impl Layers {
                 self.auto_bind = Some((bind, inputs.generation));
             }
         }
+    }
 
-        let load = if whole {
+    /// Records into layer `index` the dabs `dabs` of `stamped`, which
+    /// [`upload`](Self::upload) wrote, in one pass that clears the layer
+    /// first when `clear` and draws over what it holds otherwise.
+    fn record(
+        &self,
+        index: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &BrushPass,
+        stamped: &Stamp,
+        dabs: Range<u32>,
+        clear: bool,
+    ) {
+        let layer = &self.layers[index];
+        let load = if clear {
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
         } else {
             wgpu::LoadOp::Load
@@ -557,8 +860,15 @@ impl Layers {
             multiview_mask: None,
         });
         if !stamped.dabs.is_empty() {
-            render.set_vertex_buffer(0, buffer.slice(..bytes.len() as u64));
+            let (buffer, _) = layer.dabs.as_ref().expect("uploaded");
+            let bytes = std::mem::size_of_val(stamped.dabs.as_slice()) as u64;
+            render.set_vertex_buffer(0, buffer.slice(..bytes));
             for run in &stamped.runs {
+                // The dabs of this run inside the batch.
+                let range = run.range.start.max(dabs.start)..run.range.end.min(dabs.end);
+                if range.is_empty() {
+                    continue;
+                }
                 let (pipeline, bind) = match (run.auto, run.erase) {
                     (false, false) => (&pass.paint, &pass.bind),
                     (false, true) => (&pass.erase, &pass.bind),
@@ -574,13 +884,8 @@ impl Layers {
                 };
                 render.set_pipeline(pipeline);
                 render.set_bind_group(0, bind, &[]);
-                render.draw(0..QUAD_VERTICES, run.range.clone());
+                render.draw(0..QUAD_VERTICES, range);
             }
-        }
-        if whole {
-            Drawn::Whole
-        } else {
-            Drawn::Appended(stamped.reach)
         }
     }
 }

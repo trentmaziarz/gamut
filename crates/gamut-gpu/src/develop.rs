@@ -57,6 +57,8 @@
 //! same size rewrites the planes and reruns passes 2 and 3 without
 //! rebuilding any texture.
 
+use std::cmp::Ordering;
+
 use bytemuck::{Pod, Zeroable};
 use gamut_color::SourceSpace;
 use gamut_color::basic;
@@ -79,10 +81,12 @@ use gamut_core::mask::{
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
-use crate::brush_layer::{AutoInputs, BrushPass, Drawn, Layers, has_auto};
-use crate::edge::{EdgePass, EdgePasses, EdgeScratch, EdgeWork, Edged, Held as EdgeHeld};
+use crate::brush_layer::{AutoInputs, BrushPass, Drawn, LayerHeld, Layers, has_auto};
+use crate::edge::{
+    EdgeDraw, EdgePass, EdgePasses, EdgeScratch, EdgeStrip, EdgeWork, Edged, Held as EdgeHeld,
+};
 use crate::proxy::{self, ProxyUniform, Tile};
-use crate::refine::{RefinePass, Refined, Scratch};
+use crate::refine::{Held as MomentsHeld, RefineDraw, RefinePass, Refined, Scratch};
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
@@ -100,6 +104,72 @@ pub const TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// The alpha of a mask: one byte per pixel.
 pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// How much of a frame built ahead one slice records, in texels read and
+/// written: 700,000,000. Each pixel a head pass draws counts its reads plus
+/// its one write, so a blur of radius r counts 2 + 2 ceil(r / 2) (the
+/// centre tap and one bilinear read for each pair of taps on each side), a
+/// minimum of radius r counts 2r + 2, and the input transform counts its
+/// taps squared plus 1 (a video frame's 2 planes plus 1).
+///
+/// The reason is the frame time. At 5b8e1b1 replacing the padded window of
+/// timing_24mp.jpg at 100 percent, every operator on, took 36.24 to 54.59
+/// ms. That frame is 3104 by 3744 pixels; its nine head passes draw
+/// 90,146,736 pixels and count 9,867,249,792 texels (blurs of radius 240,
+/// 30 and 180 over 2628 columns or a 2628 by 3268 region, two minimums of
+/// radius 30 and the input over all 11,621,376 pixels). Charging the whole
+/// 54.59 ms to the head passes, the most any of them can cost, gives
+/// 180,751,965 texels a millisecond, so 4 ms is 723,007,862. A slice of
+/// 700,000,000 costs 3.87 ms at that rate, 2.57 ms at the 36.24 ms one,
+/// and the frame takes 15 slices, one a UI frame. Beside a pan inside the
+/// window (p95 1.38 ms) a UI frame stays well inside 16 ms, and the 15
+/// frames are fewer than the 20 steps of 32 pixels a pan takes to cross
+/// the 640 pixel pad. Counting texels rather than pixels keeps a slice's
+/// cost even between an input pass that reads 2 texels a pixel and a base
+/// blur that reads 242.
+///
+/// It is a schedule, not arithmetic: no pixel depends on it, and the timing
+/// phase moves it on the evidence.
+///
+/// The mask products of the frame come after its head passes in the same
+/// slices and under the same budget, in the order a render draws them: the
+/// brush layers, the alpha, the refined alpha, the edge products. Each is
+/// drawn in parts, each part in the slice the texels left pay for, and a
+/// slice records one part at least: a brush layer in batches of its dabs,
+/// the alpha in strips of rows, and the refined alpha and the edge products
+/// pass by pass, each pass in strips of rows. A part counts its reads plus
+/// its writes the same way:
+///
+/// - a strip of a mask alpha, 2 + b texels a pixel (the working texture,
+///   one layer of each of its b brushes, the write);
+/// - a batch of dabs of a brush layer, 2 a pixel of each dab's quad, 3 for
+///   an auto dab, and 1 a pixel of the frame for the clear before the first
+///   dab of a layer stamped whole (`dab_texels` in brush_layer.rs);
+/// - a strip of a pass of Refine edges, per texel of the pass (a cell or,
+///   for the apply, a pixel) what it reads and writes: step squared pixels
+///   and 3 targets for the moments of the source, 18 step squared + 1 for a
+///   moved gather, the cells a box reads and writes, 19 for the apply
+///   (`texel_cost` in refine.rs; over one tile the family sums to 39 a pixel
+///   of its work, 19 a pixel it writes and 28 c + 62 a cell, c the radius of
+///   its box in cells, with every box in the direct loop);
+/// - a strip of a pass of the edge products, 3 a pixel of each pass of Shift
+///   edge, step squared + 1 a cell for Feather's cells and 2 r + 2 a cell for
+///   each of its two blurs (r its radius in cells), 6 a pixel for the
+///   finished alpha, 2 under Contrast alone (`EdgePass::lay_out`).
+///
+/// Before the parts, the brush layer of the Gate case rode one slice whole:
+/// its 500 strokes counted 663,072,392 to 1,281,952,626 texels over the
+/// windows of the pan across the window edge, and the slice took 6.6 to 8.8
+/// ms of the pan's frame. In batches no slice records more of it than the
+/// budget pays for, but for the one dab a slice records at least.
+///
+/// In the Gate case, four full masks and a brush mask of one layer on the
+/// 3104 by 3744 frame of timing_24mp.jpg at 100 percent, the five alphas
+/// count 4 x 23,242,752 + 34,864,128 = 127,835,136 texels and the layer
+/// 11,621,376 plus its dabs. The head passes leave 632,750,208 texels of
+/// their last slice (15 x 700,000,000 less 9,867,249,792), so the alphas
+/// ride in it or in the one after, beside the layer.
+pub const AHEAD_SLICE_TEXELS: u64 = 700_000_000;
 
 /// The rows of the tone curve table: the global edit, then one per mask.
 pub const TABLE_ROWS: u32 = 1 + MAX_MASKS as u32;
@@ -464,6 +534,13 @@ struct Frame {
     window: CropRect,
     /// The size the blur sigma was taken from.
     sigma_size: (u32, u32),
+    /// The part of the frame the head-pass products cover, when the frame
+    /// serves a zoomed view: its padded window. Frames of one size placed
+    /// inside the picture can cover the same part of the source for two
+    /// windows, and the window then tells them apart, so a pan onto the
+    /// other window takes a frame built ahead for it. `None` for a render
+    /// of a crop, whose frame serves any crop of it.
+    view: Option<CropRect>,
     working: Target,
     ping: Target,
     base: Target,
@@ -527,6 +604,274 @@ pub struct RefineHold {
     pub branch: &'static str,
 }
 
+/// A frame built ahead of a pan: the head passes of the window the pan will
+/// reach and the products of the masks over them, drawn in slices, each in a
+/// submit of its own, while the current frame still serves every render.
+struct NextFrame {
+    /// The picture size and the padded window of the view it was built for.
+    full: (u32, u32),
+    window: PixelRect,
+    frame: Frame,
+    /// What the slices draw and how far they got.
+    build: AheadBuild,
+}
+
+/// The progress of a frame built ahead: its head passes in the order they
+/// are drawn, the rows of them the slices submitted so far recorded, and
+/// whether the mask products followed. Each slice writes its progress only
+/// once its commands are submitted.
+struct AheadBuild {
+    work: HeadWork,
+    passes: Vec<HeadPass>,
+    /// The pass the next slice begins in, and how many of its rows the
+    /// slices before recorded. Every pass before it is submitted whole.
+    pass: usize,
+    row: u32,
+    /// The source content the strips of the input transform read, while
+    /// they all read the same one. A video frame that arrives between two
+    /// of them leaves none, and the frame then holds no content until a
+    /// render runs its head passes again.
+    content: Option<u64>,
+    /// The last slice left no mask product of the edit it was given to
+    /// build: each is held on the frame, its key set once the slice that
+    /// drew it was submitted. A slice given another edit looks again.
+    products: bool,
+    /// The mask product the slices drew part of and did not finish, and how
+    /// far they got, written once the slice is submitted.
+    partial: Option<Partial>,
+}
+
+/// A mask product of a frame built ahead that the slices submitted so far
+/// drew part of: its key, which it claims only once its last part is
+/// submitted, what it was laid out as, and how far the slices got. The next
+/// slice goes on with it while the edit still wants it and nothing else was
+/// drawn into the frame since; otherwise the product is drawn again from its
+/// start. A brush layer keeps its own (see [`Layers::stamp_batch`]).
+enum Partial {
+    /// The alpha of mask `mask`, drawn over `region` for `shape` down to
+    /// row `row` of the region.
+    Alpha {
+        mask: usize,
+        shape: MaskShape,
+        region: PixelRect,
+        row: u32,
+    },
+    /// The refined alpha of mask `mask`: `refine` over `region` in the
+    /// scratch `scratch`, laid out as `draws`, drawn up to row `at.1` of pass
+    /// `at.0`, and the moments the scratch holds once every pass is drawn.
+    Refined {
+        mask: usize,
+        refine: Refine,
+        region: PixelRect,
+        plan: Plan,
+        scratch: u64,
+        draws: Vec<RefineDraw>,
+        at: (usize, u32),
+        moments: Option<(u64, MomentsHeld)>,
+    },
+    /// The edge products of mask `mask` for `held`, with the edge scratch as
+    /// `scratch` counts it made and the product `product`, laid out as
+    /// `draws` and drawn up to row `at.1` of pass `at.0`; which of the three
+    /// stages they draw.
+    Edged {
+        mask: usize,
+        held: EdgeHeld,
+        scratch: u64,
+        product: u64,
+        stages: [bool; 3],
+        draws: Vec<EdgeDraw>,
+        at: (usize, u32),
+    },
+}
+
+impl AheadBuild {
+    /// Whether every head pass and every mask product is recorded and
+    /// submitted.
+    fn complete(&self) -> bool {
+        self.pass == self.passes.len() && self.products
+    }
+}
+
+/// What [`Develop::ahead_products`] draws the mask products of: the frame
+/// built ahead and the work of its head passes, the source content its
+/// working texture holds once the slice is submitted and the source's own,
+/// and the edit.
+struct AheadProducts<'a> {
+    frame: &'a mut Frame,
+    work: &'a HeadWork,
+    content: u64,
+    source_content: u64,
+    edit: &'a PhotoEdit,
+}
+
+/// What a mask product a slice of a frame built ahead records holds once the
+/// slice is submitted: its key, which the slice sets on the frame only then.
+/// Until it does, the key claims nothing, so a later product of the same
+/// slice that reads it draws what it needs again.
+enum Claim {
+    /// Layer `layer` of mask `mask` holds its brush.
+    Layer {
+        mask: usize,
+        layer: usize,
+        held: LayerHeld,
+    },
+    /// The alpha of mask `mask` holds `shape` over `region`.
+    Alpha {
+        mask: usize,
+        shape: MaskShape,
+        region: PixelRect,
+    },
+    /// The refined alpha of mask `mask` holds `refine` over `region`, and the
+    /// refine scratch `scratch` holds the moments `moments` names.
+    Refined {
+        mask: usize,
+        refine: Refine,
+        region: PixelRect,
+        moments: Option<(u64, MomentsHeld)>,
+    },
+    /// The edge products of mask `mask` hold `held`.
+    Edged { mask: usize, held: EdgeHeld },
+}
+
+impl Claim {
+    /// Sets the key on `frame`, whose commands are submitted.
+    fn apply(self, frame: &mut Frame) {
+        match self {
+            Claim::Layer { mask, layer, held } => {
+                if let Some(slot) = frame.masks[mask].as_mut() {
+                    slot.layers.hold(layer, held);
+                }
+            }
+            Claim::Alpha {
+                mask,
+                shape,
+                region,
+            } => {
+                if let Some(slot) = frame.masks[mask].as_mut() {
+                    slot.shape = Some(shape);
+                    slot.alpha_region = region;
+                }
+            }
+            Claim::Refined {
+                mask,
+                refine,
+                region,
+                moments,
+            } => {
+                if let Some(slot) = frame.masks[mask].as_mut() {
+                    slot.refine = Some(refine);
+                    slot.refined_region = region;
+                }
+                // The moments are the key of the scratch they were taken in;
+                // a scratch made since holds none of them.
+                if let (Some(scratch), Some((id, held))) = (frame.refine_scratch.as_mut(), moments)
+                    && scratch.id() == id
+                {
+                    scratch.hold(held);
+                }
+            }
+            Claim::Edged { mask, held } => {
+                if let Some(edged) = frame.masks[mask]
+                    .as_mut()
+                    .and_then(|slot| slot.edged.as_mut())
+                {
+                    edged.held = Some(held);
+                }
+            }
+        }
+    }
+}
+
+/// A head pass of a frame, one render pass each in [`Develop::head_passes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadPass {
+    /// The input transform, or the YUV pass of a video frame, into working.
+    Input,
+    /// The base blur: working into ping, then ping into base.
+    BlurH,
+    BlurV,
+    /// The texture layer's blur: working into ping, then into texture_base.
+    TextureH,
+    TextureV,
+    /// The minimum of the transmission map: working into ping, then into
+    /// transmission.
+    MinimumH,
+    MinimumV,
+    /// The transmission map's smoothing: transmission into ping, then into
+    /// transmission.
+    TransmissionH,
+    TransmissionV,
+}
+
+impl HeadPass {
+    /// The passes that draw the source content when `input`, the texture
+    /// layer when `texture` and the transmission map when `transmission`,
+    /// in the order they run. Each horizontal blur writes ping and the
+    /// vertical one after it reads it, before the next pass writes ping.
+    fn plan(input: bool, texture: bool, transmission: bool) -> Vec<Self> {
+        let mut passes = Vec::with_capacity(9);
+        if input {
+            passes.extend([Self::Input, Self::BlurH, Self::BlurV]);
+        }
+        if texture {
+            passes.extend([Self::TextureH, Self::TextureV]);
+        }
+        if transmission {
+            passes.extend([
+                Self::MinimumH,
+                Self::MinimumV,
+                Self::TransmissionH,
+                Self::TransmissionV,
+            ]);
+        }
+        passes
+    }
+
+    /// The scissor of the pass: the columns under the products region for
+    /// a horizontal blur, the region for a vertical one, none for the input
+    /// transform and the minimum, which cover the whole render.
+    fn scissor(self, work: &HeadWork) -> Option<(u32, u32, u32, u32)> {
+        match self {
+            Self::Input | Self::MinimumH | Self::MinimumV => None,
+            Self::BlurH | Self::TextureH | Self::TransmissionH => {
+                Some(scissor_for(work.products, work.size, true))
+            }
+            Self::BlurV | Self::TextureV | Self::TransmissionV => {
+                Some(scissor_for(work.products, work.size, false))
+            }
+        }
+    }
+
+    /// The pixels the pass draws: its scissor, or the whole render.
+    fn rect(self, work: &HeadWork) -> (u32, u32, u32, u32) {
+        self.scissor(work)
+            .unwrap_or((0, 0, work.size.0, work.size.1))
+    }
+}
+
+/// What [`Develop::render_view`] renders for a view: the arguments of
+/// `render_window`.
+struct ViewGeometry {
+    crop: CropRect,
+    render_size: (u32, u32),
+    output_size: (u32, u32),
+    window: CropRect,
+    sigma_size: (u32, u32),
+    products: CropRect,
+}
+
+/// What the head passes of a frame draw: the render, the part of the source
+/// it covers, the size the sigmas come from, the part the products cover,
+/// and whether the texture layer and the transmission map are wanted.
+struct HeadWork {
+    size: (u32, u32),
+    window: CropRect,
+    sigma_size: (u32, u32),
+    products: CropRect,
+    texture: bool,
+    transmission: bool,
+}
+
 /// Which alpha of a mask the develop pass and the overlay read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Product {
@@ -568,6 +913,159 @@ struct FrameMask {
     /// The mask pass reading `developed`, then the one reading
     /// `developed_other`; each is drawn into the texture it does not read.
     develop_binds: [wgpu::BindGroup; 2],
+}
+
+/// What the products of a mask hold on a frame once they are what the mask
+/// wants there: the brushes of its layers, its shape without Refine edges and
+/// the edge controls, the setting and plan of Refine edges, the plan of the
+/// edge controls, and the pixels the alpha and the refined alpha are drawn
+/// over. A render and a frame built ahead read their keys against it alike.
+struct MaskWant<'a> {
+    brushes: Vec<&'a Brush>,
+    shape: MaskShape,
+    refine: Refine,
+    plan: Option<Plan>,
+    edge_plan: EdgePlan,
+    alpha_region: PixelRect,
+    refined_region: PixelRect,
+}
+
+impl<'a> MaskWant<'a> {
+    /// What `mask` wants on a frame of `size` that renders `window` of the
+    /// source with the sigmas of `sigma_size`, whose products cover `region`.
+    fn of(
+        mask: &'a Mask,
+        window: CropRect,
+        sigma_size: (u32, u32),
+        size: (u32, u32),
+        region: PixelRect,
+    ) -> Self {
+        let brushes = mask
+            .components
+            .iter()
+            .filter_map(|component| match &component.source {
+                MaskSource::Brush(brush) => Some(brush),
+                _ => None,
+            })
+            .collect();
+        let refine = mask.refine.shape();
+        let origin = (
+            (window.x * sigma_size.0 as f32).round().max(0.0) as u32,
+            (window.y * sigma_size.1 as f32).round().max(0.0) as u32,
+        );
+        let plan = (!refine.is_off()).then(|| Plan::new(&refine, sigma_size, origin, size));
+        let edge_plan = EdgePlan::new(&mask.edge, sigma_size, origin, size);
+        let edged_on = !edge_plan.is_off();
+        let frame_rect = (0, 0, size.0, size.1);
+        // The filter reads the alpha its reach beyond what it writes. A
+        // mask with an edge control on keeps its alpha and its refined
+        // alpha over the whole frame, which is padded by both reaches, so
+        // an edge slider, whose reach moves, never draws them again.
+        let alpha_region = if edged_on {
+            frame_rect
+        } else {
+            plan.map_or(region, |plan| grow(region, plan.reach(), size))
+        };
+        let refined_region = if edged_on { frame_rect } else { region };
+        let shape = MaskShape {
+            refine: Refine::default(),
+            edge: Edge::default(),
+            ..mask.shape()
+        };
+        MaskWant {
+            brushes,
+            shape,
+            refine,
+            plan,
+            edge_plan,
+            alpha_region,
+            refined_region,
+        }
+    }
+}
+
+/// The textures of a frame the masked develop pass reads besides the alpha.
+#[derive(Clone, Copy)]
+struct DevelopReads<'a> {
+    working: &'a Target,
+    base: &'a Target,
+    texture_base: &'a Target,
+    transmission: &'a Target,
+    developed: &'a Target,
+    developed_other: &'a Target,
+}
+
+/// What the products of one mask are drawn and bound with: the passes, the
+/// mask's two uniforms and the curve table, all on Develop.
+struct MaskPasses<'a> {
+    device: &'a wgpu::Device,
+    mask: &'a Pass,
+    masked: &'a Pass,
+    mask_uniform: &'a wgpu::Buffer,
+    masked_uniform: &'a wgpu::Buffer,
+    table: &'a wgpu::TextureView,
+}
+
+impl MaskPasses<'_> {
+    /// The bind group `mask.wgsl` draws the alpha with.
+    fn raster_bind(&self, working: &Target, layers: &Layers) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask bind group"),
+            layout: &self.mask.layout,
+            entries: &[
+                buffer_binding(0, self.mask_uniform),
+                texture_binding(1, &working.view),
+                texture_binding(2, &layers.array),
+            ],
+        })
+    }
+
+    /// The mask pass reads this alpha: the mask's own, or its refined one.
+    fn develop_binds(
+        &self,
+        reads: DevelopReads,
+        alpha: &wgpu::TextureView,
+    ) -> [wgpu::BindGroup; 2] {
+        [reads.developed, reads.developed_other].map(|before| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("masked develop bind group"),
+                layout: &self.masked.layout,
+                entries: &[
+                    buffer_binding(0, self.masked_uniform),
+                    texture_binding(1, &reads.working.view),
+                    texture_binding(2, &reads.base.view),
+                    texture_binding(3, &reads.texture_base.view),
+                    texture_binding(4, &reads.transmission.view),
+                    texture_binding(5, self.table),
+                    texture_binding(6, alpha),
+                    texture_binding(7, &before.view),
+                ],
+            })
+        })
+    }
+
+    /// The products of a mask with `brushes` brush components on a frame
+    /// of `size`, none drawn yet.
+    fn frame_mask(&self, reads: DevelopReads, brushes: usize, size: (u32, u32)) -> FrameMask {
+        let (width, height) = size;
+        let alpha = create_target(self.device, "mask alpha", ALPHA_FORMAT, width, height);
+        let layers = Layers::new(self.device, brushes, width, height);
+        let raster_bind = self.raster_bind(reads.working, &layers);
+        let develop_binds = self.develop_binds(reads, &alpha.view);
+        FrameMask {
+            alpha,
+            shape: None,
+            alpha_region: (0, 0, 0, 0),
+            refined: None,
+            refine: None,
+            refined_region: (0, 0, 0, 0),
+            edged: None,
+            binds_product: Product::Alpha,
+            layers,
+            raster_bind,
+            develop_binds,
+        }
+    }
 }
 
 /// One tile of the proxy build: the head pass draws the source pixels of
@@ -686,6 +1184,26 @@ pub struct Develop {
     readback: Readback,
     source: Option<Source>,
     frame: Option<Frame>,
+    /// A frame built ahead of a pan for the window the pan will reach, kept
+    /// beside `frame` and swapped in when a zoomed view asks for its window.
+    next: Option<NextFrame>,
+    /// The frame a swap took out of use, kept for its textures: the next
+    /// frame built ahead is drawn into them when its size is theirs, so a
+    /// steady pan takes no new device memory once it holds two frames. A
+    /// swap leaves no frame built ahead, and the build that follows takes
+    /// this one or drops it before it makes a frame, so no more than two
+    /// frames of textures are held at once.
+    spare: Option<Frame>,
+    /// How many times a render built its frame and ran the head passes in
+    /// its own submit, and how many times it took a frame built ahead.
+    window_replaces: u64,
+    window_swaps: u64,
+    /// How many frames were made with textures of their own.
+    frame_makes: u64,
+    /// The texels one slice of a frame built ahead records at most, and how
+    /// many slices have been submitted.
+    ahead_slice_texels: u64,
+    ahead_slices: u64,
     out: Option<Output>,
     generation: u64,
     frame_generation: u64,
@@ -873,6 +1391,13 @@ impl Develop {
             readback: Readback::new(device),
             source: None,
             frame: None,
+            next: None,
+            spare: None,
+            window_replaces: 0,
+            window_swaps: 0,
+            frame_makes: 0,
+            ahead_slice_texels: AHEAD_SLICE_TEXELS,
+            ahead_slices: 0,
             out: None,
             generation: 0,
             frame_generation: 0,
@@ -936,6 +1461,8 @@ impl Develop {
             ),
         });
         self.frame = None;
+        self.next = None;
+        self.spare = None;
         log::info!(
             "develop source set: {}x{} {:?} as {format:?}",
             photo.width,
@@ -977,6 +1504,8 @@ impl Develop {
                 atmosphere: dehaze::WHITE_ATMOSPHERE,
             });
             self.frame = None;
+            self.next = None;
+            self.spare = None;
             log::info!(
                 "develop video source set: {}x{} {:?} rotation {rotation} {colour:?}",
                 frame.width(),
@@ -1048,6 +1577,102 @@ impl Develop {
         let slot = frame.masks.get(index)?.as_ref()?;
         let refined = slot.refined.as_ref()?;
         Some((&refined.alpha, (frame.width, frame.height)))
+    }
+
+    /// How many times a render replaced its frame and ran the head passes in
+    /// the same submit: the first render of a window, a jump, a zoom change,
+    /// or a pan that left the window with no frame built ahead for it. A
+    /// test reads it to hold that a pan onto a window built ahead pays none.
+    #[doc(hidden)]
+    pub fn window_replaces(&self) -> u64 {
+        self.window_replaces
+    }
+
+    /// How many times a render took the frame built ahead instead of
+    /// replacing its own.
+    #[doc(hidden)]
+    pub fn window_swaps(&self) -> u64 {
+        self.window_swaps
+    }
+
+    /// The picture size and the padded window of the frame built ahead, when
+    /// one is held, complete or still building. A zoomed viewer asks for
+    /// this window once what is seen leaves the one it renders.
+    pub fn window_ahead(&self) -> Option<((u32, u32), PixelRect)> {
+        self.next.as_ref().map(|next| (next.full, next.window))
+    }
+
+    /// Whether a frame built ahead is held with slices left to record. The
+    /// viewer calls [`build_ahead`](Self::build_ahead) once a UI frame while
+    /// it is.
+    pub fn ahead_building(&self) -> bool {
+        self.next
+            .as_ref()
+            .is_some_and(|next| !next.build.complete())
+    }
+
+    /// How many slices of frames built ahead have been submitted.
+    #[doc(hidden)]
+    pub fn ahead_slices(&self) -> u64 {
+        self.ahead_slices
+    }
+
+    /// Drops the frame built ahead, complete or still building, and the
+    /// frame kept for its textures, as a render at another zoom drops them.
+    /// Whether a frame built ahead was held. A test drops it after a pan, so
+    /// the renders it times next hold one frame.
+    #[doc(hidden)]
+    pub fn drop_ahead(&mut self) -> bool {
+        self.spare = None;
+        self.next.take().is_some()
+    }
+
+    /// How many frames were made with textures of their own: a render that
+    /// replaced its frame, and a frame built ahead that found no frame kept
+    /// for its textures of its size. A test reads it to hold that a steady
+    /// pan takes no new frame textures once it holds two frames.
+    #[doc(hidden)]
+    pub fn frame_makes(&self) -> u64 {
+        self.frame_makes
+    }
+
+    /// Sets how many texels one slice of a frame built ahead records at most,
+    /// [`AHEAD_SLICE_TEXELS`] until set. A slice records one row of a pass at
+    /// least, so 1 records one row a slice and `u64::MAX` the whole frame in
+    /// one. A test sets it; the pixels drawn do not depend on it.
+    #[doc(hidden)]
+    pub fn set_ahead_slice_texels(&mut self, texels: u64) {
+        self.ahead_slice_texels = texels.max(1);
+    }
+
+    /// The seven textures of the current frame, or of the frame built ahead,
+    /// by name, with their size, for a test to read back and compare.
+    #[doc(hidden)]
+    pub fn frame_textures(
+        &self,
+        ahead: bool,
+    ) -> Vec<(&'static str, &wgpu::TextureView, (u32, u32))> {
+        let frame = if ahead {
+            self.next.as_ref().map(|next| &next.frame)
+        } else {
+            self.frame.as_ref()
+        };
+        let Some(frame) = frame else {
+            return Vec::new();
+        };
+        let size = (frame.width, frame.height);
+        [
+            ("working", &frame.working),
+            ("ping", &frame.ping),
+            ("base", &frame.base),
+            ("texture base", &frame.texture_base),
+            ("transmission", &frame.transmission),
+            ("developed", &frame.developed),
+            ("developed other", &frame.developed_other),
+        ]
+        .into_iter()
+        .map(|(name, target)| (name, &target.view, size))
+        .collect()
     }
 
     /// How many brush layers have been stamped whole since the graph was
@@ -1242,6 +1867,9 @@ impl Develop {
         render_size: (u32, u32),
         output_size: (u32, u32),
     ) -> Option<&wgpu::TextureView> {
+        // Only a zoomed view pans onto a frame built ahead.
+        self.next = None;
+        self.spare = None;
         self.render_window(
             edit,
             crop,
@@ -1250,6 +1878,7 @@ impl Develop {
             CropRect::FULL,
             render_size,
             crop,
+            false,
         )
     }
 
@@ -1264,6 +1893,9 @@ impl Develop {
         crop: CropRect,
         output_size: (u32, u32),
     ) -> Option<&wgpu::TextureView> {
+        // Only a zoomed view pans onto a frame built ahead.
+        self.next = None;
+        self.spare = None;
         let full = render_size_for_crop(crop, output_size);
         let (full_w, full_h) = (full.0 as f32, full.1 as f32);
         let reach = (basic::blur_radius(basic::base_sigma(full.0, full.1)).max(0) as u32)
@@ -1285,7 +1917,16 @@ impl Develop {
             height: crop.height / window.height,
         };
         let window_size = ((x1 - x0).round() as u32, (y1 - y0).round() as u32);
-        self.render_window(edit, inner, window_size, output_size, window, full, inner)
+        self.render_window(
+            edit,
+            inner,
+            window_size,
+            output_size,
+            window,
+            full,
+            inner,
+            false,
+        )
     }
 
     /// Renders what a zoomed viewer shows. The head-pass products (the base
@@ -1295,7 +1936,8 @@ impl Develop {
     /// one to one. A pan that stays inside the window therefore runs no
     /// head pass, and a slider step develops only what is seen.
     /// The frame holds the window plus the reach of the widest head pass on
-    /// every side, or of Refine edges when a mask's reaches further, so the
+    /// every side, or of Refine edges when a mask's reaches further, moved
+    /// inside the picture where it would pass an edge, so the
     /// picture is the one [`render`](Self::render) gives at `view.full`.
     ///
     /// `view.full` must not pass the size of the source: above one source
@@ -1308,11 +1950,834 @@ impl Develop {
         view: &ViewWindow,
     ) -> Option<&wgpu::TextureView> {
         let full = (view.full.0.max(1), view.full.1.max(1));
+        // A frame built ahead at another zoom serves no view of this one,
+        // and a frame kept for its textures is of another size there.
+        if self.next.as_ref().is_some_and(|next| next.full != full) {
+            self.next = None;
+        }
+        if self
+            .spare
+            .as_ref()
+            .is_some_and(|spare| spare.sigma_size != full)
+        {
+            self.spare = None;
+        }
+        // The view's window is the frame built ahead when the pan reached
+        // it, and render_window swaps that frame in.
+        let geometry = self.view_geometry(edit, view);
+        self.render_window(
+            edit,
+            geometry.crop,
+            geometry.render_size,
+            geometry.output_size,
+            geometry.window,
+            geometry.sigma_size,
+            geometry.products,
+            true,
+        )
+    }
+
+    /// Builds the frame of `window`, a padded window of a zoomed view of the
+    /// picture at `full`, ahead of the pan that will reach it, one slice a
+    /// call. The first call makes the frame; each call records at most one
+    /// slice of the head passes left and then of the mask products `edit`
+    /// wants on it (the brush layers, the alphas, the refined alphas and the
+    /// edge products of every mask a render of `edit` draws),
+    /// [`AHEAD_SLICE_TEXELS`] of work, into an encoder of its own and submits
+    /// it before it returns. The current frame keeps serving every render
+    /// meanwhile, and once every slice is submitted
+    /// [`render_view`](Self::render_view) takes this frame when it asks for
+    /// that window, instead of replacing its own, and draws none of those
+    /// products again while the edit is the one they were built for. A frame
+    /// held for the same window is kept and built on; one held for another is
+    /// dropped. A call with another edit builds what that edit wants of the
+    /// products that the frame does not hold.
+    ///
+    /// Whether this call completed the frame: true from the call that
+    /// submits its last slice, false while slices are left and from a call
+    /// that finds nothing left to build or `window` rendered by the current
+    /// frame. [`ahead_building`](Self::ahead_building) tells whether slices
+    /// are left.
+    ///
+    /// The frame holds the head passes of the source content it was built
+    /// from. A video frame that arrives before the swap is drawn into it
+    /// at the swap, as into the current frame at every new video frame, and
+    /// the mask products with it. The proxy of an auto stroke is the
+    /// source's, which the current frame's render builds; no slice builds it.
+    pub fn build_ahead(&mut self, edit: &PhotoEdit, full: (u32, u32), window: PixelRect) -> bool {
+        let full = (full.0.max(1), full.1.max(1));
+        let view = ViewWindow {
+            full,
+            window,
+            visible: window,
+        };
+        let geometry = self.view_geometry(edit, &view);
+        let Some(source) = self.source.as_ref() else {
+            return false;
+        };
+        let (width, height) = (geometry.render_size.0.max(1), geometry.render_size.1.max(1));
+        let same = |f: &Frame| {
+            (f.width, f.height, f.generation) == (width, height, source.generation)
+                && f.window == geometry.window
+                && f.sigma_size == geometry.sigma_size
+                && f.view == Some(geometry.products)
+        };
+        if self.frame.as_ref().is_some_and(same) {
+            return false;
+        }
+        if !self.next.as_ref().is_some_and(|next| same(&next.frame)) {
+            // The frame held for another window goes first, so no more than
+            // two frames are held at once. Its textures, or those of the
+            // frame a swap took out of use (the two are never held together),
+            // are drawn into when they are of this size, and dropped before a
+            // frame is made otherwise.
+            let held = self.next.take().map(|next| next.frame);
+            let mut frame = match self.spare.take().or(held) {
+                Some(mut kept) if kept.fits(width, height, source.generation) => {
+                    kept.renew(source, geometry.window, geometry.sigma_size);
+                    kept
+                }
+                kept => {
+                    drop(kept);
+                    self.frame_makes += 1;
+                    self.build_frame(source, width, height, geometry.window, geometry.sigma_size)
+                }
+            };
+            frame.view = Some(geometry.products);
+            let (texture, transmission) =
+                head_products_wanted(edit, &mask_twin::active_masks(edit));
+            let passes = HeadPass::plan(frame.content != source.content, texture, transmission);
+            self.next = Some(NextFrame {
+                full,
+                window,
+                frame,
+                build: AheadBuild {
+                    work: HeadWork {
+                        size: (width, height),
+                        window: geometry.window,
+                        sigma_size: geometry.sigma_size,
+                        products: geometry.products,
+                        texture,
+                        transmission,
+                    },
+                    passes,
+                    pass: 0,
+                    row: 0,
+                    content: None,
+                    products: false,
+                    partial: None,
+                },
+            });
+        }
+        self.ahead_slice(edit)
+    }
+
+    /// Records the next slice of the frame built ahead and submits it:
+    /// strips of whole rows of its passes, in their order, until the next
+    /// strip would pass the slice's texels. The first strip of a pass clears
+    /// its target, as the pass does when it runs whole, and the strips after
+    /// it load it, so every pixel of the target ends as the whole pass leaves
+    /// it. A pass without a scissor is cut into strips of the whole width.
+    /// Once every head pass is recorded, the slice goes on with the mask
+    /// products of `edit` (see [`ahead_products`](Self::ahead_products)) under
+    /// the texels left. Whether this slice completed the frame.
+    ///
+    /// The uniforms of the head passes, and those of the mask alphas and the
+    /// brush stamps, are Develop's, shared with the current frame. A slice
+    /// writes every one its strips and products read and submits before it
+    /// returns, so a render's writes, which land at the render's own submit,
+    /// never reach its commands.
+    ///
+    /// Every key the slice moves forward is set only once its commands are
+    /// submitted: the build's own progress, the done flags of the head
+    /// passes, and the key of each product it drew (see [`Claim`]). A key
+    /// the slice has to take back, because what it names is being drawn
+    /// again, it takes back when it records: a key may claim less than its
+    /// texture holds, never more.
+    fn ahead_slice(&mut self, edit: &PhotoEdit) -> bool {
+        let Some(mut next) = self.next.take() else {
+            return false;
+        };
+        let was_complete = next.build.complete();
+        let source = self.source.as_ref().expect("a frame ahead has a source");
+        let source_content = source.content;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("develop ahead encoder"),
+            });
+        // The product the slices before left unfinished, written back once
+        // this slice is submitted.
+        let mut partial = next.build.partial.take();
+        let build = &next.build;
+        let mut budget = self.ahead_slice_texels;
+        // What the slice records: strips of the head passes, then products.
+        let mut recorded = 0u32;
+        // How far the build gets, written to it once the slice is submitted.
+        let (mut pass_at, mut row_at, mut content) = (build.pass, build.row, build.content);
+        let mut finished = Vec::new();
+        while let Some(&pass) = build.passes.get(pass_at) {
+            let (x, y, w, h) = pass.rect(&build.work);
+            let per_row = u64::from(w) * self.head_pass_texels(pass, &build.work);
+            let left = h - row_at;
+            let fits = (budget / per_row).min(u64::from(left)) as u32;
+            // A slice records one row at least, so a budget under one row
+            // still moves the build.
+            let rows = if recorded == 0 { fits.max(1) } else { fits };
+            if rows == 0 {
+                break;
+            }
+            if pass == HeadPass::Input {
+                content = match content {
+                    _ if row_at == 0 => Some(source.content),
+                    Some(content) if content == source.content => Some(content),
+                    _ => None,
+                };
+                if row_at == 0 {
+                    // From this strip on the working texture holds other
+                    // pixels, so this frame forgets what its products hold of
+                    // it, and its auto layers; the current frame keeps its
+                    // own. A product left unfinished is drawn again.
+                    forget_products(&mut next.frame, true);
+                    partial = None;
+                }
+            }
+            let load = if row_at == 0 {
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+            } else {
+                wgpu::LoadOp::Load
+            };
+            self.write_head_uniform(pass, &build.work);
+            self.draw_head_pass(
+                &mut encoder,
+                &next.frame,
+                pass,
+                Some((x, y + row_at, w, rows)),
+                load,
+            );
+            recorded += 1;
+            budget = budget.saturating_sub(u64::from(rows) * per_row);
+            row_at += rows;
+            if row_at == h {
+                finished.push(pass);
+                pass_at += 1;
+                row_at = 0;
+            }
+        }
+        // The source content the working texture holds once this slice is
+        // submitted, which the mask products are drawn from.
+        let held_content = match content {
+            Some(content) if finished.contains(&HeadPass::Input) => content,
+            _ => next.frame.content,
+        };
+        // The mask products read the head passes, so they follow them all.
+        let mut claims = Vec::new();
+        let products = pass_at == build.passes.len()
+            && self.ahead_products(
+                &mut encoder,
+                AheadProducts {
+                    frame: &mut next.frame,
+                    work: &next.build.work,
+                    content: held_content,
+                    source_content,
+                    edit,
+                },
+                &mut budget,
+                &mut recorded,
+                &mut claims,
+                &mut partial,
+            );
+        if recorded > 0 {
+            self.queue.submit(Some(encoder.finish()));
+            self.ahead_slices += 1;
+        }
+        // What the frame holds, and how far its build got, are known only
+        // now that its commands are submitted.
+        let NextFrame { frame, build, .. } = &mut next;
+        (build.pass, build.row, build.content) = (pass_at, row_at, content);
+        for pass in finished {
+            match pass {
+                HeadPass::Input => {
+                    if let Some(content) = build.content {
+                        frame.content = content;
+                    }
+                }
+                HeadPass::BlurV => {
+                    frame.products_region =
+                        Some(scissor_for(build.work.products, build.work.size, false));
+                }
+                HeadPass::TextureV => frame.texture_ready = true,
+                HeadPass::TransmissionV => frame.transmission_ready = true,
+                _ => {}
+            }
+        }
+        for claim in claims {
+            claim.apply(frame);
+        }
+        build.products = products;
+        build.partial = partial;
+        let complete = build.complete();
+        self.next = Some(next);
+        // A call that finds a complete frame and records nothing completes
+        // nothing.
+        complete && (recorded > 0 || !was_complete)
+    }
+
+    /// Records into `encoder` the mask products of a frame built ahead that
+    /// `products.edit` wants and the frame does not hold, in the order a
+    /// render draws them, in parts while the texels `budget` has left pay for
+    /// the next part (see [`AHEAD_SLICE_TEXELS`]); a slice records one part
+    /// at least, counted in `recorded`. A brush layer goes a batch of dabs at
+    /// a time, an alpha a strip of rows, a refined alpha and the edge
+    /// products a strip of rows of one of their passes, each pass laid out
+    /// as a render lays it out on a new frame, with the arithmetic of that
+    /// render. A product the slice does not finish is left in `partial`, and
+    /// the next slice goes on with it. Once its last part is recorded its
+    /// key goes to `claims`, for the slice to set once it is submitted; a key
+    /// claims nothing while its product is drawn in parts. Whether no product
+    /// is left to build.
+    ///
+    /// Nothing is built while the working texture holds another content than
+    /// the source (a video frame arrived during the build): the swap's render
+    /// runs the head passes again and draws every product with them. An auto
+    /// layer waits for the proxy of the content the working texture holds,
+    /// which the current frame's render builds; no product is built past it.
+    #[allow(clippy::too_many_arguments)]
+    fn ahead_products(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        products: AheadProducts,
+        budget: &mut u64,
+        recorded: &mut u32,
+        claims: &mut Vec<Claim>,
+        partial: &mut Option<Partial>,
+    ) -> bool {
+        let AheadProducts {
+            frame,
+            work,
+            content,
+            source_content,
+            edit,
+        } = products;
+        if content != source_content {
+            return true;
+        }
+        let source = self.source.as_ref().expect("a frame ahead has a source");
+        let photo = (source.width, source.height);
+        let size = work.size;
+        let (width, height) = size;
+        let frame_rect = (0, 0, width, height);
+        let region = scissor_for(work.products, size, false);
+        let geometry = Geometry {
+            window: work.window,
+            size,
+            photo,
+        };
+        // The masks a render of the edit draws: those that change the
+        // picture, then the one shown as the overlay.
+        let masks = mask_twin::active_masks(edit);
+        let overlaid = self.overlaid(edit);
+        let drawn: Vec<(usize, &Mask)> = masks
+            .iter()
+            .map(|(index, mask)| (*index, mask))
+            .chain(
+                overlaid
+                    .iter()
+                    .filter(|(index, _)| masks.iter().all(|(active, _)| active != index))
+                    .map(|(index, mask)| (*index, mask)),
+            )
+            .collect();
+        let Frame {
+            working,
+            base,
+            texture_base,
+            transmission,
+            developed,
+            developed_other,
+            masks: slots,
+            refine_scratch,
+            edge_scratch,
+            ..
+        } = frame;
+        let reads = DevelopReads {
+            working,
+            base,
+            texture_base,
+            transmission,
+            developed,
+            developed_other,
+        };
+        for (index, mask) in drawn {
+            let want = MaskWant::of(mask, work.window, work.sigma_size, size, region);
+            let passes = MaskPasses {
+                device: &self.device,
+                mask: &self.mask,
+                masked: &self.masked,
+                mask_uniform: &self.mask_uniforms[index],
+                masked_uniform: &self.masked_uniforms[index],
+                table: &self.curve_table_view,
+            };
+            let slot = slots[index]
+                .get_or_insert_with(|| passes.frame_mask(reads, want.brushes.len(), size));
+
+            // The brush layers: those that do not hold their brush, stamped
+            // whole or by the dabs added since, a batch of dabs at a time.
+            if slot.layers.len() != want.brushes.len() {
+                slot.layers = Layers::new(&self.device, want.brushes.len(), width, height);
+                slot.raster_bind = passes.raster_bind(working, &slot.layers);
+                slot.shape = None;
+            }
+            let stale: Vec<usize> = (0..want.brushes.len())
+                .filter(|layer| !slot.layers.holds(*layer, want.brushes[*layer]))
+                .collect();
+            if !stale.is_empty() {
+                // The proxy is the source's, built once a source content by
+                // the current frame's render and by no slice.
+                let proxy = self
+                    .proxy
+                    .as_ref()
+                    .filter(|proxy| proxy.content == Some(content));
+                if proxy.is_none() && stale.iter().any(|layer| has_auto(want.brushes[*layer])) {
+                    return false;
+                }
+                // The alpha reads the layers: it is drawn again after them.
+                slot.shape = None;
+                for &layer in &stale {
+                    let brush = want.brushes[layer];
+                    let auto = proxy.filter(|_| has_auto(brush)).map(|proxy| AutoInputs {
+                        proxy: &proxy.target.view,
+                        working: &working.view,
+                        generation: proxy.id,
+                    });
+                    let Some(batch) = slot.layers.stamp_batch(
+                        layer,
+                        &self.device,
+                        &self.queue,
+                        encoder,
+                        &mut self.brush,
+                        brush,
+                        &geometry,
+                        auto,
+                        *budget,
+                        *recorded == 0,
+                    ) else {
+                        return false;
+                    };
+                    if batch.recorded {
+                        // Another product than the one left unfinished is
+                        // drawn: that one starts again.
+                        *partial = None;
+                        *budget = budget.saturating_sub(batch.texels);
+                        *recorded += 1;
+                    }
+                    match batch.drawn {
+                        Drawn::Nothing => {}
+                        Drawn::Appended(_) => self.layer_appends += 1,
+                        Drawn::Whole => self.layer_builds += 1,
+                    }
+                    if !batch.done {
+                        return false;
+                    }
+                    if let Some(held) = slot.layers.take_held(layer) {
+                        claims.push(Claim::Layer {
+                            mask: index,
+                            layer,
+                            held,
+                        });
+                    }
+                }
+            }
+
+            // The alpha of the components, drawn in strips of rows over its
+            // region: the first clears the alpha, as the whole pass does, and
+            // the strips after it draw over what it holds.
+            if slot.shape.as_ref() != Some(&want.shape)
+                || !holds(slot.alpha_region, want.alpha_region)
+            {
+                let area = want.alpha_region;
+                let per_row = u64::from(area.2) * (2 + want.brushes.len() as u64);
+                let from = match &*partial {
+                    Some(Partial::Alpha {
+                        mask: at,
+                        shape,
+                        region,
+                        row,
+                    }) if *at == index && *shape == want.shape && *region == area => *row,
+                    _ => 0,
+                };
+                let left = area.3 - from;
+                let rows = rows_in_budget(per_row, left, *budget, *recorded);
+                if left > 0 && rows == 0 {
+                    return false;
+                }
+                if from == 0 {
+                    // The alpha is drawn again, and Refine edges and the edge
+                    // controls read it: none of the three claims anything
+                    // until the slice of its last strip is submitted.
+                    *partial = None;
+                    slot.shape = None;
+                    slot.refine = None;
+                    if let Some(edged) = slot.edged.as_mut() {
+                        edged.held = None;
+                    }
+                }
+                self.queue.write_buffer(
+                    passes.mask_uniform,
+                    0,
+                    bytemuck::bytes_of(&MaskUniform::new(mask, &geometry)),
+                );
+                let load = if from == 0 {
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                draw_loading(
+                    encoder,
+                    "mask alpha",
+                    &self.mask.pipeline,
+                    &slot.raster_bind,
+                    &slot.alpha.view,
+                    Some((area.0, area.1 + from, area.2, rows)),
+                    load,
+                );
+                *budget = budget.saturating_sub(u64::from(rows) * per_row);
+                *recorded += 1;
+                if from + rows < area.3 {
+                    *partial = Some(Partial::Alpha {
+                        mask: index,
+                        shape: want.shape.clone(),
+                        region: area,
+                        row: from + rows,
+                    });
+                    return false;
+                }
+                *partial = None;
+                self.alpha_builds += 1;
+                claims.push(Claim::Alpha {
+                    mask: index,
+                    shape: want.shape.clone(),
+                    region: area,
+                });
+            }
+
+            // The refined alpha of Refine edges over its region in the
+            // frame's scratch, laid out once and drawn a strip of rows of a
+            // pass at a time.
+            match want.plan {
+                None => {
+                    slot.refined = None;
+                    slot.refine = None;
+                    if matches!(&*partial, Some(Partial::Refined { mask: at, .. }) if *at == index)
+                    {
+                        *partial = None;
+                    }
+                }
+                Some(plan) => {
+                    if slot.refine != Some(want.refine)
+                        || !holds(slot.refined_region, want.refined_region)
+                    {
+                        let resume = match &*partial {
+                            Some(Partial::Refined {
+                                mask: at,
+                                refine,
+                                region,
+                                plan: laid,
+                                scratch,
+                                ..
+                            }) => {
+                                *at == index
+                                    && *refine == want.refine
+                                    && *region == want.refined_region
+                                    && *laid == plan
+                                    && slot.refined.is_some()
+                                    && refine_scratch.as_ref().map(Scratch::id) == Some(*scratch)
+                            }
+                            _ => false,
+                        };
+                        if !resume {
+                            if *recorded > 0 && *budget == 0 {
+                                return false;
+                            }
+                            *partial = None;
+                            // These passes draw over the frame's scratch: a
+                            // refine this slice finished claims none of the
+                            // moments it took there.
+                            for claim in claims.iter_mut() {
+                                if let Claim::Refined { moments, .. } = claim {
+                                    *moments = None;
+                                }
+                            }
+                            // The edge controls read the refined alpha.
+                            slot.refine = None;
+                            if let Some(edged) = slot.edged.as_mut() {
+                                edged.held = None;
+                            }
+                            let refined = slot.refined.get_or_insert_with(|| {
+                                self.refine
+                                    .refined(&self.device, ALPHA_FORMAT, width, height)
+                            });
+                            let laid = self.refine.lay_out(
+                                &self.device,
+                                &self.queue,
+                                refine_scratch,
+                                refined,
+                                &working.view,
+                                &slot.alpha.view,
+                                &plan,
+                                want.refined_region,
+                            );
+                            // The moments the passes take are the scratch's
+                            // key once the slice of the last is submitted,
+                            // and none until then.
+                            let scratch = refine_scratch.as_mut().expect("laid out above");
+                            let id = scratch.id();
+                            let moments = scratch.take_held().map(|held| (id, held));
+                            *partial = Some(Partial::Refined {
+                                mask: index,
+                                refine: want.refine,
+                                region: want.refined_region,
+                                plan,
+                                scratch: id,
+                                draws: laid.draws,
+                                at: (0, 0),
+                                moments,
+                            });
+                        }
+                        let Some(Partial::Refined { draws, at, .. }) = partial.as_mut() else {
+                            unreachable!("a refine is laid out above");
+                        };
+                        let scratch = refine_scratch.as_ref().expect("laid out above");
+                        let refined = slot.refined.as_ref().expect("laid out above");
+                        while let Some(pass) = draws.get(at.0) {
+                            let left = pass.rows() - at.1;
+                            let rows = rows_in_budget(pass.row_texels(), left, *budget, *recorded);
+                            if left > 0 && rows == 0 {
+                                break;
+                            }
+                            if rows > 0 {
+                                self.refine.draw_rows(
+                                    encoder,
+                                    scratch,
+                                    refined,
+                                    pass,
+                                    at.1,
+                                    at.1 + rows,
+                                );
+                                *budget =
+                                    budget.saturating_sub(u64::from(rows) * pass.row_texels());
+                                *recorded += 1;
+                            }
+                            at.1 += rows;
+                            if at.1 == pass.rows() {
+                                *at = (at.0 + 1, 0);
+                            }
+                        }
+                        if at.0 < draws.len() {
+                            return false;
+                        }
+                        let Some(Partial::Refined {
+                            refine,
+                            region,
+                            moments,
+                            ..
+                        }) = partial.take()
+                        else {
+                            unreachable!("a refine is laid out above");
+                        };
+                        self.refine_builds += 1;
+                        claims.push(Claim::Refined {
+                            mask: index,
+                            refine,
+                            region,
+                            moments,
+                        });
+                    }
+                }
+            }
+
+            // The edge products, made or dropped for the plan, laid out from
+            // the alpha Refine edges hands on and drawn a strip of rows of a
+            // pass at a time.
+            let edge_plan = want.edge_plan;
+            if edge_plan.is_off() {
+                slot.edged = None;
+                if matches!(&*partial, Some(Partial::Edged { mask: at, .. }) if *at == index) {
+                    *partial = None;
+                }
+            } else {
+                let refined_input = slot.refined.is_some();
+                let edged = slot
+                    .edged
+                    .get_or_insert_with(|| self.edge.edged(&self.device));
+                // A product made again holds nothing yet; a shifted or
+                // finished alpha made or dropped has a new product id.
+                let made = self
+                    .edge
+                    .prepare(&self.device, edge_scratch, edged, &edge_plan);
+                let remade = made.shifted || made.cells || made.finished;
+                if remade {
+                    edged.held = None;
+                }
+                let held = EdgeHeld {
+                    plan: edge_plan,
+                    refined: refined_input,
+                };
+                if edged.held != Some(held) {
+                    let resume = !remade
+                        && match &*partial {
+                            Some(Partial::Edged {
+                                mask: at,
+                                held: laid,
+                                scratch,
+                                product,
+                                ..
+                            }) => {
+                                *at == index
+                                    && *laid == held
+                                    && *scratch == edge_scratch.made()
+                                    && *product == edged.product_id()
+                            }
+                            _ => false,
+                        };
+                    if !resume {
+                        if *recorded > 0 && *budget == 0 {
+                            return false;
+                        }
+                        *partial = None;
+                        edged.held = None;
+                        let p = &edge_plan;
+                        let work = EdgeWork {
+                            shift: p.shifts().then_some(frame_rect),
+                            feather: p.feathers().then_some(region),
+                            finish: (p.feathers() || p.contrasts()).then_some(region),
+                        };
+                        let draws = self.edge.lay_out(
+                            &self.device,
+                            &self.queue,
+                            edge_scratch,
+                            edged,
+                            p,
+                            &work,
+                        );
+                        *partial = Some(Partial::Edged {
+                            mask: index,
+                            held,
+                            scratch: edge_scratch.made(),
+                            product: edged.product_id(),
+                            stages: [
+                                work.shift.is_some(),
+                                work.feather.is_some(),
+                                work.finish.is_some(),
+                            ],
+                            draws,
+                            at: (0, 0),
+                        });
+                    }
+                    let Some(Partial::Edged { draws, at, .. }) = partial.as_mut() else {
+                        unreachable!("the edge products are laid out above");
+                    };
+                    let mut strips = Vec::new();
+                    while let Some(pass) = draws.get(at.0) {
+                        let left = pass.rows() - at.1;
+                        let rows = rows_in_budget(pass.row_texels(), left, *budget, *recorded);
+                        if left > 0 && rows == 0 {
+                            break;
+                        }
+                        if rows > 0 {
+                            strips.push(EdgeStrip {
+                                pass,
+                                from: at.1,
+                                to: at.1 + rows,
+                            });
+                            *budget = budget.saturating_sub(u64::from(rows) * pass.row_texels());
+                            *recorded += 1;
+                        }
+                        at.1 += rows;
+                        if at.1 == pass.rows() {
+                            *at = (at.0 + 1, 0);
+                        }
+                    }
+                    let input = slot
+                        .refined
+                        .as_ref()
+                        .map_or(&slot.alpha.view, |refined| &refined.alpha);
+                    self.edge.draw_strips(
+                        &self.device,
+                        encoder,
+                        edge_scratch,
+                        edged,
+                        input,
+                        &strips,
+                    );
+                    if at.0 < draws.len() {
+                        return false;
+                    }
+                    let Some(Partial::Edged { stages, .. }) = partial.take() else {
+                        unreachable!("the edge products are laid out above");
+                    };
+                    for (stage, drawn) in stages.into_iter().enumerate() {
+                        if drawn {
+                            self.edge_builds[stage] += 1;
+                        }
+                    }
+                    claims.push(Claim::Edged { mask: index, held });
+                }
+            }
+
+            // The bind groups of the masked develop pass follow the alpha it
+            // reads, told apart by its product id.
+            let product = product_of(slot);
+            if slot.binds_product != product {
+                slot.develop_binds = passes.develop_binds(reads, product_view(slot));
+                slot.binds_product = product;
+            }
+        }
+        // Every product is held: none is left unfinished. The scratches no
+        // mask of the frame needs go, as after a render.
+        *partial = None;
+        if slots.iter().flatten().all(|slot| slot.refined.is_none()) {
+            *refine_scratch = None;
+        }
+        let (runs, cells) = slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| slot.edged.as_ref())
+            .fold((false, false), |(runs, cells), edged| {
+                (runs || edged.shifts(), cells || edged.feathers())
+            });
+        edge_scratch.keep(runs, cells);
+        true
+    }
+
+    /// The mask shown as the overlay, sanitised, when the edit has one there.
+    /// The overlay shows a mask whether or not it adjusts anything yet, so
+    /// its alpha is drawn even when the mask itself is not.
+    fn overlaid(&self, edit: &PhotoEdit) -> Option<(usize, Mask)> {
+        let index = self.overlay.filter(|index| *index < MAX_MASKS)?;
+        Some((index, edit.masks.get(index)?.sanitised()))
+    }
+
+    /// What `render_window` renders for a zoomed view: the frame holds the
+    /// window plus the reach of the widest head pass on every side, or of
+    /// Refine edges when a mask's reaches further.
+    fn view_geometry(&self, edit: &PhotoEdit, view: &ViewWindow) -> ViewGeometry {
+        let full = (view.full.0.max(1), view.full.1.max(1));
         let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
         let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
         let reach = head_pass_reach(full).max(self.refine_reach(edit, full));
-        let (x0, y0) = (wx.saturating_sub(reach), wy.saturating_sub(reach));
-        let (x1, y1) = ((wx + ww + reach).min(full.0), (wy + wh + reach).min(full.1));
+        // The frame is the window and the reach on every side, moved inside
+        // the picture where it would pass an edge, and cut to the picture
+        // only where the picture is shorter: so windows of one size have
+        // frames of one size. Where it is moved, the window keeps the reach
+        // on the inner side and meets the picture's own edge on the other,
+        // as the full render does.
+        let place = |start: u32, size: u32, full: u32| {
+            let span = (size + 2 * reach).min(full);
+            let low = start.saturating_sub(reach).min(full - span);
+            (low, low + span)
+        };
+        let (x0, x1) = place(wx, ww, full.0);
+        let (y0, y1) = place(wy, wh, full.1);
         let frame = ((x1 - x0) as f32, (y1 - y0) as f32);
         let window = CropRect {
             x: x0 as f32 / full.0 as f32,
@@ -1326,22 +2791,22 @@ impl Develop {
             width: w as f32 / frame.0,
             height: h as f32 / frame.1,
         };
-        self.render_window(
-            edit,
-            within((vx, vy, vw, vh)),
-            (x1 - x0, y1 - y0),
-            (vw, vh),
+        ViewGeometry {
+            crop: within((vx, vy, vw, vh)),
+            render_size: (x1 - x0, y1 - y0),
+            output_size: (vw, vh),
             window,
-            full,
-            within((wx, wy, ww, wh)),
-        )
+            sigma_size: full,
+            products: within((wx, wy, ww, wh)),
+        }
     }
 
     /// The shared body: renders `window` of the source at `render_size`
     /// with the blur sigma of `sigma_size`, draws the head-pass products
     /// over `products` of that render and the develop passes over `crop`,
     /// then crops `crop` of it into the output. `crop` lies inside
-    /// `products`.
+    /// `products`. A `view` render is of a zoomed view, whose frame is
+    /// told apart by `products` too (see [`Frame::view`]).
     #[allow(clippy::too_many_arguments)]
     fn render_window(
         &mut self,
@@ -1352,7 +2817,9 @@ impl Develop {
         window: CropRect,
         sigma_size: (u32, u32),
         products: CropRect,
+        view: bool,
     ) -> Option<&wgpu::TextureView> {
+        let view = view.then_some(products);
         let source = self.source.as_ref()?;
         let (width, height) = (render_size.0.max(1), render_size.1.max(1));
         let mut encoder = self
@@ -1365,209 +2832,68 @@ impl Develop {
             (f.width, f.height, f.generation) != (width, height, source.generation)
                 || f.window != window
                 || f.sigma_size != sigma_size
+                || f.view != view
         });
-        let rerun = stale
-            || self
-                .frame
-                .as_ref()
-                .is_some_and(|f| f.content != source.content);
         if stale {
-            self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
+            // A frame built ahead for this window is swapped in once every
+            // slice of it is submitted: its head passes ran in submits of
+            // their own. Without one the frame is replaced and its head
+            // passes run in this submit; one still building for this window
+            // is dropped, as the frame replaced here serves the window.
+            let ahead = self.next.take_if(|next| {
+                let f = &next.frame;
+                (f.width, f.height, f.generation) == (width, height, source.generation)
+                    && f.window == window
+                    && f.sigma_size == sigma_size
+                    && f.view == view
+            });
+            match ahead {
+                Some(next) if next.build.complete() => {
+                    // The frame taken out of use keeps its textures for the
+                    // next frame built ahead. No frame is built ahead now,
+                    // so the two are all the frames held.
+                    self.spare = self.frame.replace(next.frame);
+                    self.window_swaps += 1;
+                }
+                building => {
+                    drop(building);
+                    // A frame is made here, beside the one it replaces: the
+                    // frame kept for its textures goes first.
+                    self.spare = None;
+                    self.frame_makes += 1;
+                    let mut frame = self.build_frame(source, width, height, window, sigma_size);
+                    frame.view = view;
+                    self.frame = Some(frame);
+                    self.window_replaces += 1;
+                }
+            }
             self.frame_generation += 1;
         }
-        if rerun {
-            let frame = self.frame.as_mut().expect("frame built above");
-            frame.content = source.content;
-            let window_uniform = [window.x, window.y, window.width, window.height];
-            let (head_pipeline, head_label) = match &source.kind {
-                SourceKind::Photo { space, .. } => {
-                    let taps = input_taps((source.width, source.height), window, (width, height));
-                    self.queue.write_buffer(
-                        &self.input_uniform,
-                        0,
-                        bytemuck::bytes_of(&InputUniform {
-                            matrix: matrices::input_matrix(*space).to_wgsl_columns(),
-                            render_size: [width as f32, height as f32],
-                            decode_srgb: 1,
-                            taps,
-                            window: window_uniform,
-                        }),
-                    );
-                    (&self.input.pipeline, "input transform")
-                }
-                SourceKind::Video(planes) => {
-                    self.queue.write_buffer(
-                        &self.video_uniform,
-                        0,
-                        bytemuck::bytes_of(&planes.uniform(window_uniform)),
-                    );
-                    (&self.video.pipeline, "video")
-                }
-            };
-            let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
-            draw(
-                &mut encoder,
-                head_label,
-                head_pipeline,
-                &frame.input_bind,
-                &frame.working.view,
-                None,
-            );
-            // Only the columns under the products region are read by the
-            // vertical pass, and only that region by the develop pass, so
-            // the blur and develop passes are scissored to it plus a margin.
-            let columns = scissor_for(products, (width, height), true);
-            let region = scissor_for(products, (width, height), false);
-            draw(
-                &mut encoder,
-                "blur h",
-                &self.blur.pipeline,
-                &frame.blur_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "blur v",
-                &self.blur.pipeline,
-                &frame.blur_v_bind,
-                &frame.base.view,
-                Some(region),
-            );
-        }
-        // The head-pass products of M3. Each is drawn once when its slider
-        // leaves 0 and again only after the head passes ran or the scissor
-        // moved, never on a plain slider change.
+        // The masks that change the picture, and the head-pass products they
+        // and the global edit want.
+        let masks = mask_twin::active_masks(edit);
+        // The overlay shows a mask whether or not it adjusts anything yet,
+        // so its alpha is drawn even when the mask itself is not.
+        let overlaid = self.overlaid(edit);
+        let (texture, transmission) = head_products_wanted(edit, &masks);
+        let work = HeadWork {
+            size: (width, height),
+            window,
+            sigma_size,
+            products,
+            texture,
+            transmission,
+        };
+        let mut frame = self.frame.take().expect("frame built above");
+        self.head_passes(&mut encoder, &mut frame, &work);
+        self.frame = Some(frame);
         let frame = self.frame.as_mut().expect("frame built above");
-        let columns = scissor_for(products, (width, height), true);
         let region = scissor_for(products, (width, height), false);
         // The develop passes cover only what the output shows. For a zoomed
         // viewer that is far less than the products cover, so a slider step
         // costs what it costs on a fitted picture, and a pan inside the
         // window develops what came into view and runs no head pass.
         let seen = scissor_for(crop, (width, height), false);
-        if rerun || frame.products_region != Some(region) {
-            frame.texture_ready = false;
-            frame.transmission_ready = false;
-            frame.products_region = Some(region);
-            frame.developed_for = None;
-            // The moments Refine edges holds of the source are of the
-            // working texture as it was.
-            if let Some(scratch) = frame.refine_scratch.as_mut() {
-                scratch.forget_source();
-            }
-            for mask in frame.masks.iter_mut().flatten() {
-                mask.shape = None;
-                mask.refine = None;
-                if let Some(edged) = mask.edged.as_mut() {
-                    edged.held = None;
-                }
-                // A layer with an auto stroke reads the working texture: it
-                // is stamped again when the head passes ran. One without
-                // reads no source pixel and is kept.
-                if rerun {
-                    mask.layers.forget_auto();
-                }
-            }
-        }
-        // The masks that change the picture, and what each develops with. A
-        // mask that alone turns on texture or dehaze asks for the product
-        // the same way the global slider does.
-        let masks = mask_twin::active_masks(edit);
-        // The overlay shows a mask whether or not it adjusts anything yet,
-        // so its alpha is drawn even when the mask itself is not.
-        let shown = self.overlay.filter(|index| *index < MAX_MASKS);
-        let overlaid: Option<(usize, Mask)> = shown.and_then(|index| {
-            let mask = edit.masks.get(index)?.sanitised();
-            Some((index, mask))
-        });
-        let effective: Vec<Adjustments> = masks
-            .iter()
-            .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
-            .collect();
-        let wants_texture = edit.texture != 0.0 || effective.iter().any(|e| e.texture != 0.0);
-        let wants_transmission = edit.dehaze != 0.0 || effective.iter().any(|e| e.dehaze != 0.0);
-        if wants_texture && !frame.texture_ready {
-            let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
-            draw(
-                &mut encoder,
-                "texture blur h",
-                &self.blur.pipeline,
-                &frame.texture_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "texture blur v",
-                &self.blur.pipeline,
-                &frame.texture_v_bind,
-                &frame.texture_base.view,
-                Some(region),
-            );
-            frame.texture_ready = true;
-        }
-        if wants_transmission && !frame.transmission_ready {
-            let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
-            let a = source.atmosphere;
-            for (buffer, direction, stage) in [
-                (&self.minimum_h_uniform, [1, 0], 0),
-                (&self.minimum_v_uniform, [0, 1], 1),
-            ] {
-                self.queue.write_buffer(
-                    buffer,
-                    0,
-                    bytemuck::bytes_of(&MinimumUniform {
-                        direction,
-                        radius,
-                        stage,
-                        atmosphere: [a[0], a[1], a[2], 1.0],
-                    }),
-                );
-            }
-            let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
-            write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
-            // The minimum runs over the whole render: the smoothing reads
-            // the map beyond the scissor on every side.
-            draw(
-                &mut encoder,
-                "minimum h",
-                &self.minimum.pipeline,
-                &frame.minimum_h_bind,
-                &frame.ping.view,
-                None,
-            );
-            draw(
-                &mut encoder,
-                "minimum v",
-                &self.minimum.pipeline,
-                &frame.minimum_v_bind,
-                &frame.transmission.view,
-                None,
-            );
-            draw(
-                &mut encoder,
-                "transmission blur h",
-                &self.blur.pipeline,
-                &frame.smooth_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                &mut encoder,
-                "transmission blur v",
-                &self.blur.pipeline,
-                &frame.smooth_v_bind,
-                &frame.transmission.view,
-                Some(region),
-            );
-            frame.transmission_ready = true;
-        }
         let curves = &edit.look.curves;
         if !curves.is_identity() && self.curves_uploaded.as_ref() != Some(curves) {
             write_table_row(&self.queue, &self.curve_table, 0, &curve::bake(curves));
@@ -1624,70 +2950,43 @@ impl Develop {
             .map(|(index, mask)| (*index, mask, true))
             .chain(only_shown.map(|(index, mask)| (*index, mask, false)))
         {
-            let brushes: Vec<&Brush> = mask
-                .components
-                .iter()
-                .filter_map(|component| match &component.source {
-                    MaskSource::Brush(brush) => Some(brush),
-                    _ => None,
-                })
-                .collect();
-            let raster_bind = |layers: &Layers| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("mask bind group"),
-                    layout: &self.mask.layout,
-                    entries: &[
-                        buffer_binding(0, &self.mask_uniforms[index]),
-                        texture_binding(1, &frame.working.view),
-                        texture_binding(2, &layers.array),
-                    ],
-                })
+            // Refine edges, then the edge controls, are the last steps of the
+            // shape. The alpha of the components is kept under the shape
+            // without them, so a Refine or an edge slider filters the alpha
+            // again and never redraws it.
+            let MaskWant {
+                brushes,
+                shape,
+                refine,
+                plan,
+                edge_plan,
+                alpha_region,
+                refined_region,
+            } = MaskWant::of(mask, window, sigma_size, (width, height), region);
+            let passes = MaskPasses {
+                device: &self.device,
+                mask: &self.mask,
+                masked: &self.masked,
+                mask_uniform: &self.mask_uniforms[index],
+                masked_uniform: &self.masked_uniforms[index],
+                table: &self.curve_table_view,
             };
-            // The mask pass reads this alpha: the mask's own, or its refined
-            // one.
-            let develop_binds = |alpha: &wgpu::TextureView| {
-                [&frame.developed, &frame.developed_other].map(|before| {
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("masked develop bind group"),
-                        layout: &self.masked.layout,
-                        entries: &[
-                            buffer_binding(0, &self.masked_uniforms[index]),
-                            texture_binding(1, &frame.working.view),
-                            texture_binding(2, &frame.base.view),
-                            texture_binding(3, &frame.texture_base.view),
-                            texture_binding(4, &frame.transmission.view),
-                            texture_binding(5, &self.curve_table_view),
-                            texture_binding(6, alpha),
-                            texture_binding(7, &before.view),
-                        ],
-                    })
-                })
+            let reads = DevelopReads {
+                working: &frame.working,
+                base: &frame.base,
+                texture_base: &frame.texture_base,
+                transmission: &frame.transmission,
+                developed: &frame.developed,
+                developed_other: &frame.developed_other,
             };
-            let slot = frame.masks[index].get_or_insert_with(|| {
-                let alpha = create_target(&self.device, "mask alpha", ALPHA_FORMAT, width, height);
-                let layers = Layers::new(&self.device, brushes.len(), width, height);
-                let raster_bind = raster_bind(&layers);
-                let develop_binds = develop_binds(&alpha.view);
-                FrameMask {
-                    alpha,
-                    shape: None,
-                    alpha_region: (0, 0, 0, 0),
-                    refined: None,
-                    refine: None,
-                    refined_region: (0, 0, 0, 0),
-                    edged: None,
-                    binds_product: Product::Alpha,
-                    layers,
-                    raster_bind,
-                    develop_binds,
-                }
-            });
+            let slot = frame.masks[index]
+                .get_or_insert_with(|| passes.frame_mask(reads, brushes.len(), (width, height)));
             // A layer for each brush of the mask. The layers are kept while
             // the frame is; each is stamped again only when its strokes are
             // not the ones it holds.
             if slot.layers.len() != brushes.len() {
                 slot.layers = Layers::new(&self.device, brushes.len(), width, height);
-                slot.raster_bind = raster_bind(&slot.layers);
+                slot.raster_bind = passes.raster_bind(reads.working, &slot.layers);
                 slot.shape = None;
             }
             let mut stamped = Damage::Nothing;
@@ -1723,35 +3022,8 @@ impl Develop {
                     }
                 }
             }
-            // Refine edges, then the edge controls, are the last steps of the
-            // shape. The alpha of the components is kept under the shape
-            // without them, so a Refine or an edge slider filters the alpha
-            // again and never redraws it.
-            let refine = mask.refine.shape();
-            let origin = (
-                (window.x * sigma_size.0 as f32).round().max(0.0) as u32,
-                (window.y * sigma_size.1 as f32).round().max(0.0) as u32,
-            );
-            let plan =
-                (!refine.is_off()).then(|| Plan::new(&refine, sigma_size, origin, (width, height)));
-            let edge_plan = EdgePlan::new(&mask.edge, sigma_size, origin, (width, height));
             let edged_on = !edge_plan.is_off();
             let frame_rect = (0, 0, width, height);
-            // The filter reads the alpha its reach beyond what it writes. A
-            // mask with an edge control on keeps its alpha and its refined
-            // alpha over the whole frame, which is padded by both reaches, so
-            // an edge slider, whose reach moves, never draws them again.
-            let alpha_region = if edged_on {
-                frame_rect
-            } else {
-                plan.map_or(region, |plan| grow(region, plan.reach(), (width, height)))
-            };
-            let refined_region = if edged_on { frame_rect } else { region };
-            let shape = MaskShape {
-                refine: Refine::default(),
-                edge: Edge::default(),
-                ..mask.shape()
-            };
             // What of the alpha this render drew again.
             let mut redrawn = Damage::Nothing;
             if slot.shape.as_ref() != Some(&shape) || !holds(slot.alpha_region, alpha_region) {
@@ -1963,7 +3235,7 @@ impl Develop {
             };
             let product = product_of(slot);
             if slot.binds_product != product {
-                slot.develop_binds = develop_binds(product_view(slot));
+                slot.develop_binds = passes.develop_binds(reads, product_view(slot));
                 slot.binds_product = product;
             }
             if !develops {
@@ -2270,6 +3542,220 @@ impl Develop {
         (target, uniform, bind)
     }
 
+    /// The head passes of `frame`: the input transform and the base blur
+    /// when it does not hold the source content yet, then the texture layer
+    /// and the transmission map when `work` wants them and they were not
+    /// drawn since. They read only the frame and the uniforms they write, so
+    /// a frame built ahead runs them in submits of its own
+    /// ([`ahead_slice`](Self::ahead_slice)); here each runs whole.
+    fn head_passes(&self, encoder: &mut wgpu::CommandEncoder, frame: &mut Frame, work: &HeadWork) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let rerun = frame.content != source.content;
+        if rerun {
+            frame.content = source.content;
+        }
+        // The head-pass products of M3. Each is drawn once when its slider
+        // leaves 0 and again only after the head passes ran or the scissor
+        // moved, never on a plain slider change.
+        let region = scissor_for(work.products, work.size, false);
+        if rerun || frame.products_region != Some(region) {
+            frame.texture_ready = false;
+            frame.transmission_ready = false;
+            frame.products_region = Some(region);
+            frame.developed_for = None;
+            forget_products(frame, rerun);
+        }
+        let texture = work.texture && !frame.texture_ready;
+        let transmission = work.transmission && !frame.transmission_ready;
+        let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+        for pass in HeadPass::plan(rerun, texture, transmission) {
+            self.write_head_uniform(pass, work);
+            self.draw_head_pass(encoder, frame, pass, pass.scissor(work), clear);
+        }
+        if texture {
+            frame.texture_ready = true;
+        }
+        if transmission {
+            frame.transmission_ready = true;
+        }
+    }
+
+    /// Writes the uniform `pass` reads for `work`. Each head pass has a
+    /// buffer of its own, so a submit holds every pass's value at once.
+    fn write_head_uniform(&self, pass: HeadPass, work: &HeadWork) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let (width, height) = work.size;
+        let (window, sigma_size) = (work.window, work.sigma_size);
+        match pass {
+            HeadPass::Input => {
+                let window_uniform = [window.x, window.y, window.width, window.height];
+                match &source.kind {
+                    SourceKind::Photo { space, .. } => {
+                        let taps =
+                            input_taps((source.width, source.height), window, (width, height));
+                        self.queue.write_buffer(
+                            &self.input_uniform,
+                            0,
+                            bytemuck::bytes_of(&InputUniform {
+                                matrix: matrices::input_matrix(*space).to_wgsl_columns(),
+                                render_size: [width as f32, height as f32],
+                                decode_srgb: 1,
+                                taps,
+                                window: window_uniform,
+                            }),
+                        );
+                    }
+                    SourceKind::Video(planes) => {
+                        self.queue.write_buffer(
+                            &self.video_uniform,
+                            0,
+                            bytemuck::bytes_of(&planes.uniform(window_uniform)),
+                        );
+                    }
+                }
+            }
+            HeadPass::BlurH | HeadPass::BlurV => {
+                let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::BlurH {
+                    write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
+                } else {
+                    write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
+                }
+            }
+            HeadPass::TextureH | HeadPass::TextureV => {
+                let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::TextureH {
+                    write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
+                } else {
+                    write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
+                }
+            }
+            HeadPass::MinimumH | HeadPass::MinimumV => {
+                let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
+                let a = source.atmosphere;
+                let (buffer, direction, stage) = if pass == HeadPass::MinimumH {
+                    (&self.minimum_h_uniform, [1, 0], 0)
+                } else {
+                    (&self.minimum_v_uniform, [0, 1], 1)
+                };
+                self.queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::bytes_of(&MinimumUniform {
+                        direction,
+                        radius,
+                        stage,
+                        atmosphere: [a[0], a[1], a[2], 1.0],
+                    }),
+                );
+            }
+            HeadPass::TransmissionH | HeadPass::TransmissionV => {
+                let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::TransmissionH {
+                    write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
+                } else {
+                    write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
+                }
+            }
+        }
+    }
+
+    /// Records `pass` of `frame` under `scissor`, beginning with `load`: a
+    /// clear for the whole pass or its first strip, a load for the strips
+    /// after it.
+    fn draw_head_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        pass: HeadPass,
+        scissor: Option<(u32, u32, u32, u32)>,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let blur = &self.blur.pipeline;
+        let minimum = &self.minimum.pipeline;
+        let (label, pipeline, bind, target) = match pass {
+            HeadPass::Input => {
+                let (label, pipeline) = match &source.kind {
+                    SourceKind::Photo { .. } => ("input transform", &self.input.pipeline),
+                    SourceKind::Video(_) => ("video", &self.video.pipeline),
+                };
+                (label, pipeline, &frame.input_bind, &frame.working)
+            }
+            HeadPass::BlurH => ("blur h", blur, &frame.blur_h_bind, &frame.ping),
+            HeadPass::BlurV => ("blur v", blur, &frame.blur_v_bind, &frame.base),
+            HeadPass::TextureH => ("texture blur h", blur, &frame.texture_h_bind, &frame.ping),
+            HeadPass::TextureV => (
+                "texture blur v",
+                blur,
+                &frame.texture_v_bind,
+                &frame.texture_base,
+            ),
+            HeadPass::MinimumH => ("minimum h", minimum, &frame.minimum_h_bind, &frame.ping),
+            HeadPass::MinimumV => (
+                "minimum v",
+                minimum,
+                &frame.minimum_v_bind,
+                &frame.transmission,
+            ),
+            HeadPass::TransmissionH => (
+                "transmission blur h",
+                blur,
+                &frame.smooth_h_bind,
+                &frame.ping,
+            ),
+            HeadPass::TransmissionV => (
+                "transmission blur v",
+                blur,
+                &frame.smooth_v_bind,
+                &frame.transmission,
+            ),
+        };
+        draw_loading(encoder, label, pipeline, bind, &target.view, scissor, load);
+    }
+
+    /// What one pixel of `pass` costs, in texels read and written (see
+    /// [`AHEAD_SLICE_TEXELS`]): the reads its shader makes for the pixel
+    /// plus its one write.
+    fn head_pass_texels(&self, pass: HeadPass, work: &HeadWork) -> u64 {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let sigma_size = work.sigma_size;
+        // A blur reads its centre and one bilinear read for each pair of
+        // taps on each side (blur.wgsl).
+        let blur = |sigma: f32| {
+            let radius = basic::blur_radius(sigma).max(0) as u64;
+            1 + 2 * radius.div_ceil(2)
+        };
+        let reads = match pass {
+            HeadPass::Input => match &source.kind {
+                SourceKind::Photo { .. } => {
+                    let taps = u64::from(input_taps(
+                        (source.width, source.height),
+                        work.window,
+                        work.size,
+                    ));
+                    taps * taps
+                }
+                // The luma plane and the chroma plane.
+                SourceKind::Video(_) => 2,
+            },
+            HeadPass::BlurH | HeadPass::BlurV => {
+                blur(basic::base_sigma(sigma_size.0, sigma_size.1))
+            }
+            HeadPass::TextureH | HeadPass::TextureV => {
+                blur(local::texture_sigma(sigma_size.0, sigma_size.1))
+            }
+            HeadPass::MinimumH | HeadPass::MinimumV => {
+                let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1).max(0) as u64;
+                2 * radius + 1
+            }
+            HeadPass::TransmissionH | HeadPass::TransmissionV => {
+                blur(dehaze::smoothing_sigma(sigma_size.0, sigma_size.1))
+            }
+        };
+        reads + 1
+    }
+
     fn build_frame(
         &self,
         source: &Source,
@@ -2400,6 +3886,7 @@ impl Develop {
             content: source.content.wrapping_sub(1),
             window,
             sigma_size,
+            view: None,
             working,
             ping,
             base,
@@ -2656,6 +4143,112 @@ fn write_table_row(queue: &wgpu::Queue, table: &wgpu::Texture, row: u32, tables:
     );
 }
 
+impl Frame {
+    /// Whether a frame of `width` by `height` over the source textures of
+    /// `generation` can be drawn into this one: the size and the source are
+    /// its own, and so is the size of each of its seven textures. The
+    /// textures of the masks are of the frame's size as well.
+    fn fits(&self, width: u32, height: u32, generation: u64) -> bool {
+        (self.width, self.height, self.generation) == (width, height, generation)
+            && [
+                &self.working,
+                &self.ping,
+                &self.base,
+                &self.texture_base,
+                &self.transmission,
+                &self.developed,
+                &self.developed_other,
+            ]
+            .iter()
+            .all(|target| (target.width, target.height) == (width, height))
+    }
+
+    /// Makes this frame, which a swap took out of use, the frame of `window`
+    /// of `source` with the sigmas of `sigma_size`, holding what a frame
+    /// [`Develop::build_frame`] makes holds: every key and done flag says
+    /// nothing is drawn. The textures and the bind groups over them are
+    /// kept; their pixels are of the window before, and each is drawn before
+    /// it is read, as on a new frame: the first strip of every head pass
+    /// clears its target, and every mask product is drawn again. The refine
+    /// scratch and the edge scratch are kept while their sizes fit, which
+    /// the passes that lay them out test, and hold no moments of the
+    /// source; a product texture made from here on gets a new id.
+    fn renew(&mut self, source: &Source, window: CropRect, sigma_size: (u32, u32)) {
+        self.window = window;
+        self.sigma_size = sigma_size;
+        // The head passes have not run into these textures for this window.
+        self.content = source.content.wrapping_sub(1);
+        self.texture_ready = false;
+        self.transmission_ready = false;
+        self.products_region = None;
+        self.developed_for = None;
+        self.developed_passes = 0;
+        // The alphas, the refined alphas, the edge products and the moments
+        // of the source.
+        forget_products(self, true);
+        for mask in self.masks.iter_mut().flatten() {
+            // Every brush layer is stamped again: its dabs are placed in the
+            // pixels of the window before.
+            mask.layers.forget();
+            mask.alpha_region = (0, 0, 0, 0);
+            mask.refined_region = (0, 0, 0, 0);
+        }
+    }
+}
+
+/// Forgets what the mask products of `frame` hold of its working texture,
+/// which the head passes draw again or whose scissor moved: the alphas, the
+/// refined alphas and the edge products are drawn again, and the moments
+/// Refine edges holds of the source, which are of the working texture as it
+/// was, are taken again. When `auto`, the working texture holds another
+/// source content: a layer with an auto stroke reads it, so it is stamped
+/// again; one without reads no source pixel and is kept. Only `frame` forgets:
+/// the other frame keeps its own keys.
+fn forget_products(frame: &mut Frame, auto: bool) {
+    if let Some(scratch) = frame.refine_scratch.as_mut() {
+        scratch.forget_source();
+    }
+    for mask in frame.masks.iter_mut().flatten() {
+        mask.shape = None;
+        mask.refine = None;
+        if let Some(edged) = mask.edged.as_mut() {
+            edged.held = None;
+        }
+        if auto {
+            mask.layers.forget_auto();
+        }
+    }
+}
+
+/// How many rows of a pass whose row costs `per_row` texels a slice of a
+/// frame built ahead draws, with `left` rows of the pass to draw and `budget`
+/// texels left: those the budget pays for, and one at least while the slice
+/// has recorded nothing.
+fn rows_in_budget(per_row: u64, left: u32, budget: u64, recorded: u32) -> u32 {
+    // A pass of no texels a row costs nothing: every row fits.
+    let fits = budget
+        .checked_div(per_row)
+        .map_or(left, |rows| rows.min(u64::from(left)) as u32);
+    if recorded == 0 && left > 0 {
+        fits.max(1)
+    } else {
+        fits
+    }
+}
+
+/// Whether the edit wants the texture layer and the transmission map. A mask
+/// that alone turns on texture or dehaze asks for the product the same way
+/// the global slider does.
+fn head_products_wanted(edit: &PhotoEdit, masks: &[(usize, Mask)]) -> (bool, bool) {
+    let effective: Vec<Adjustments> = masks
+        .iter()
+        .map(|(_, mask)| mask_twin::effective_adjustments(&edit.adjust, &mask.adjust))
+        .collect();
+    let wants_texture = edit.texture != 0.0 || effective.iter().any(|e| e.texture != 0.0);
+    let wants_transmission = edit.dehaze != 0.0 || effective.iter().any(|e| e.dehaze != 0.0);
+    (wants_texture, wants_transmission)
+}
+
 /// What a zoomed viewer shows, in pixels of the whole picture rendered at
 /// `full`. Rectangles are x, y, width, height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2672,8 +4265,15 @@ pub struct ViewWindow {
 /// A rectangle of pixels: x, y, width, height.
 pub type PixelRect = (u32, u32, u32, u32);
 
-/// `visible` with `pad` on every side, its edges moved outward onto `grid`,
-/// kept inside `full`.
+/// `visible` with `pad` on every side, its low edges moved outward onto
+/// `grid`, at one size for every place of `visible`: on each axis the widest
+/// that `visible` and its pad snapped outward onto the grid can be, which
+/// holds them wherever they lie. Where the window would pass the far edge of
+/// `full` it is moved inward until it ends there, and so still holds
+/// `visible`; on an axis where `full` is not longer than that size the
+/// window is the whole of `full`. So every window of one zoom has one size,
+/// and so has every frame rendered for one (see [`Develop::render_view`]),
+/// and a frame a pan leaves can be drawn into for the next window.
 pub fn padded_window(
     full: (u32, u32),
     visible: PixelRect,
@@ -2682,14 +4282,108 @@ pub fn padded_window(
 ) -> PixelRect {
     let grid = grid.max(1);
     let axis = |start: u32, size: u32, pad: u32, full: u32| {
+        let span = (size + 2 * pad + grid - 1).div_ceil(grid) * grid;
+        if span >= full {
+            return (0, full.max(1));
+        }
         let low = start.saturating_sub(pad) / grid * grid;
-        let high = (start + size + pad).div_ceil(grid) * grid;
-        let high = high.min(full).max(low + 1);
-        (low, high - low)
+        (low.min(full - span), span)
     };
     let (x, width) = axis(visible.0, visible.2, pad.0, full.0);
     let (y, height) = axis(visible.1, visible.3, pad.1, full.1);
     (x, y, width, height)
+}
+
+/// Where `visible` first lies outside `window` when a pan keeps moving it by
+/// the step from `previous` to `visible`, kept inside `full`. `None` while the
+/// pan does not move, or when it moves only toward edges of `window` that are
+/// edges of `full`, so that it never leaves.
+pub fn pan_exit(
+    full: (u32, u32),
+    window: PixelRect,
+    previous: PixelRect,
+    visible: PixelRect,
+) -> Option<PixelRect> {
+    let step = (
+        i64::from(visible.0) - i64::from(previous.0),
+        i64::from(visible.1) - i64::from(previous.1),
+    );
+    // The steps until the pan passes the edge of the window on one axis.
+    let steps = |step: i64, start: u32, size: u32, low: u32, extent: u32, full: u32| {
+        let (start, size, low, high) = (
+            i64::from(start),
+            i64::from(size),
+            i64::from(low),
+            i64::from(low) + i64::from(extent),
+        );
+        match step {
+            0 => None,
+            s if s > 0 && high < i64::from(full) => Some((high - start - size).max(0) / s + 1),
+            s if s < 0 && low > 0 => Some((start - low).max(0) / -s + 1),
+            _ => None,
+        }
+    };
+    let across = steps(step.0, visible.0, visible.2, window.0, window.2, full.0);
+    let down = steps(step.1, visible.1, visible.3, window.1, window.3, full.1);
+    let taken = match (across, down) {
+        (Some(a), Some(d)) => a.min(d),
+        (Some(n), None) | (None, Some(n)) => n,
+        (None, None) => return None,
+    };
+    let moved = |start: u32, size: u32, step: i64, full: u32| {
+        let last = i64::from(full.saturating_sub(size));
+        (i64::from(start) + taken * step).clamp(0, last) as u32
+    };
+    Some((
+        moved(visible.0, visible.2, step.0, full.0),
+        moved(visible.1, visible.3, step.1, full.1),
+        visible.2,
+        visible.3,
+    ))
+}
+
+/// The window to build ahead of a pan: the padded window of what is seen
+/// where the pan leaves `window` (see [`pan_exit`]), moved half the pad
+/// further in the direction of the pan on each axis it moves along. It
+/// holds that rectangle with half the pad behind it, so a pan whose steps
+/// vary by less than that still leaves `window` inside it, and reaches one
+/// and a half pads ahead of it. `None` when the pan never leaves `window`.
+pub fn window_ahead(
+    full: (u32, u32),
+    window: PixelRect,
+    previous: PixelRect,
+    visible: PixelRect,
+    pad: (u32, u32),
+    grid: u32,
+) -> Option<PixelRect> {
+    let exit = pan_exit(full, window, previous, visible)?;
+    let ahead = |start: u32, size: u32, pan: Ordering, pad: u32, full: u32| match pan {
+        Ordering::Greater => start.saturating_add(pad).min(full.saturating_sub(size)),
+        Ordering::Less => start.saturating_sub(pad),
+        Ordering::Equal => start,
+    };
+    let (x, y) = (
+        ahead(
+            exit.0,
+            exit.2,
+            visible.0.cmp(&previous.0),
+            pad.0 / 2,
+            full.0,
+        ),
+        ahead(
+            exit.1,
+            exit.3,
+            visible.1.cmp(&previous.1),
+            pad.1 / 2,
+            full.1,
+        ),
+    );
+    let moved = padded_window(full, (x, y, exit.2, exit.3), pad, grid);
+    Some(if holds(moved, exit) {
+        moved
+    } else {
+        padded_window(full, exit, pad, grid)
+    })
 }
 
 /// Whether `inner` lies inside `window`.
@@ -3061,11 +4755,96 @@ fn draw_loading(
 mod tests {
     use super::{
         DevelopUniform, FLAG_CURVES, Geometry, MAX_TAPS, MaskComponentUniform, MaskUniform,
-        MinimumUniform, OutputUniform, input_taps, scissor_for,
+        MinimumUniform, OutputUniform, PixelRect, holds, input_taps, padded_window, pan_exit,
+        scissor_for, window_ahead,
     };
     use gamut_core::mask::{Component, LinearGradient, MaskOp, MaskSource, RadialGradient};
     use gamut_core::{Adjustments, CropRect, Mask};
     use std::mem::offset_of;
+
+    /// The window a pan will reach, for each of the four directions of a
+    /// steady pan of 32 pixels a step at 100 percent of a 6000 by 4000 photo
+    /// in a 1280 by 1600 tab: the rectangle seen where the pan first leaves
+    /// the window is the one the steps reach, and the window ahead holds it,
+    /// keeps the cross axis of the window it follows and reaches past that
+    /// window in the pan's direction.
+    #[test]
+    fn a_window_ahead_lies_where_a_pan_leaves_in_each_of_four_directions() {
+        const FULL: (u32, u32) = (6000, 4000);
+        const PAD: (u32, u32) = (640, 800);
+        const GRID: u32 = 64;
+        const STEP: i64 = 32;
+        let visible: PixelRect = (2359, 1199, 1281, 1601);
+        let window = padded_window(FULL, visible, PAD, GRID);
+        assert_eq!(window, (1664, 384, 2624, 3264));
+        let at = |rect: PixelRect, (dx, dy): (i64, i64)| -> PixelRect {
+            (
+                (i64::from(rect.0) + dx) as u32,
+                (i64::from(rect.1) + dy) as u32,
+                rect.2,
+                rect.3,
+            )
+        };
+        // Right, down, left, up: the step, the exit and the window ahead.
+        // Down and up the window ahead would pass an edge of the picture: it
+        // is moved inside it at the size of every other window.
+        let cases = [
+            ((STEP, 0), (3031, 1199), (2688, 384, 2624, 3264)),
+            ((0, STEP), (2359, 2063), (1664, 736, 2624, 3264)),
+            ((-STEP, 0), (1655, 1199), (640, 384, 2624, 3264)),
+            ((0, -STEP), (2359, 367), (1664, 0, 2624, 3264)),
+        ];
+        for (step, exit, expected) in cases {
+            let previous = at(visible, (-step.0, -step.1));
+            let left = pan_exit(FULL, window, previous, visible).expect("the pan leaves");
+            // The steps themselves: the first rectangle outside the window.
+            let mut walked = visible;
+            while holds(window, walked) {
+                walked = at(walked, step);
+            }
+            assert_eq!(left, walked, "exit of the pan {step:?}");
+            assert_eq!((left.0, left.1), exit, "exit of the pan {step:?}");
+            let ahead =
+                window_ahead(FULL, window, previous, visible, PAD, GRID).expect("a window ahead");
+            assert_eq!(ahead, expected, "window ahead of the pan {step:?}");
+            assert_eq!(
+                (ahead.2, ahead.3),
+                (window.2, window.3),
+                "one window size at one zoom, the pan {step:?}"
+            );
+            assert!(holds(ahead, left), "{ahead:?} holds the exit {left:?}");
+            assert!(
+                !holds(window, left),
+                "the exit {left:?} is out of {window:?}"
+            );
+            let reach = |rect: PixelRect| match step {
+                (dx, _) if dx > 0 => i64::from(rect.0 + rect.2),
+                (dx, _) if dx < 0 => -i64::from(rect.0),
+                (_, dy) if dy > 0 => i64::from(rect.1 + rect.3),
+                _ => -i64::from(rect.1),
+            };
+            assert!(
+                reach(ahead) > reach(window),
+                "{ahead:?} reaches past {window:?} toward {step:?}"
+            );
+            // The cross axis is the window's own.
+            if step.0 == 0 {
+                assert_eq!((ahead.0, ahead.2), (window.0, window.2));
+            } else {
+                assert_eq!((ahead.1, ahead.3), (window.1, window.3));
+            }
+        }
+        // No step, no window ahead; a pan toward an edge of the picture the
+        // window already touches never leaves it.
+        assert_eq!(
+            window_ahead(FULL, window, visible, visible, PAD, GRID),
+            None
+        );
+        let corner = padded_window(FULL, (0, 0, 1281, 1601), PAD, GRID);
+        let still = (0, 0, 1281, 1601);
+        assert_eq!(pan_exit(FULL, corner, (32, 0, 1281, 1601), still), None);
+        assert_eq!(pan_exit(FULL, corner, (0, 32, 1281, 1601), still), None);
+    }
 
     #[test]
     fn a_window_at_one_source_pixel_a_pixel_takes_one_tap() {

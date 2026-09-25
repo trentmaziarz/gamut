@@ -414,7 +414,7 @@ struct FloatTarget {
 /// amount, the tile, the cells of the tile the moments were taken over, and
 /// the radius of the box and the cells of the box means.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Held {
+pub(crate) struct Held {
     full: (u32, u32),
     origin: (u32, u32),
     size: (u32, u32),
@@ -520,6 +520,23 @@ impl Scratch {
     pub(crate) fn forget_source(&mut self) {
         self.held = None;
     }
+
+    /// Takes the key of the moments out, so the scratch claims none until
+    /// [`Scratch::hold`] sets it again: a frame built ahead records a refine
+    /// in a slice and sets the key once the slice's commands are submitted.
+    pub(crate) fn take_held(&mut self) -> Option<Held> {
+        self.held.take()
+    }
+
+    /// Sets the key [`Scratch::take_held`] took out.
+    pub(crate) fn hold(&mut self, held: Held) {
+        self.held = Some(held);
+    }
+
+    /// Told apart from every scratch before it, on either frame.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// The refined alpha of one mask and what draws it.
@@ -563,44 +580,166 @@ struct Binds {
     block_gather_across: wgpu::BindGroup,
 }
 
+/// A pipeline of the pass family, by name, so that a pass laid out once can
+/// be drawn later, a strip of it at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pipe {
+    Source,
+    SourceA,
+    SourceB,
+    GatherFirst,
+    GatherMoved,
+    BoxH2,
+    BoxV2,
+    BoxH1,
+    BoxV1,
+    BlockH2,
+    BlockV2,
+    BlockH1,
+    BlockV1,
+    Solve,
+    SolveA,
+    SolveB,
+    Apply,
+}
+
+/// A bind group of [`Binds`], by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    Cells,
+    SourcePair,
+    SourceOne,
+    FarPair,
+    FarOne,
+    GatherAcross,
+    Solve,
+    Moving,
+    BlockCells,
+    BlockSourcePair,
+    BlockSourceOne,
+    BlockFarPair,
+    BlockFarOne,
+    BlockGatherAcross,
+}
+
+/// A texture a pass draws into: a target of cells of the scratch, by its
+/// name in [`Scratch`], or the refined alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    R(usize),
+    S(usize),
+    F(usize),
+    G,
+    V(usize),
+    Refined,
+}
+
 /// The block pass that draws before a box pass of [`BLOCK_TAPS`] cells or
 /// more.
-struct Block<'a> {
-    label: &'a str,
-    pipeline: &'a wgpu::RenderPipeline,
-    bind: &'a wgpu::BindGroup,
+#[derive(Clone, Copy)]
+struct Block {
+    label: &'static str,
+    pipe: Pipe,
+    group: Group,
     /// Down the targets, or across.
     down: bool,
 }
 
-impl<'a> Block<'a> {
-    fn across(
-        label: &'a str,
-        pipeline: &'a wgpu::RenderPipeline,
-        bind: &'a wgpu::BindGroup,
-    ) -> Option<Self> {
+impl Block {
+    fn across(label: &'static str, pipe: Pipe, group: Group) -> Option<Self> {
         Some(Block {
             label,
-            pipeline,
-            bind,
+            pipe,
+            group,
             down: false,
         })
     }
 
-    fn down(
-        label: &'a str,
-        pipeline: &'a wgpu::RenderPipeline,
-        bind: &'a wgpu::BindGroup,
-    ) -> Option<Self> {
+    fn down(label: &'static str, pipe: Pipe, group: Group) -> Option<Self> {
         Some(Block {
             label,
-            pipeline,
-            bind,
+            pipe,
+            group,
             down: true,
         })
     }
 }
 
+/// One pass of a refine as [`RefinePass::lay_out`] lays it out: what it
+/// draws with, into which targets, over which rectangle, at which place of
+/// the uniform buffer, and what each texel of that rectangle costs in texels
+/// read and written. No pass reads a texture it writes and each writes every
+/// texel of its rectangle over what the target holds, so the rows of a pass
+/// can be drawn in strips, in submits of their own, and leave the target as
+/// the whole pass does.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RefineDraw {
+    label: &'static str,
+    pipe: Pipe,
+    group: Group,
+    targets: Vec<Place>,
+    offset: u32,
+    area: Rect,
+    unit: u64,
+}
+
+impl RefineDraw {
+    /// The rows of the rectangle the pass draws.
+    pub(crate) fn rows(&self) -> u32 {
+        self.area.3
+    }
+
+    /// What one row of the pass costs, in texels read and written.
+    pub(crate) fn row_texels(&self) -> u64 {
+        self.unit * u64::from(self.area.2)
+    }
+}
+
+/// A refine laid out: its passes in the order they draw and how many tiles
+/// they cover.
+pub(crate) struct RefineWork {
+    pub(crate) draws: Vec<RefineDraw>,
+    pub(crate) tiles: u32,
+}
+
+/// What a texel of the rectangle of a pass through `pipe` costs, in texels
+/// read and written, for a cell of `cell` pixels and a box that reads
+/// `box_reads` cells of each target. A pass over cells counts every pixel of
+/// a cell it reads:
+///
+/// - the moments of the source read the cell's pixels and write 3 targets,
+///   cell + 3 (cell + 2 and cell + 1 in two passes);
+/// - the first gather reads the alpha and the working texture at each pixel
+///   and writes 2, 2 cell + 2;
+/// - a moved gather reads 18 a pixel (the alpha, the working texture and 4
+///   bilinear reads of the 4 solved targets) and writes 1, 18 cell + 1;
+/// - a box of t targets reads its cells of each and writes each, t
+///   (box_reads + 1): 2 c + 1 cells in the direct loop, c its radius, and
+///   the block sums and the cells left over from blocks;
+/// - a block pass of t targets reads 8 cells of each and writes each, 9 t;
+/// - the solve reads 5 targets and writes 4, 9 (5 + 2 in each of two);
+/// - the apply reads 18 and writes 1 at each pixel, 19.
+///
+/// Over one tile of p pixels of work in n cells, o pixels of the apply, the
+/// fused family with every box in the direct loop sums to 39 p + 19 o +
+/// (28 c + 62) n: the ten boxes read 14 targets.
+fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
+    let block = u64::from(BLOCK);
+    match pipe {
+        Pipe::Source => cell + 3,
+        Pipe::SourceA => cell + 2,
+        Pipe::SourceB => cell + 1,
+        Pipe::GatherFirst => 2 * cell + 2,
+        Pipe::GatherMoved => 18 * cell + 1,
+        Pipe::BoxH2 | Pipe::BoxV2 => 2 * (box_reads + 1),
+        Pipe::BoxH1 | Pipe::BoxV1 => box_reads + 1,
+        Pipe::BlockH2 | Pipe::BlockV2 => 2 * (block + 1),
+        Pipe::BlockH1 | Pipe::BlockV1 => block + 1,
+        Pipe::Solve => 9,
+        Pipe::SolveA | Pipe::SolveB => 7,
+        Pipe::Apply => 19,
+    }
+}
 /// The pipelines of `refine.wgsl`.
 pub(crate) struct RefinePass {
     layout: wgpu::BindGroupLayout,
@@ -842,6 +981,33 @@ impl RefinePass {
         plan: &Plan,
         over: Rect,
     ) -> u32 {
+        let work = self.lay_out(device, queue, scratch, refined, working, alpha, plan, over);
+        let scratch = scratch.as_ref().expect("laid out above");
+        for draw in &work.draws {
+            self.draw_rows(encoder, scratch, refined, draw, 0, draw.rows());
+        }
+        work.tiles
+    }
+
+    /// Lays out the refine [`run`](Self::run) draws, without drawing it: the
+    /// scratch made or kept, the uniform of every tile written, the bind
+    /// groups made, the moments of the source the scratch holds once every
+    /// pass is drawn set as its key, and the passes in the order they draw.
+    /// [`draw_rows`](Self::draw_rows) draws them, whole or a strip of rows
+    /// at a time, into the same scratch and refined alpha while nothing else
+    /// draws there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lay_out(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scratch: &mut Option<Scratch>,
+        refined: &mut Refined,
+        working: &wgpu::TextureView,
+        alpha: &wgpu::TextureView,
+        plan: &Plan,
+        over: Rect,
+    ) -> RefineWork {
         let held = scratch.as_ref().map(|held| held.size);
         let hold = hold(held, plan, self.scratch_budget);
         self.last_hold = Some(hold);
@@ -955,7 +1121,6 @@ impl RefinePass {
                 },
             ));
         }
-        let (_, binds) = refined.binds.as_ref().expect("made above");
         // The blocks each box adds, and none when every box sums its cells
         // in the direct loop.
         let blocks = if self.direct_box {
@@ -963,7 +1128,17 @@ impl RefinePass {
         } else {
             box_blocks(plan.cells)
         };
-        let mut drawn = 0u32;
+        // What a texel of each pass costs: a cell holds step squared pixels,
+        // and a box reads its block sums and the cells left over, or all 2
+        // cells + 1 in the direct loop.
+        let cell = u64::from(plan.step) * u64::from(plan.step);
+        let taps = u64::from(2 * plan.cells + 1);
+        let box_reads = if blocks > 0 {
+            u64::from(blocks) + taps - u64::from(blocks * BLOCK)
+        } else {
+            taps
+        };
+        let mut draws: Vec<RefineDraw> = Vec::new();
         for (slot, tile) in tiles.iter().enumerate() {
             let offset = slot as u32 * self.stride;
             let uniform = RefineUniform {
@@ -975,37 +1150,40 @@ impl RefinePass {
                 u64::from(offset),
                 bytemuck::bytes_of(&uniform),
             );
-            let (f, g, v) = (&scratch.f, &scratch.g, &scratch.v);
             // A box pass of blocks has its block pass first, into v0 (and v1
             // for a pair). Both are free at every box: the solve writes them
             // after the last box of a gather, and the moments of the next
             // gather read them before its first box.
-            let sums = [&v[0].view, &v[1].view];
+            let sums = [Place::V(0), Place::V(1)];
             let count = tile.count;
-            let mut pass = |label: &str,
-                            pipeline: &wgpu::RenderPipeline,
-                            bind: &wgpu::BindGroup,
-                            targets: &[&wgpu::TextureView],
+            let mut pass = |label: &'static str,
+                            pipe: Pipe,
+                            group: Group,
+                            targets: &[Place],
                             area: Rect,
                             block: Option<Block>| {
                 if let Some(block) = block.filter(|_| blocks > 0) {
-                    draw(
-                        encoder,
-                        block.label,
-                        block.pipeline,
-                        block.bind,
+                    draws.push(RefineDraw {
+                        label: block.label,
+                        pipe: block.pipe,
+                        group: block.group,
+                        targets: sums[..targets.len()].to_vec(),
                         offset,
-                        &sums[..targets.len()],
-                        block_area(area, block.down, plan.cells, count),
-                    );
-                    drawn += 1;
+                        area: block_area(area, block.down, plan.cells, count),
+                        unit: texel_cost(block.pipe, cell, box_reads),
+                    });
                 }
-                draw(encoder, label, pipeline, bind, offset, targets, area);
-                drawn += 1;
+                draws.push(RefineDraw {
+                    label,
+                    pipe,
+                    group,
+                    targets: targets.to_vec(),
+                    offset,
+                    area,
+                    unit: texel_cost(pipe, cell, box_reads),
+                });
             };
-            fn pair<'a>(a: &'a FloatTarget, b: &'a FloatTarget) -> [&'a wgpu::TextureView; 2] {
-                [&a.view, &b.view]
-            }
+            let pair = |a: Place, b: Place| [a, b];
             let work = tile.work;
             // The moments of the source over the cells the gathers work
             // over, unless the targets hold them there already: over the
@@ -1031,35 +1209,33 @@ impl RefinePass {
                 Some(had) => (strips(join(had.area, work), had.area), false),
                 None => (vec![work], true),
             };
-            let (r, s) = (&scratch.r, &scratch.s);
-            let cells = &binds.cells;
             for &over in &moments {
                 let label = |whole_label: &'static str, strip_label: &'static str| {
                     if whole { whole_label } else { strip_label }
                 };
-                if let Some(source) = &self.source {
+                if self.source.is_some() {
                     pass(
                         label("refine source", "refine source strip"),
-                        source,
-                        cells,
-                        &[&r[0].view, &r[1].view, &r[2].view],
+                        Pipe::Source,
+                        Group::Cells,
+                        &[Place::R(0), Place::R(1), Place::R(2)],
                         over,
                         None,
                     );
                 } else {
                     pass(
                         label("refine source a", "refine source a strip"),
-                        self.source_a.as_ref().expect("made without a fused source"),
-                        cells,
-                        &pair(&r[0], &r[1]),
+                        Pipe::SourceA,
+                        Group::Cells,
+                        &pair(Place::R(0), Place::R(1)),
                         over,
                         None,
                     );
                     pass(
                         label("refine source b", "refine source b strip"),
-                        self.source_b.as_ref().expect("made without a fused source"),
-                        cells,
-                        &[&r[2].view],
+                        Pipe::SourceB,
+                        Group::Cells,
+                        &[Place::R(2)],
                         over,
                         None,
                     );
@@ -1079,51 +1255,47 @@ impl RefinePass {
             if boxed.is_none() {
                 pass(
                     "refine source h a",
-                    &self.box_h2,
-                    &binds.source_pair,
-                    &pair(&f[0], &f[1]),
+                    Pipe::BoxH2,
+                    Group::SourcePair,
+                    &pair(Place::F(0), Place::F(1)),
                     work,
                     Block::across(
                         "refine source h a block",
-                        &self.block_h2,
-                        &binds.block_source_pair,
+                        Pipe::BlockH2,
+                        Group::BlockSourcePair,
                     ),
                 );
                 pass(
                     "refine source h b",
-                    &self.box_h1,
-                    &binds.source_one,
-                    &[&f[2].view],
+                    Pipe::BoxH1,
+                    Group::SourceOne,
+                    &[Place::F(2)],
                     work,
                     Block::across(
                         "refine source h b block",
-                        &self.block_h1,
-                        &binds.block_source_one,
+                        Pipe::BlockH1,
+                        Group::BlockSourceOne,
                     ),
                 );
                 pass(
                     "refine source v a",
-                    &self.box_v2,
-                    &binds.far_pair,
-                    &pair(&s[0], &s[1]),
+                    Pipe::BoxV2,
+                    Group::FarPair,
+                    &pair(Place::S(0), Place::S(1)),
                     work,
                     Block::down(
                         "refine source v a block",
-                        &self.block_v2,
-                        &binds.block_far_pair,
+                        Pipe::BlockV2,
+                        Group::BlockFarPair,
                     ),
                 );
                 pass(
                     "refine source v b",
-                    &self.box_v1,
-                    &binds.far_one,
-                    &[&s[2].view],
+                    Pipe::BoxV1,
+                    Group::FarOne,
+                    &[Place::S(2)],
                     work,
-                    Block::down(
-                        "refine source v b block",
-                        &self.block_v1,
-                        &binds.block_far_one,
-                    ),
+                    Block::down("refine source v b block", Pipe::BlockV1, Group::BlockFarOne),
                 );
             }
             for gather in 0..GATHERS {
@@ -1132,87 +1304,87 @@ impl RefinePass {
                     // of every gather reads from f2.
                     pass(
                         "refine gather first",
-                        &self.gather_first,
-                        &binds.cells,
-                        &pair(&f[0], &f[2]),
+                        Pipe::GatherFirst,
+                        Group::Cells,
+                        &pair(Place::F(0), Place::F(2)),
                         work,
                         None,
                     );
                     pass(
                         "refine gather h2",
-                        &self.box_h2,
-                        &binds.gather_across,
-                        &pair(&f[1], g),
+                        Pipe::BoxH2,
+                        Group::GatherAcross,
+                        &pair(Place::F(1), Place::G),
                         work,
                         Block::across(
                             "refine gather h2 block",
-                            &self.block_h2,
-                            &binds.block_gather_across,
+                            Pipe::BlockH2,
+                            Group::BlockGatherAcross,
                         ),
                     );
                     pass(
                         "refine gather v2",
-                        &self.box_v2,
-                        &binds.cells,
-                        &pair(&f[0], &f[2]),
+                        Pipe::BoxV2,
+                        Group::Cells,
+                        &pair(Place::F(0), Place::F(2)),
                         work,
-                        Block::down("refine gather v2 block", &self.block_v2, &binds.block_cells),
+                        Block::down("refine gather v2 block", Pipe::BlockV2, Group::BlockCells),
                     );
                 } else {
                     // q moved from what the gather before solved, pixel by
                     // pixel, as the moments are summed.
                     pass(
                         "refine gather",
-                        &self.gather_moved,
-                        &binds.moving,
-                        &[&f[0].view],
+                        Pipe::GatherMoved,
+                        Group::Moving,
+                        &[Place::F(0)],
                         work,
                         None,
                     );
                     pass(
                         "refine gather h1",
-                        &self.box_h1,
-                        &binds.gather_across,
-                        &[&f[1].view],
+                        Pipe::BoxH1,
+                        Group::GatherAcross,
+                        &[Place::F(1)],
                         work,
                         Block::across(
                             "refine gather h1 block",
-                            &self.block_h1,
-                            &binds.block_gather_across,
+                            Pipe::BlockH1,
+                            Group::BlockGatherAcross,
                         ),
                     );
                     pass(
                         "refine gather v1",
-                        &self.box_v1,
-                        &binds.cells,
-                        &[&f[0].view],
+                        Pipe::BoxV1,
+                        Group::Cells,
+                        &[Place::F(0)],
                         work,
-                        Block::down("refine gather v1 block", &self.block_v1, &binds.block_cells),
+                        Block::down("refine gather v1 block", Pipe::BlockV1, Group::BlockCells),
                     );
                 }
-                if let Some(solve) = &self.solve {
+                if self.solve.is_some() {
                     pass(
                         "refine solve",
-                        solve,
-                        &binds.solve,
-                        &[&v[0].view, &v[1].view, &v[2].view, &v[3].view],
+                        Pipe::Solve,
+                        Group::Solve,
+                        &[Place::V(0), Place::V(1), Place::V(2), Place::V(3)],
                         work,
                         None,
                     );
                 } else {
                     pass(
                         "refine solve a",
-                        self.solve_a.as_ref().expect("made without a fused solve"),
-                        &binds.solve,
-                        &pair(&v[0], &v[1]),
+                        Pipe::SolveA,
+                        Group::Solve,
+                        &pair(Place::V(0), Place::V(1)),
                         work,
                         None,
                     );
                     pass(
                         "refine solve b",
-                        self.solve_b.as_ref().expect("made without a fused solve"),
-                        &binds.solve,
-                        &pair(&v[2], &v[3]),
+                        Pipe::SolveB,
+                        Group::Solve,
+                        &pair(Place::V(2), Place::V(3)),
                         work,
                         None,
                     );
@@ -1220,18 +1392,100 @@ impl RefinePass {
                 if gather + 1 == GATHERS {
                     pass(
                         "refine apply",
-                        &self.apply,
-                        &binds.moving,
-                        &[&refined.alpha],
+                        Pipe::Apply,
+                        Group::Moving,
+                        &[Place::Refined],
                         tile.out,
                         None,
                     );
                 }
             }
         }
-        self.refine_passes = self.refine_passes.wrapping_add(drawn);
         self.refine_tiles = self.refine_tiles.wrapping_add(tiles.len() as u32);
-        tiles.len() as u32
+        RefineWork {
+            draws,
+            tiles: tiles.len() as u32,
+        }
+    }
+
+    /// Draws rows `from` to `to` of the rectangle of `pass`, a pass of a
+    /// refine [`lay_out`](Self::lay_out) laid out with this scratch and
+    /// refined alpha. The rows of a pass drawn in any number of strips, in
+    /// order or not, leave its targets as the whole pass does.
+    pub(crate) fn draw_rows(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scratch: &Scratch,
+        refined: &Refined,
+        pass: &RefineDraw,
+        from: u32,
+        to: u32,
+    ) {
+        if from >= to {
+            return;
+        }
+        let (id, binds) = refined.binds.as_ref().expect("laid out above");
+        debug_assert_eq!(*id, scratch.id, "laid out with this scratch");
+        let pipeline = match pass.pipe {
+            Pipe::Source => self.source.as_ref().expect("made with a fused source"),
+            Pipe::SourceA => self.source_a.as_ref().expect("made without a fused source"),
+            Pipe::SourceB => self.source_b.as_ref().expect("made without a fused source"),
+            Pipe::GatherFirst => &self.gather_first,
+            Pipe::GatherMoved => &self.gather_moved,
+            Pipe::BoxH2 => &self.box_h2,
+            Pipe::BoxV2 => &self.box_v2,
+            Pipe::BoxH1 => &self.box_h1,
+            Pipe::BoxV1 => &self.box_v1,
+            Pipe::BlockH2 => &self.block_h2,
+            Pipe::BlockV2 => &self.block_v2,
+            Pipe::BlockH1 => &self.block_h1,
+            Pipe::BlockV1 => &self.block_v1,
+            Pipe::Solve => self.solve.as_ref().expect("made with a fused solve"),
+            Pipe::SolveA => self.solve_a.as_ref().expect("made without a fused solve"),
+            Pipe::SolveB => self.solve_b.as_ref().expect("made without a fused solve"),
+            Pipe::Apply => &self.apply,
+        };
+        let bind = match pass.group {
+            Group::Cells => &binds.cells,
+            Group::SourcePair => &binds.source_pair,
+            Group::SourceOne => &binds.source_one,
+            Group::FarPair => &binds.far_pair,
+            Group::FarOne => &binds.far_one,
+            Group::GatherAcross => &binds.gather_across,
+            Group::Solve => &binds.solve,
+            Group::Moving => &binds.moving,
+            Group::BlockCells => &binds.block_cells,
+            Group::BlockSourcePair => &binds.block_source_pair,
+            Group::BlockSourceOne => &binds.block_source_one,
+            Group::BlockFarPair => &binds.block_far_pair,
+            Group::BlockFarOne => &binds.block_far_one,
+            Group::BlockGatherAcross => &binds.block_gather_across,
+        };
+        let targets: Vec<&wgpu::TextureView> = pass
+            .targets
+            .iter()
+            .map(|place| match *place {
+                Place::R(i) => &scratch.r[i].view,
+                Place::S(i) => &scratch.s[i].view,
+                Place::F(i) => &scratch.f[i].view,
+                Place::G => &scratch.g.view,
+                Place::V(i) => &scratch.v[i].view,
+                Place::Refined => &refined.alpha,
+            })
+            .collect();
+        let (x, y, width, _) = pass.area;
+        draw(
+            encoder,
+            pass.label,
+            pipeline,
+            bind,
+            pass.offset,
+            &targets,
+            (x, y + from, width, to - from),
+        );
+        if from == 0 {
+            self.refine_passes = self.refine_passes.wrapping_add(1);
+        }
     }
 }
 

@@ -155,14 +155,18 @@ impl Viewer {
             self.develop.set_overlay(overlay);
             session.develop_dirty = true;
         }
+        // Once what is seen leaves the rendered window, the window built
+        // ahead of the pan is taken when it holds what is seen.
         let target = match plan {
             Some(plan) => Target::Window(ViewWindow {
                 full: plan.full,
-                window: plan.window(self.window_rendered()),
+                window: plan.window_or_ahead(self.window_rendered(), self.develop.window_ahead()),
                 visible: plan.visible,
             }),
             None => Target::Whole(wanted),
         };
+        // What the last render showed, for the direction of a pan.
+        let previous = self.rendered;
         let nearest = plan.is_some_and(|plan| plan.nearest);
         let mut has_picture = false;
         if session.photo.is_some() {
@@ -175,6 +179,9 @@ impl Viewer {
             }
         } else {
             self.show_placeholder(wanted);
+        }
+        if has_picture && let Some(plan) = plan {
+            self.build_ahead(&plan, previous, session);
         }
 
         // Zoomed, the texture holds only what is seen and goes where that
@@ -228,6 +235,45 @@ impl Viewer {
         }
         self.show_photo(target, nearest, session);
         true
+    }
+
+    /// Builds the window a pan will reach ahead of it, from the step between
+    /// what the render before showed and what this one shows, when the view
+    /// moved inside the same picture size. A window already built or
+    /// building for where the pan leaves is kept; the graph builds it again
+    /// only when the edit moved the frame it needs. The graph records one
+    /// slice of that frame a call, so this runs once a UI frame while it is
+    /// building, through a pause in the pan too, and asks for the next UI
+    /// frame until the last slice is submitted.
+    fn build_ahead(&mut self, plan: &RenderPlan, previous: Option<Target>, session: &mut Session) {
+        let (Some(Target::Window(before)), Some(Target::Window(now))) = (previous, self.rendered)
+        else {
+            return;
+        };
+        // A step of more than the pad is a jump, not a pan.
+        if before.full != now.full
+            || before.visible.0.abs_diff(now.visible.0) > plan.pad.0
+            || before.visible.1.abs_diff(now.visible.1) > plan.pad.1
+        {
+            return;
+        }
+        let built = self
+            .develop
+            .window_ahead()
+            .filter(|(full, _)| *full == now.full)
+            .map(|(_, window)| window);
+        let wanted = if before.visible == now.visible {
+            // The pan paused: a frame ahead still building goes on.
+            built.filter(|_| self.develop.ahead_building())
+        } else {
+            plan.ahead(now.window, before.visible, built)
+        };
+        if let Some(ahead) = wanted {
+            self.develop.build_ahead(&session.edit, now.full, ahead);
+            if self.develop.ahead_building() {
+                session.repaint_wanted = true;
+            }
+        }
     }
 
     /// The window the develop graph holds, for a zoomed view to keep.

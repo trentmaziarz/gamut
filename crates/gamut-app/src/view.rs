@@ -19,7 +19,7 @@
 
 use egui::{Pos2, Rect, Vec2};
 
-pub use gamut_gpu::develop::{PixelRect, holds, padded_window};
+pub use gamut_gpu::develop::{PixelRect, holds, padded_window, pan_exit, window_ahead};
 
 use crate::viewer::fit_aspect;
 
@@ -491,9 +491,48 @@ impl RenderPlan {
     /// padded one otherwise. From 100 percent up the picture size no longer
     /// changes, so zooming further in keeps the window too.
     pub fn window(&self, rendered: Option<((u32, u32), PixelRect)>) -> PixelRect {
-        match rendered {
-            Some((full, window)) if full == self.full && holds(window, self.visible) => window,
-            _ => padded_window(self.full, self.visible, self.pad, self.grid),
+        self.window_or_ahead(rendered, None)
+    }
+
+    /// [`window`](Self::window), with the window built ahead of a pan taken
+    /// once what is seen leaves the rendered one and lies inside it, so the
+    /// frame built for it is swapped in rather than a new one replaced.
+    pub fn window_or_ahead(
+        &self,
+        rendered: Option<((u32, u32), PixelRect)>,
+        ahead: Option<((u32, u32), PixelRect)>,
+    ) -> PixelRect {
+        let holding = |held: Option<((u32, u32), PixelRect)>| {
+            held.filter(|(full, window)| *full == self.full && holds(*window, self.visible))
+                .map(|(_, window)| window)
+        };
+        holding(rendered)
+            .or_else(|| holding(ahead))
+            .unwrap_or_else(|| padded_window(self.full, self.visible, self.pad, self.grid))
+    }
+
+    /// The window to build ahead of a pan that moved what is seen from
+    /// `previous` to this plan's `visible` inside `window`: the one held
+    /// ahead, `built`, while it holds where the pan will leave `window`, a
+    /// new one otherwise. `None` while the pan does not move or never
+    /// leaves `window`.
+    pub fn ahead(
+        &self,
+        window: PixelRect,
+        previous: PixelRect,
+        built: Option<PixelRect>,
+    ) -> Option<PixelRect> {
+        let exit = pan_exit(self.full, window, previous, self.visible)?;
+        match built {
+            Some(built) if holds(built, exit) => Some(built),
+            _ => window_ahead(
+                self.full,
+                window,
+                previous,
+                self.visible,
+                self.pad,
+                self.grid,
+            ),
         }
     }
 }
@@ -791,7 +830,7 @@ mod tests {
     #[test]
     fn the_padded_window_is_snapped_to_the_grid() {
         let window = padded_window((6000, 4000), (2551, 1651, 901, 701), (450, 350), 64);
-        assert_eq!(window, (2048, 1280, 1856, 1472));
+        assert_eq!(window, (2048, 1280, 1920, 1472));
         for edge in [window.0, window.1, window.0 + window.2, window.1 + window.3] {
             assert_eq!(edge % 64, 0);
         }
@@ -799,11 +838,14 @@ mod tests {
 
     #[test]
     fn the_padded_window_never_leaves_the_photo() {
+        // At an edge the window is moved inside the photo, at the size of a
+        // window away from the edges, and still holds what is seen.
         let corner = padded_window((6000, 4000), (5099, 3299, 901, 701), (450, 350), 64);
-        assert_eq!(corner, (4608, 2944, 1392, 1056));
+        assert_eq!(corner, (4080, 2528, 1920, 1472));
         assert!(holds((0, 0, 6000, 4000), corner));
+        assert!(holds(corner, (5099, 3299, 901, 701)));
         let origin = padded_window((6000, 4000), (0, 0, 901, 701), (450, 350), 64);
-        assert_eq!((origin.0, origin.1), (0, 0));
+        assert_eq!(origin, (0, 0, 1920, 1472));
         // A picture smaller than the pad is its own window.
         assert_eq!(
             padded_window((300, 200), (0, 0, 300, 200), (450, 350), 64),
@@ -828,6 +870,58 @@ mod tests {
         let replaced = far.window(rendered);
         assert_ne!(replaced, window);
         assert!(holds(replaced, far.visible));
+    }
+
+    #[test]
+    fn a_steady_pan_keeps_its_window_ahead_and_takes_it_on_leaving() {
+        let mut view = at(1.0, [0.5, 0.5]);
+        let mut plan = self::plan(&view, 1.0);
+        let window = plan.window(None);
+        let rendered = Some((plan.full, window));
+        let mut built: Option<PixelRect> = None;
+        let mut steps = 0;
+        loop {
+            let previous = plan.visible;
+            view = view.panned(tab(), SOURCE, 1.0, Vec2::new(-32.0, 0.0));
+            plan = self::plan(&view, 1.0);
+            steps += 1;
+            assert!(steps < 100, "the pan leaves the window");
+            if !holds(window, plan.visible) {
+                break;
+            }
+            // The rendered window is kept while it holds what is seen.
+            assert_eq!(plan.window_or_ahead(rendered, None), window);
+            let ahead = plan
+                .ahead(window, previous, built)
+                .expect("a moving pan leaves the window");
+            if let Some(built) = built {
+                assert_eq!(ahead, built, "the window ahead is kept at step {steps}");
+            }
+            assert!(
+                ahead.0 + ahead.2 > window.0 + window.2,
+                "{ahead:?} lies ahead"
+            );
+            built = Some(ahead);
+        }
+        let ahead = built.expect("chosen before the pan left");
+        // Out of the rendered window, the window ahead is taken; without one
+        // a new padded window replaces it.
+        assert!(holds(ahead, plan.visible));
+        assert_eq!(
+            plan.window_or_ahead(rendered, Some((plan.full, ahead))),
+            ahead
+        );
+        assert_eq!(
+            plan.window_or_ahead(rendered, None),
+            padded_window(plan.full, plan.visible, plan.pad, plan.grid)
+        );
+        // A window ahead at another picture size is never taken.
+        assert_ne!(
+            plan.window_or_ahead(rendered, Some(((3000, 2000), ahead))),
+            ahead
+        );
+        // A view that did not move chooses none.
+        assert_eq!(plan.ahead(ahead, plan.visible, None), None);
     }
 
     #[test]
