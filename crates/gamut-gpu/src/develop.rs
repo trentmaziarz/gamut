@@ -512,6 +512,21 @@ struct Frame {
     edge_scratch: EdgeScratch,
 }
 
+/// The scratch a refine drew with, as [`Develop::refine_last_hold`] reads
+/// it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefineHold {
+    /// The cells a side the targets of the scratch hold.
+    pub size: (u32, u32),
+    /// The most cells a side a tile of the refine held.
+    pub side: u32,
+    /// Whether the scratch was made for this refine.
+    pub made: bool,
+    /// The branch of the rule: First, Fits, Cut or Floor.
+    pub branch: &'static str,
+}
+
 /// Which alpha of a mask the develop pass and the overlay read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Product {
@@ -1006,6 +1021,33 @@ impl Develop {
     #[doc(hidden)]
     pub fn mask_alpha_builds(&self) -> u64 {
         self.alpha_builds
+    }
+
+    /// The scratch the last refine of this graph drew with: the cells a side
+    /// it holds, the side its tiles were cut at, whether it was made for
+    /// that refine, and the branch of the rule that gave it. `None` before
+    /// any refine. A test reads it to hold two masks at different steps
+    /// inside the budget.
+    #[doc(hidden)]
+    pub fn refine_last_hold(&self) -> Option<RefineHold> {
+        self.refine.last_hold.map(|hold| RefineHold {
+            size: hold.size,
+            side: hold.side,
+            made: hold.made,
+            branch: hold.branch.name(),
+        })
+    }
+
+    /// The refined alpha of mask `index` on the frame of the last render,
+    /// and the size of that frame. `None` while the mask has Refine edges
+    /// off. A test reads its bytes to hold a refine beside another mask to
+    /// the same refine alone.
+    #[doc(hidden)]
+    pub fn refined_alpha(&self, index: usize) -> Option<(&wgpu::TextureView, (u32, u32))> {
+        let frame = self.frame.as_ref()?;
+        let slot = frame.masks.get(index)?.as_ref()?;
+        let refined = slot.refined.as_ref()?;
+        Some((&refined.alpha, (frame.width, frame.height)))
     }
 
     /// How many brush layers have been stamped whole since the graph was

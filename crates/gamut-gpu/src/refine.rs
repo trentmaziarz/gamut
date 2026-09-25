@@ -215,6 +215,18 @@ pub(crate) enum Branch {
     Floor,
 }
 
+impl Branch {
+    /// The name of the branch, as a test reads it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Branch::First => "First",
+            Branch::Fits => "Fits",
+            Branch::Cut => "Cut",
+            Branch::Floor => "Floor",
+        }
+    }
+}
+
 /// The size of the scratch a plan draws with, the side its tiles are cut
 /// at, whether the scratch is made for it, and by which branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -634,6 +646,9 @@ pub(crate) struct RefinePass {
     /// Every box sums its cells in the direct loop, whatever its size, so a
     /// test can hold the block sums to it.
     direct_box: bool,
+    /// What [`hold`] gave the last plan drawn, so a test can read the size
+    /// of the scratch and the side of the tiles.
+    pub(crate) last_hold: Option<Hold>,
 }
 
 const SHADER: &str = include_str!("shaders/refine.wgsl");
@@ -754,6 +769,7 @@ impl RefinePass {
             refine_passes: 0,
             refine_tiles: 0,
             direct_box: false,
+            last_hold: None,
         }
     }
 
@@ -828,6 +844,7 @@ impl RefinePass {
     ) -> u32 {
         let held = scratch.as_ref().map(|held| held.size);
         let hold = hold(held, plan, self.scratch_budget);
+        self.last_hold = Some(hold);
         if hold.made {
             let size = hold.size;
             if let (Branch::Floor, Some(held)) = (hold.branch, held) {
