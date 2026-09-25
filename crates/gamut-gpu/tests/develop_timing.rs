@@ -29,7 +29,8 @@
 //! crosses the edge of the window at least three times, with the window
 //! ahead of it built as the viewer builds it, one slice a frame. It holds
 //! that no crossing replaces the window in one submit, and its p95 and its
-//! maximum are held to the gate.
+//! maximum are held to the gate. The frame it leaves built ahead is dropped
+//! after it, so the lines after it time renders that hold one frame.
 //!
 //! The auto brush comes after it: a sixth mask that is a brush of 500 auto
 //! strokes of 50 points, a third of them painted with a pen whose pressure
@@ -1182,6 +1183,22 @@ fn develop_at_viewer_size_is_fast_enough() {
             pan.crossings
         );
         edge_pan = Some((p95, max));
+
+        // The frame the pan left built ahead is dropped, as a render at
+        // another zoom drops it, so the lines after this one time renders
+        // that hold one frame, as they did before the build ahead.
+        let dropped = develop.drop_ahead();
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the drop");
+        println!(
+            "the frame built ahead after the pan across the window edge: dropped {dropped}, held now {}",
+            develop.window_ahead().is_some()
+        );
+        assert!(
+            develop.window_ahead().is_none(),
+            "no frame built ahead is held after the pan"
+        );
     }
 
     // The auto brush, over all of that: a sixth mask of 500 auto strokes, a

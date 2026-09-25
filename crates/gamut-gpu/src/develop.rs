@@ -81,13 +81,12 @@ use gamut_core::mask::{
 use gamut_core::{Adjustments, CropRect, ExportPreset, PhotoEdit};
 use gamut_media::{FramePlanes, Photo};
 
-use crate::brush_layer::{AutoInputs, BrushPass, Drawn, LayerHeld, Layers, has_auto, stamp_texels};
+use crate::brush_layer::{AutoInputs, BrushPass, Drawn, LayerHeld, Layers, has_auto};
 use crate::edge::{
-    EdgePass, EdgePasses, EdgeScratch, EdgeWork, Edged, Held as EdgeHeld, levels as edge_levels,
-    pad as edge_pad,
+    EdgeDraw, EdgePass, EdgePasses, EdgeScratch, EdgeStrip, EdgeWork, Edged, Held as EdgeHeld,
 };
 use crate::proxy::{self, ProxyUniform, Tile};
-use crate::refine::{Held as MomentsHeld, RefinePass, Refined, Scratch};
+use crate::refine::{Held as MomentsHeld, RefineDraw, RefinePass, Refined, Scratch};
 use crate::video::{VideoSource, VideoUniform};
 use crate::{FULLSCREEN_VERTICES, Readback, fullscreen_primitive};
 
@@ -133,20 +132,36 @@ pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// phase moves it on the evidence.
 ///
 /// The mask products of the frame come after its head passes in the same
-/// slices and under the same budget, one product of one mask at a time in
-/// the order a render draws them: the brush layers, the alpha, the refined
-/// alpha, the edge products. Each counts its reads plus its writes the same
-/// way, and a slice records one product at least:
+/// slices and under the same budget, in the order a render draws them: the
+/// brush layers, the alpha, the refined alpha, the edge products. Each is
+/// drawn in parts, each part in the slice the texels left pay for, and a
+/// slice records one part at least: a brush layer in batches of its dabs,
+/// the alpha in strips of rows, and the refined alpha and the edge products
+/// pass by pass, each pass in strips of rows. A part counts its reads plus
+/// its writes the same way:
 ///
-/// - a mask alpha, 2 + b texels a pixel of the region it is drawn over (the
-///   working texture, one layer of each of its b brushes, the write);
-/// - a brush layer, 1 a pixel of the frame for its clear, and 2 a pixel of
-///   each dab's quad, 3 for an auto dab (`stamp_texels`);
-/// - a refined alpha, 39 a pixel of its work, 19 a pixel it writes and
-///   28 c + 62 a cell, c the radius of its box in cells (`refine_texels`);
-/// - the edge products, 3 a pixel of each pass of Shift edge, 1 a pixel and
-///   4 r + 5 a cell for Feather's cells (r its radius in cells), 6 a pixel
-///   for the finished alpha, 2 under Contrast alone (`edge_texels`).
+/// - a strip of a mask alpha, 2 + b texels a pixel (the working texture,
+///   one layer of each of its b brushes, the write);
+/// - a batch of dabs of a brush layer, 2 a pixel of each dab's quad, 3 for
+///   an auto dab, and 1 a pixel of the frame for the clear before the first
+///   dab of a layer stamped whole (`dab_texels` in brush_layer.rs);
+/// - a strip of a pass of Refine edges, per texel of the pass (a cell or,
+///   for the apply, a pixel) what it reads and writes: step squared pixels
+///   and 3 targets for the moments of the source, 18 step squared + 1 for a
+///   moved gather, the cells a box reads and writes, 19 for the apply
+///   (`texel_cost` in refine.rs; over one tile the family sums to 39 a pixel
+///   of its work, 19 a pixel it writes and 28 c + 62 a cell, c the radius of
+///   its box in cells, with every box in the direct loop);
+/// - a strip of a pass of the edge products, 3 a pixel of each pass of Shift
+///   edge, step squared + 1 a cell for Feather's cells and 2 r + 2 a cell for
+///   each of its two blurs (r its radius in cells), 6 a pixel for the
+///   finished alpha, 2 under Contrast alone (`EdgePass::lay_out`).
+///
+/// Before the parts, the brush layer of the Gate case rode one slice whole:
+/// its 500 strokes counted 663,072,392 to 1,281,952,626 texels over the
+/// windows of the pan across the window edge, and the slice took 6.6 to 8.8
+/// ms of the pan's frame. In batches no slice records more of it than the
+/// budget pays for, but for the one dab a slice records at least.
 ///
 /// In the Gate case, four full masks and a brush mask of one layer on the
 /// 3104 by 3744 frame of timing_24mp.jpg at 100 percent, the five alphas
@@ -614,6 +629,52 @@ struct AheadBuild {
     /// build: each is held on the frame, its key set once the slice that
     /// drew it was submitted. A slice given another edit looks again.
     products: bool,
+    /// The mask product the slices drew part of and did not finish, and how
+    /// far they got, written once the slice is submitted.
+    partial: Option<Partial>,
+}
+
+/// A mask product of a frame built ahead that the slices submitted so far
+/// drew part of: its key, which it claims only once its last part is
+/// submitted, what it was laid out as, and how far the slices got. The next
+/// slice goes on with it while the edit still wants it and nothing else was
+/// drawn into the frame since; otherwise the product is drawn again from its
+/// start. A brush layer keeps its own (see [`Layers::stamp_batch`]).
+enum Partial {
+    /// The alpha of mask `mask`, drawn over `region` for `shape` down to
+    /// row `row` of the region.
+    Alpha {
+        mask: usize,
+        shape: MaskShape,
+        region: PixelRect,
+        row: u32,
+    },
+    /// The refined alpha of mask `mask`: `refine` over `region` in the
+    /// scratch `scratch`, laid out as `draws`, drawn up to row `at.1` of pass
+    /// `at.0`, and the moments the scratch holds once every pass is drawn.
+    Refined {
+        mask: usize,
+        refine: Refine,
+        region: PixelRect,
+        plan: Plan,
+        scratch: u64,
+        draws: Vec<RefineDraw>,
+        at: (usize, u32),
+        moments: Option<(u64, MomentsHeld)>,
+    },
+    /// The edge products of mask `mask` for `held`, with the edge scratch as
+    /// `scratch` counts it made and the product `product`, laid out as
+    /// `draws` and drawn up to row `at.1` of pass `at.0`; which of the three
+    /// stages they draw.
+    Edged {
+        mask: usize,
+        held: EdgeHeld,
+        scratch: u64,
+        product: u64,
+        stages: [bool; 3],
+        draws: Vec<EdgeDraw>,
+        at: (usize, u32),
+    },
 }
 
 impl AheadBuild {
@@ -1536,6 +1597,14 @@ impl Develop {
         self.ahead_slices
     }
 
+    /// Drops the frame built ahead, complete or still building, as a render
+    /// at another zoom drops it. Whether one was held. A test drops it after
+    /// a pan, so the renders it times next hold one frame.
+    #[doc(hidden)]
+    pub fn drop_ahead(&mut self) -> bool {
+        self.next.take().is_some()
+    }
+
     /// Sets how many texels one slice of a frame built ahead records at most,
     /// [`AHEAD_SLICE_TEXELS`] until set. A slice records one row of a pass at
     /// least, so 1 records one row a slice and `u64::MAX` the whole frame in
@@ -1929,6 +1998,7 @@ impl Develop {
                     row: 0,
                     content: None,
                     products: false,
+                    partial: None,
                 },
             });
         }
@@ -1969,6 +2039,9 @@ impl Develop {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("develop ahead encoder"),
             });
+        // The product the slices before left unfinished, written back once
+        // this slice is submitted.
+        let mut partial = next.build.partial.take();
         let build = &next.build;
         let mut budget = self.ahead_slice_texels;
         // What the slice records: strips of the head passes, then products.
@@ -1997,8 +2070,9 @@ impl Develop {
                     // From this strip on the working texture holds other
                     // pixels, so this frame forgets what its products hold of
                     // it, and its auto layers; the current frame keeps its
-                    // own.
+                    // own. A product left unfinished is drawn again.
                     forget_products(&mut next.frame, true);
+                    partial = None;
                 }
             }
             let load = if row_at == 0 {
@@ -2044,6 +2118,7 @@ impl Develop {
                 &mut budget,
                 &mut recorded,
                 &mut claims,
+                &mut partial,
             );
         if recorded > 0 {
             self.queue.submit(Some(encoder.finish()));
@@ -2073,6 +2148,7 @@ impl Develop {
             claim.apply(frame);
         }
         build.products = products;
+        build.partial = partial;
         let complete = build.complete();
         self.next = Some(next);
         // A call that finds a complete frame and records nothing completes
@@ -2081,19 +2157,25 @@ impl Develop {
     }
 
     /// Records into `encoder` the mask products of a frame built ahead that
-    /// `products.edit` wants and the frame does not hold, one product of one
-    /// mask at a time in the order a render draws them, while the texels
-    /// `budget` has left pay for the next one (see [`AHEAD_SLICE_TEXELS`]); a
-    /// slice records one at least, counted in `recorded`. Each is drawn whole,
-    /// as a render draws it on a new frame, with the arithmetic of that
-    /// render, and its key goes to `claims`, for the slice to set once it is
-    /// submitted. Whether no product is left to build.
+    /// `products.edit` wants and the frame does not hold, in the order a
+    /// render draws them, in parts while the texels `budget` has left pay for
+    /// the next part (see [`AHEAD_SLICE_TEXELS`]); a slice records one part
+    /// at least, counted in `recorded`. A brush layer goes a batch of dabs at
+    /// a time, an alpha a strip of rows, a refined alpha and the edge
+    /// products a strip of rows of one of their passes, each pass laid out
+    /// as a render lays it out on a new frame, with the arithmetic of that
+    /// render. A product the slice does not finish is left in `partial`, and
+    /// the next slice goes on with it. Once its last part is recorded its
+    /// key goes to `claims`, for the slice to set once it is submitted; a key
+    /// claims nothing while its product is drawn in parts. Whether no product
+    /// is left to build.
     ///
     /// Nothing is built while the working texture holds another content than
     /// the source (a video frame arrived during the build): the swap's render
     /// runs the head passes again and draws every product with them. An auto
     /// layer waits for the proxy of the content the working texture holds,
     /// which the current frame's render builds; no product is built past it.
+    #[allow(clippy::too_many_arguments)]
     fn ahead_products(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2101,6 +2183,7 @@ impl Develop {
         budget: &mut u64,
         recorded: &mut u32,
         claims: &mut Vec<Claim>,
+        partial: &mut Option<Partial>,
     ) -> bool {
         let AheadProducts {
             frame,
@@ -2157,9 +2240,6 @@ impl Develop {
             developed,
             developed_other,
         };
-        // The next product fits while the slice has recorded none yet or the
-        // texels left pay for it.
-        let fits = |cost: u64, budget: u64, recorded: u32| recorded == 0 || cost <= budget;
         for (index, mask) in drawn {
             let want = MaskWant::of(mask, work.window, work.sigma_size, size, region);
             let passes = MaskPasses {
@@ -2174,7 +2254,7 @@ impl Develop {
                 .get_or_insert_with(|| passes.frame_mask(reads, want.brushes.len(), size));
 
             // The brush layers: those that do not hold their brush, stamped
-            // whole or by the dabs added since.
+            // whole or by the dabs added since, a batch of dabs at a time.
             if slot.layers.len() != want.brushes.len() {
                 slot.layers = Layers::new(&self.device, want.brushes.len(), width, height);
                 slot.raster_bind = passes.raster_bind(working, &slot.layers);
@@ -2193,13 +2273,8 @@ impl Develop {
                 if proxy.is_none() && stale.iter().any(|layer| has_auto(want.brushes[*layer])) {
                     return false;
                 }
-                let cost = stale
-                    .iter()
-                    .map(|layer| pixels(frame_rect) + stamp_texels(want.brushes[*layer], &geometry))
-                    .sum();
-                if !fits(cost, *budget, *recorded) {
-                    return false;
-                }
+                // The alpha reads the layers: it is drawn again after them.
+                slot.shape = None;
                 for &layer in &stale {
                     let brush = want.brushes[layer];
                     let auto = proxy.filter(|_| has_auto(brush)).map(|proxy| AutoInputs {
@@ -2207,7 +2282,7 @@ impl Develop {
                         working: &working.view,
                         generation: proxy.id,
                     });
-                    let drawn = slot.layers.update(
+                    let Some(batch) = slot.layers.stamp_batch(
                         layer,
                         &self.device,
                         &self.queue,
@@ -2216,11 +2291,25 @@ impl Develop {
                         brush,
                         &geometry,
                         auto,
-                    );
-                    match drawn {
+                        *budget,
+                        *recorded == 0,
+                    ) else {
+                        return false;
+                    };
+                    if batch.recorded {
+                        // Another product than the one left unfinished is
+                        // drawn: that one starts again.
+                        *partial = None;
+                        *budget = budget.saturating_sub(batch.texels);
+                        *recorded += 1;
+                    }
+                    match batch.drawn {
                         Drawn::Nothing => {}
                         Drawn::Appended(_) => self.layer_appends += 1,
                         Drawn::Whole => self.layer_builds += 1,
+                    }
+                    if !batch.done {
+                        return false;
                     }
                     if let Some(held) = slot.layers.take_held(layer) {
                         claims.push(Claim::Layer {
@@ -2230,110 +2319,224 @@ impl Develop {
                         });
                     }
                 }
-                // The alpha reads the layers: it is drawn again after them.
-                slot.shape = None;
-                *budget = budget.saturating_sub(cost);
-                *recorded += 1;
             }
 
-            // The alpha of the components, drawn whole.
+            // The alpha of the components, drawn in strips of rows over its
+            // region: the first clears the alpha, as the whole pass does, and
+            // the strips after it draw over what it holds.
             if slot.shape.as_ref() != Some(&want.shape)
                 || !holds(slot.alpha_region, want.alpha_region)
             {
-                let cost = pixels(want.alpha_region) * (2 + want.brushes.len() as u64);
-                if !fits(cost, *budget, *recorded) {
+                let area = want.alpha_region;
+                let per_row = u64::from(area.2) * (2 + want.brushes.len() as u64);
+                let from = match &*partial {
+                    Some(Partial::Alpha {
+                        mask: at,
+                        shape,
+                        region,
+                        row,
+                    }) if *at == index && *shape == want.shape && *region == area => *row,
+                    _ => 0,
+                };
+                let left = area.3 - from;
+                let rows = rows_in_budget(per_row, left, *budget, *recorded);
+                if left > 0 && rows == 0 {
                     return false;
+                }
+                if from == 0 {
+                    // The alpha is drawn again, and Refine edges and the edge
+                    // controls read it: none of the three claims anything
+                    // until the slice of its last strip is submitted.
+                    *partial = None;
+                    slot.shape = None;
+                    slot.refine = None;
+                    if let Some(edged) = slot.edged.as_mut() {
+                        edged.held = None;
+                    }
                 }
                 self.queue.write_buffer(
                     passes.mask_uniform,
                     0,
                     bytemuck::bytes_of(&MaskUniform::new(mask, &geometry)),
                 );
-                draw(
+                let load = if from == 0 {
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                draw_loading(
                     encoder,
                     "mask alpha",
                     &self.mask.pipeline,
                     &slot.raster_bind,
                     &slot.alpha.view,
-                    Some(want.alpha_region),
+                    Some((area.0, area.1 + from, area.2, rows)),
+                    load,
                 );
+                *budget = budget.saturating_sub(u64::from(rows) * per_row);
+                *recorded += 1;
+                if from + rows < area.3 {
+                    *partial = Some(Partial::Alpha {
+                        mask: index,
+                        shape: want.shape.clone(),
+                        region: area,
+                        row: from + rows,
+                    });
+                    return false;
+                }
+                *partial = None;
                 self.alpha_builds += 1;
                 claims.push(Claim::Alpha {
                     mask: index,
                     shape: want.shape.clone(),
-                    region: want.alpha_region,
+                    region: area,
                 });
-                // The alpha is drawn again, and Refine edges and the edge
-                // controls read it: none of the three claims anything until
-                // the slice is submitted.
-                slot.shape = None;
-                slot.refine = None;
-                if let Some(edged) = slot.edged.as_mut() {
-                    edged.held = None;
-                }
-                *budget = budget.saturating_sub(cost);
-                *recorded += 1;
             }
 
-            // The refined alpha of Refine edges, drawn whole over its region
-            // in the frame's scratch.
+            // The refined alpha of Refine edges over its region in the
+            // frame's scratch, laid out once and drawn a strip of rows of a
+            // pass at a time.
             match want.plan {
                 None => {
                     slot.refined = None;
                     slot.refine = None;
+                    if matches!(&*partial, Some(Partial::Refined { mask: at, .. }) if *at == index)
+                    {
+                        *partial = None;
+                    }
                 }
                 Some(plan) => {
                     if slot.refine != Some(want.refine)
                         || !holds(slot.refined_region, want.refined_region)
                     {
-                        let cost = refine_texels(&plan, want.refined_region, size);
-                        if !fits(cost, *budget, *recorded) {
+                        let resume = match &*partial {
+                            Some(Partial::Refined {
+                                mask: at,
+                                refine,
+                                region,
+                                plan: laid,
+                                scratch,
+                                ..
+                            }) => {
+                                *at == index
+                                    && *refine == want.refine
+                                    && *region == want.refined_region
+                                    && *laid == plan
+                                    && slot.refined.is_some()
+                                    && refine_scratch.as_ref().map(Scratch::id) == Some(*scratch)
+                            }
+                            _ => false,
+                        };
+                        if !resume {
+                            if *recorded > 0 && *budget == 0 {
+                                return false;
+                            }
+                            *partial = None;
+                            // These passes draw over the frame's scratch: a
+                            // refine this slice finished claims none of the
+                            // moments it took there.
+                            for claim in claims.iter_mut() {
+                                if let Claim::Refined { moments, .. } = claim {
+                                    *moments = None;
+                                }
+                            }
+                            // The edge controls read the refined alpha.
+                            slot.refine = None;
+                            if let Some(edged) = slot.edged.as_mut() {
+                                edged.held = None;
+                            }
+                            let refined = slot.refined.get_or_insert_with(|| {
+                                self.refine
+                                    .refined(&self.device, ALPHA_FORMAT, width, height)
+                            });
+                            let laid = self.refine.lay_out(
+                                &self.device,
+                                &self.queue,
+                                refine_scratch,
+                                refined,
+                                &working.view,
+                                &slot.alpha.view,
+                                &plan,
+                                want.refined_region,
+                            );
+                            // The moments the passes take are the scratch's
+                            // key once the slice of the last is submitted,
+                            // and none until then.
+                            let scratch = refine_scratch.as_mut().expect("laid out above");
+                            let id = scratch.id();
+                            let moments = scratch.take_held().map(|held| (id, held));
+                            *partial = Some(Partial::Refined {
+                                mask: index,
+                                refine: want.refine,
+                                region: want.refined_region,
+                                plan,
+                                scratch: id,
+                                draws: laid.draws,
+                                at: (0, 0),
+                                moments,
+                            });
+                        }
+                        let Some(Partial::Refined { draws, at, .. }) = partial.as_mut() else {
+                            unreachable!("a refine is laid out above");
+                        };
+                        let scratch = refine_scratch.as_ref().expect("laid out above");
+                        let refined = slot.refined.as_ref().expect("laid out above");
+                        while let Some(pass) = draws.get(at.0) {
+                            let left = pass.rows() - at.1;
+                            let rows = rows_in_budget(pass.row_texels(), left, *budget, *recorded);
+                            if left > 0 && rows == 0 {
+                                break;
+                            }
+                            if rows > 0 {
+                                self.refine.draw_rows(
+                                    encoder,
+                                    scratch,
+                                    refined,
+                                    pass,
+                                    at.1,
+                                    at.1 + rows,
+                                );
+                                *budget =
+                                    budget.saturating_sub(u64::from(rows) * pass.row_texels());
+                                *recorded += 1;
+                            }
+                            at.1 += rows;
+                            if at.1 == pass.rows() {
+                                *at = (at.0 + 1, 0);
+                            }
+                        }
+                        if at.0 < draws.len() {
                             return false;
                         }
-                        let refined = slot.refined.get_or_insert_with(|| {
-                            self.refine
-                                .refined(&self.device, ALPHA_FORMAT, width, height)
-                        });
-                        self.refine.run(
-                            &self.device,
-                            &self.queue,
-                            encoder,
-                            refine_scratch,
-                            refined,
-                            &working.view,
-                            &slot.alpha.view,
-                            &plan,
-                            want.refined_region,
-                        );
+                        let Some(Partial::Refined {
+                            refine,
+                            region,
+                            moments,
+                            ..
+                        }) = partial.take()
+                        else {
+                            unreachable!("a refine is laid out above");
+                        };
                         self.refine_builds += 1;
-                        // The moments the run took are the scratch's key
-                        // once the slice is submitted, and none until then.
-                        let moments = refine_scratch.as_mut().and_then(|scratch| {
-                            let id = scratch.id();
-                            scratch.take_held().map(|held| (id, held))
-                        });
                         claims.push(Claim::Refined {
                             mask: index,
-                            refine: want.refine,
-                            region: want.refined_region,
+                            refine,
+                            region,
                             moments,
                         });
-                        slot.refine = None;
-                        // The edge controls read the refined alpha.
-                        if let Some(edged) = slot.edged.as_mut() {
-                            edged.held = None;
-                        }
-                        *budget = budget.saturating_sub(cost);
-                        *recorded += 1;
                     }
                 }
             }
 
-            // The edge products, made or dropped for the plan and drawn whole
-            // from the alpha Refine edges hands on.
+            // The edge products, made or dropped for the plan, laid out from
+            // the alpha Refine edges hands on and drawn a strip of rows of a
+            // pass at a time.
             let edge_plan = want.edge_plan;
             if edge_plan.is_off() {
                 slot.edged = None;
+                if matches!(&*partial, Some(Partial::Edged { mask: at, .. }) if *at == index) {
+                    *partial = None;
+                }
             } else {
                 let refined_input = slot.refined.is_some();
                 let edged = slot
@@ -2344,7 +2547,8 @@ impl Develop {
                 let made = self
                     .edge
                     .prepare(&self.device, edge_scratch, edged, &edge_plan);
-                if made.shifted || made.cells || made.finished {
+                let remade = made.shifted || made.cells || made.finished;
+                if remade {
                     edged.held = None;
                 }
                 let held = EdgeHeld {
@@ -2352,42 +2556,104 @@ impl Develop {
                     refined: refined_input,
                 };
                 if edged.held != Some(held) {
-                    let cost = edge_texels(&edge_plan, size, region);
-                    if !fits(cost, *budget, *recorded) {
-                        return false;
+                    let resume = !remade
+                        && match &*partial {
+                            Some(Partial::Edged {
+                                mask: at,
+                                held: laid,
+                                scratch,
+                                product,
+                                ..
+                            }) => {
+                                *at == index
+                                    && *laid == held
+                                    && *scratch == edge_scratch.made()
+                                    && *product == edged.product_id()
+                            }
+                            _ => false,
+                        };
+                    if !resume {
+                        if *recorded > 0 && *budget == 0 {
+                            return false;
+                        }
+                        *partial = None;
+                        edged.held = None;
+                        let p = &edge_plan;
+                        let work = EdgeWork {
+                            shift: p.shifts().then_some(frame_rect),
+                            feather: p.feathers().then_some(region),
+                            finish: (p.feathers() || p.contrasts()).then_some(region),
+                        };
+                        let draws = self.edge.lay_out(
+                            &self.device,
+                            &self.queue,
+                            edge_scratch,
+                            edged,
+                            p,
+                            &work,
+                        );
+                        *partial = Some(Partial::Edged {
+                            mask: index,
+                            held,
+                            scratch: edge_scratch.made(),
+                            product: edged.product_id(),
+                            stages: [
+                                work.shift.is_some(),
+                                work.feather.is_some(),
+                                work.finish.is_some(),
+                            ],
+                            draws,
+                            at: (0, 0),
+                        });
                     }
-                    let p = &edge_plan;
-                    let work = EdgeWork {
-                        shift: p.shifts().then_some(frame_rect),
-                        feather: p.feathers().then_some(region),
-                        finish: (p.feathers() || p.contrasts()).then_some(region),
+                    let Some(Partial::Edged { draws, at, .. }) = partial.as_mut() else {
+                        unreachable!("the edge products are laid out above");
                     };
-                    for (stage, drawn) in [work.shift, work.feather, work.finish]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        if drawn.is_some() {
-                            self.edge_builds[stage] += 1;
+                    let mut strips = Vec::new();
+                    while let Some(pass) = draws.get(at.0) {
+                        let left = pass.rows() - at.1;
+                        let rows = rows_in_budget(pass.row_texels(), left, *budget, *recorded);
+                        if left > 0 && rows == 0 {
+                            break;
+                        }
+                        if rows > 0 {
+                            strips.push(EdgeStrip {
+                                pass,
+                                from: at.1,
+                                to: at.1 + rows,
+                            });
+                            *budget = budget.saturating_sub(u64::from(rows) * pass.row_texels());
+                            *recorded += 1;
+                        }
+                        at.1 += rows;
+                        if at.1 == pass.rows() {
+                            *at = (at.0 + 1, 0);
                         }
                     }
                     let input = slot
                         .refined
                         .as_ref()
                         .map_or(&slot.alpha.view, |refined| &refined.alpha);
-                    self.edge.run(
+                    self.edge.draw_strips(
                         &self.device,
-                        &self.queue,
                         encoder,
                         edge_scratch,
                         edged,
                         input,
-                        p,
-                        &work,
+                        &strips,
                     );
-                    edged.held = None;
+                    if at.0 < draws.len() {
+                        return false;
+                    }
+                    let Some(Partial::Edged { stages, .. }) = partial.take() else {
+                        unreachable!("the edge products are laid out above");
+                    };
+                    for (stage, drawn) in stages.into_iter().enumerate() {
+                        if drawn {
+                            self.edge_builds[stage] += 1;
+                        }
+                    }
                     claims.push(Claim::Edged { mask: index, held });
-                    *budget = budget.saturating_sub(cost);
-                    *recorded += 1;
                 }
             }
 
@@ -2399,7 +2665,9 @@ impl Develop {
                 slot.binds_product = product;
             }
         }
-        // The scratches no mask of the frame needs go, as after a render.
+        // Every product is held: none is left unfinished. The scratches no
+        // mask of the frame needs go, as after a render.
+        *partial = None;
         if slots.iter().flatten().all(|slot| slot.refined.is_none()) {
             *refine_scratch = None;
         }
@@ -3806,66 +4074,20 @@ fn forget_products(frame: &mut Frame, auto: bool) {
     }
 }
 
-/// The pixels of `rect`.
-fn pixels(rect: PixelRect) -> u64 {
-    u64::from(rect.2) * u64::from(rect.3)
-}
-
-/// What drawing the refined alpha of `plan` over `over` of a render of `size`
-/// costs a slice of a frame built ahead, in texels read and written (see
-/// [`AHEAD_SLICE_TEXELS`]), counted from `refine.wgsl` with every box summed
-/// in the direct loop, the most it costs. Over the work of the tile, `over`
-/// grown by the filter's reach, of p pixels in n cells of a box of c cells:
-/// the moments of the source read each pixel once and write 3 targets a
-/// cell; the first gather reads the alpha and the working texture at each
-/// pixel and writes 2 a cell; the two moved gathers each read 18 a pixel
-/// (the alpha, the working texture and 4 bilinear reads of the 4 solved
-/// targets) and write 1 a cell; the ten boxes read 14 targets 2 c + 1 cells
-/// each and write them, 14 (2 c + 2) a cell; the three solves read 5 and
-/// write 4 a cell; the apply reads 18 and writes 1 at each of the o pixels
-/// of `over`. In all 39 p + 19 o + (28 c + 62) n.
-fn refine_texels(plan: &Plan, over: PixelRect, size: (u32, u32)) -> u64 {
-    let work = pixels(grow(over, plan.reach(), size));
-    let step = u64::from(plan.step.max(1));
-    let cells = work.div_ceil(step * step);
-    let c = u64::from(plan.cells);
-    39 * work + 19 * pixels(over) + (28 * c + 62) * cells
-}
-
-/// What drawing the edge products of `plan` whole costs a slice of a frame
-/// built ahead of `size`, whose products cover `region`, in texels read and
-/// written (see [`AHEAD_SLICE_TEXELS`]). Shift edge: each pass reads 2 and
-/// writes 1 a pixel, a level of each run's table over the frame grown by the
-/// pad, the combine pass of each run over the frame. Feather: its cells pass
-/// reads each pixel of the region once and writes 1 a cell, and its blur
-/// across and down reads 2 r + 1 cells and writes 1 a cell each, r its
-/// radius in cells. The finished alpha reads the input and 4 cells and
-/// writes 1 a pixel of the region under Feather, and reads 1 and writes 1
-/// under Contrast alone.
-fn edge_texels(plan: &EdgePlan, size: (u32, u32), region: PixelRect) -> u64 {
-    let frame = pixels((0, 0, size.0, size.1));
-    let mut texels = 0;
-    if plan.shifts() {
-        let runs = plan.runs();
-        let pad = edge_pad(&runs);
-        let padded = pixels((0, 0, size.0 + 2 * pad, size.1 + 2 * pad));
-        texels += runs
-            .iter()
-            .map(|run| 3 * padded * u64::from(edge_levels(run.half)) + 3 * frame)
-            .sum::<u64>();
+/// How many rows of a pass whose row costs `per_row` texels a slice of a
+/// frame built ahead draws, with `left` rows of the pass to draw and `budget`
+/// texels left: those the budget pays for, and one at least while the slice
+/// has recorded nothing.
+fn rows_in_budget(per_row: u64, left: u32, budget: u64, recorded: u32) -> u32 {
+    // A pass of no texels a row costs nothing: every row fits.
+    let fits = budget
+        .checked_div(per_row)
+        .map_or(left, |rows| rows.min(u64::from(left)) as u32);
+    if recorded == 0 && left > 0 {
+        fits.max(1)
+    } else {
+        fits
     }
-    if plan.feathers() {
-        let (_, grid) = plan.grid();
-        let cells = pixels((0, 0, grid.0, grid.1));
-        let r = u64::from(plan.radius_cells);
-        texels += pixels(region) + cells * (4 * r + 5);
-    }
-    if plan.feathers() {
-        texels += 6 * pixels(region);
-    } else if plan.contrasts() {
-        texels += 2 * pixels(region);
-    }
-    texels
 }
 
 /// Whether the edit wants the texture layer and the transmission map. A mask

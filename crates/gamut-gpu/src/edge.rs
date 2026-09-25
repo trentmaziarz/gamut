@@ -248,18 +248,28 @@ pub(crate) struct EdgeScratch {
     pad: u32,
     /// The means of the cells and the blur across, r32float.
     cells: Option<[Texture; 2]>,
+    /// Counts up each time a texture above is made or dropped, so what was
+    /// laid out over them is told from what they hold now.
+    made: u64,
 }
 
 impl EdgeScratch {
     /// Drops what no mask of the frame needs.
     pub(crate) fn keep(&mut self, runs: bool, cells: bool) {
-        if !runs {
+        if !runs && self.runs.is_some() {
             self.runs = None;
             self.pad = 0;
+            self.made += 1;
         }
-        if !cells {
+        if !cells && self.cells.is_some() {
             self.cells = None;
+            self.made += 1;
         }
+    }
+
+    /// Counts up each time a texture of the scratch is made or dropped.
+    pub(crate) fn made(&self) -> u64 {
+        self.made
     }
 
     /// How many textures it holds.
@@ -361,6 +371,66 @@ pub struct EdgePasses {
     pub shift: u64,
     pub feather: u64,
     pub finish: u64,
+}
+
+/// A texture a pass reads or writes, by name: the input of the chain, a
+/// work texture of Shift edge, the shifted alpha, a spare cell target of
+/// Feather, the mask's blurred cells, or the finished alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeView {
+    Input,
+    Work(usize),
+    Shifted,
+    Spare(usize),
+    Cells,
+    Finished,
+}
+
+/// The pipeline of a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Level,
+    Combine,
+    Cells,
+    Blur,
+    Finish,
+}
+
+/// One pass of the edge products of a mask as [`EdgePass::lay_out`] lays it
+/// out: its pipeline, its uniform and where the uniform buffer holds it,
+/// what it reads (source, other, cells), what it writes and over which
+/// rectangle, and what each texel of that rectangle costs in texels read and
+/// written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeDraw {
+    kind: Kind,
+    uniform: EdgeUniform,
+    offset: u32,
+    source: EdgeView,
+    other: EdgeView,
+    cells: EdgeView,
+    target: EdgeView,
+    area: Rect,
+    unit: u64,
+}
+
+impl EdgeDraw {
+    /// The rows of the rectangle the pass draws.
+    pub(crate) fn rows(&self) -> u32 {
+        self.area.3
+    }
+
+    /// What one row of the pass costs, in texels read and written.
+    pub(crate) fn row_texels(&self) -> u64 {
+        self.unit * u64::from(self.area.2)
+    }
+}
+
+/// Rows `from` to `to` of the rectangle of a pass.
+pub(crate) struct EdgeStrip<'a> {
+    pub(crate) pass: &'a EdgeDraw,
+    pub(crate) from: u32,
+    pub(crate) to: u32,
 }
 
 /// The pipelines of `edge.wgsl`.
@@ -600,6 +670,7 @@ impl EdgePass {
                 scratch.runs =
                     Some([0; 3].map(|_| texture(device, "edge runs", RUN_FORMAT, padded)));
                 scratch.pad = wanted;
+                scratch.made += 1;
             }
         } else {
             edged.shifted = None;
@@ -613,6 +684,7 @@ impl EdgePass {
             if scratch.cells.as_ref().is_none_or(|c| !fits(&c[0])) {
                 scratch.cells =
                     Some([0; 2].map(|_| texture(device, "feather scratch", CELL_FORMAT, grid)));
+                scratch.made += 1;
             }
         } else {
             edged.cells = None;
@@ -650,35 +722,53 @@ impl EdgePass {
         plan: &Plan,
         work: &EdgeWork,
     ) {
+        let draws = self.lay_out(device, queue, scratch, edged, plan, work);
+        let strips: Vec<EdgeStrip> = draws
+            .iter()
+            .map(|pass| EdgeStrip {
+                pass,
+                from: 0,
+                to: pass.rows(),
+            })
+            .collect();
+        self.draw_strips(device, encoder, scratch, edged, input, &strips);
+    }
+
+    /// Lays out what [`run`](Self::run) draws, without drawing it: the
+    /// uniform of every pass written, the passes counted, and the passes in
+    /// the order they draw. [`draw_strips`](Self::draw_strips) draws them,
+    /// whole or a strip of rows at a time, while the products and the
+    /// scratch stay the ones laid out and nothing else draws there.
+    pub(crate) fn lay_out(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scratch: &EdgeScratch,
+        edged: &mut Edged,
+        plan: &Plan,
+        work: &EdgeWork,
+    ) -> Vec<EdgeDraw> {
         let frame = plan.size;
         let base = EdgeUniform::of(plan);
-        // Every pass: its pipeline, its uniform, what it reads (source,
-        // other, cells), what it writes, and where.
-        struct Draw<'a> {
-            kind: Kind,
-            uniform: EdgeUniform,
-            source: &'a wgpu::TextureView,
-            other: &'a wgpu::TextureView,
-            cells: &'a wgpu::TextureView,
-            target: &'a wgpu::TextureView,
-            area: Rect,
-        }
-        #[derive(Clone, Copy)]
-        enum Kind {
-            Level,
-            Combine,
-            Cells,
-            Blur,
-            Finish,
-        }
-        let mut draws: Vec<Draw> = Vec::new();
+        let mut draws: Vec<EdgeDraw> = Vec::new();
         let mut counts = EdgePasses::default();
-        let shifted = edged.shifted.as_ref().map(|t| &t.view);
+        // What a texel of each pass costs, in texels read and written: a
+        // pass of Shift edge reads 2 and writes 1 a pixel; Feather's cells
+        // pass reads the step squared pixels of a cell and writes 1, and its
+        // blur reads 2 r + 1 cells and writes 1, r its radius in cells; the
+        // finished alpha reads the input and 4 cells and writes 1 a pixel
+        // under Feather, and reads 1 and writes 1 under Contrast alone.
+        let cell = u64::from(plan.step) * u64::from(plan.step);
+        let blur = 2 * u64::from(plan.radius_cells) + 2;
+        let finish = if plan.feathers() { 6 } else { 2 };
         // What Feather and the finished alpha read: the shifted alpha while
         // Shift edge is on, the input otherwise.
-        let stage_input = shifted.unwrap_or(input);
-        if let (Some(out), Some(shifted), Some(runs)) = (work.shift, shifted, scratch.runs.as_ref())
-        {
+        let stage_input = if edged.shifted.is_some() {
+            EdgeView::Shifted
+        } else {
+            EdgeView::Input
+        };
+        if let (Some(out), Some(_), Some(_)) = (work.shift, &edged.shifted, &scratch.runs) {
             let runs_of_plan = plan.runs();
             // The pixels each run must be right over, from the last back:
             // the last over `out`, each earlier one over what the one after
@@ -695,9 +785,9 @@ impl EdgePass {
                 );
             }
             let view = |place: Place| match place {
-                Place::Input => input,
-                Place::Work(w) => &runs[w].view,
-                Place::Shifted => shifted,
+                Place::Input => EdgeView::Input,
+                Place::Work(w) => EdgeView::Work(w),
+                Place::Shifted => EdgeView::Shifted,
             };
             // Where pixel (0, 0) of the frame lies in a place, and the
             // padded texture the levels are drawn and held in.
@@ -728,7 +818,7 @@ impl EdgePass {
                         padded,
                     )
                 };
-                draws.push(Draw {
+                draws.push(EdgeDraw {
                     kind: if pass.combine {
                         Kind::Combine
                     } else {
@@ -744,86 +834,135 @@ impl EdgePass {
                         input_origin: [origin(pass.input) as i32; 2],
                         ..base
                     },
+                    offset: 0,
                     source: view(pass.read),
                     other: view(pass.input),
                     cells: view(pass.read),
                     target: view(pass.write),
                     area,
+                    unit: 3,
                 });
                 counts.shift += 1;
             }
         }
-        if let (Some(over), Some(held), Some(spare)) =
-            (work.feather, edged.cells.as_ref(), scratch.cells.as_ref())
-        {
+        if let (Some(over), Some(_), Some(_)) = (work.feather, &edged.cells, &scratch.cells) {
             let (_, grid) = plan.grid();
             let radius = plan.radius_cells;
             // The cells the pixels read, their blur down, and across.
             let down = cells_under(plan, over);
             let across = grow_xy(down, 0, radius, grid);
             let means = grow_xy(down, radius, radius, grid);
-            draws.push(Draw {
+            draws.push(EdgeDraw {
                 kind: Kind::Cells,
                 uniform: base,
+                offset: 0,
                 source: stage_input,
                 other: stage_input,
                 cells: stage_input,
-                target: &spare[0].view,
+                target: EdgeView::Spare(0),
                 area: means,
+                unit: cell + 1,
             });
-            draws.push(Draw {
+            draws.push(EdgeDraw {
                 kind: Kind::Blur,
                 uniform: EdgeUniform {
                     direction: [1, 0],
                     ..base
                 },
+                offset: 0,
                 source: stage_input,
                 other: stage_input,
-                cells: &spare[0].view,
-                target: &spare[1].view,
+                cells: EdgeView::Spare(0),
+                target: EdgeView::Spare(1),
                 area: across,
+                unit: blur,
             });
-            draws.push(Draw {
+            draws.push(EdgeDraw {
                 kind: Kind::Blur,
                 uniform: EdgeUniform {
                     direction: [0, 1],
                     ..base
                 },
+                offset: 0,
                 source: stage_input,
                 other: stage_input,
-                cells: &spare[1].view,
-                target: &held.view,
+                cells: EdgeView::Spare(1),
+                target: EdgeView::Cells,
                 area: down,
+                unit: blur,
             });
             counts.feather += 3;
         }
-        if let (Some(over), Some(finished)) = (work.finish, edged.finished.as_ref()) {
-            let cells = edged.cells.as_ref().map_or(stage_input, |t| &t.view);
-            draws.push(Draw {
+        if let (Some(over), Some(_)) = (work.finish, &edged.finished) {
+            let cells = if edged.cells.is_some() {
+                EdgeView::Cells
+            } else {
+                stage_input
+            };
+            draws.push(EdgeDraw {
                 kind: Kind::Finish,
                 uniform: base,
+                offset: 0,
                 source: stage_input,
                 other: stage_input,
                 cells,
-                target: &finished.view,
+                target: EdgeView::Finished,
                 area: over,
+                unit: finish,
             });
             counts.finish += 1;
         }
         if draws.is_empty() {
-            return;
+            return draws;
         }
         if edged.slots < draws.len() as u32 {
             edged.slots = (draws.len() as u32).next_power_of_two();
             edged.uniform = self.uniform_buffer(device, edged.slots);
         }
+        for (slot, d) in draws.iter_mut().enumerate() {
+            d.offset = slot as u32 * self.stride;
+            queue.write_buffer(
+                &edged.uniform,
+                u64::from(d.offset),
+                bytemuck::bytes_of(&d.uniform),
+            );
+        }
+        self.passes.shift += counts.shift;
+        self.passes.feather += counts.feather;
+        self.passes.finish += counts.finish;
+        draws
+    }
+
+    /// Draws `strips`, each rows of the rectangle of a pass [`lay_out`]
+    /// (Self::lay_out) laid out for `edged` and `scratch`, reading `input`.
+    /// No pass reads the texture it writes, and each writes every texel of
+    /// its rectangle over what its target holds, so the rows of a pass drawn
+    /// in any number of strips leave its target as the whole pass does.
+    pub(crate) fn draw_strips(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scratch: &EdgeScratch,
+        edged: &Edged,
+        input: &wgpu::TextureView,
+        strips: &[EdgeStrip],
+    ) {
+        let view = |at: EdgeView| -> &wgpu::TextureView {
+            match at {
+                EdgeView::Input => input,
+                EdgeView::Work(w) => &scratch.runs.as_ref().expect("laid out with runs")[w].view,
+                EdgeView::Shifted => &edged.shifted.as_ref().expect("laid out shifted").view,
+                EdgeView::Spare(s) => &scratch.cells.as_ref().expect("laid out with cells")[s].view,
+                EdgeView::Cells => &edged.cells.as_ref().expect("laid out with cells").view,
+                EdgeView::Finished => &edged.finished.as_ref().expect("laid out finished").view,
+            }
+        };
         // One bind group for each set of textures a pass reads.
-        let mut groups: Vec<([usize; 3], wgpu::BindGroup)> = Vec::new();
-        let key =
-            |d: &Draw| [d.source, d.other, d.cells].map(|v| v as *const wgpu::TextureView as usize);
-        for d in &draws {
-            let k = key(d);
-            if groups.iter().any(|(held, _)| *held == k) {
+        let mut groups: Vec<([EdgeView; 3], wgpu::BindGroup)> = Vec::new();
+        for strip in strips {
+            let d = strip.pass;
+            let key = [d.source, d.other, d.cells];
+            if groups.iter().any(|(held, _)| *held == key) {
                 continue;
             }
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -840,27 +979,26 @@ impl EdgePass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(d.source),
+                        resource: wgpu::BindingResource::TextureView(view(d.source)),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(d.other),
+                        resource: wgpu::BindingResource::TextureView(view(d.other)),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(d.cells),
+                        resource: wgpu::BindingResource::TextureView(view(d.cells)),
                     },
                 ],
             });
-            groups.push((k, group));
+            groups.push((key, group));
         }
-        for (slot, d) in draws.iter().enumerate() {
-            let offset = slot as u32 * self.stride;
-            queue.write_buffer(
-                &edged.uniform,
-                u64::from(offset),
-                bytemuck::bytes_of(&d.uniform),
-            );
+        for strip in strips {
+            let d = strip.pass;
+            let (x, y, width, _) = d.area;
+            if width == 0 || strip.from >= strip.to {
+                continue;
+            }
             let pipeline = match d.kind {
                 Kind::Level => &self.level,
                 Kind::Combine => &self.combine,
@@ -868,20 +1006,15 @@ impl EdgePass {
                 Kind::Blur => &self.blur,
                 Kind::Finish => &self.finish,
             };
-            let k = key(d);
+            let key = [d.source, d.other, d.cells];
             let group = &groups
                 .iter()
-                .find(|(held, _)| *held == k)
+                .find(|(held, _)| *held == key)
                 .expect("made above")
                 .1;
-            if d.area.2 == 0 || d.area.3 == 0 {
-                continue;
-            }
-            draw(encoder, pipeline, group, offset, d.target, d.area);
+            let area = (x, y + strip.from, width, strip.to - strip.from);
+            draw(encoder, pipeline, group, d.offset, view(d.target), area);
         }
-        self.passes.shift += counts.shift;
-        self.passes.feather += counts.feather;
-        self.passes.finish += counts.finish;
     }
 }
 

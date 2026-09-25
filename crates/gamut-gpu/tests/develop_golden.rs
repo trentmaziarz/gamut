@@ -1778,25 +1778,35 @@ fn refined_masks_built_ahead_equal_a_fresh_render() {
         refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
         refined_at(exposure_mask("Brush", brush), 90.0, 0.02, 70.0),
     ];
-    let built = assert_products_built_ahead(
-        &gpu,
-        &photo,
-        &edit,
-        &AheadCase {
-            name: "refined masks",
-            full: (width, height),
-            start: (401, 113, 180, 140),
-            pad: (40, 30),
-            grid: 8,
-            step: (8, 0),
-            texels: 2_000_000,
-        },
-    );
-    assert_eq!(built.refine_builds, 2, "each refined alpha is built ahead");
-    assert!(
-        built.refine_source_builds > 0,
-        "the moments of the source are taken ahead"
-    );
+    // The second budget cuts each pass of Refine edges into strips of rows
+    // over several slices.
+    for (name, texels) in [
+        ("refined masks", 2_000_000),
+        ("refined masks in strips", 20_000),
+    ] {
+        let built = assert_products_built_ahead(
+            &gpu,
+            &photo,
+            &edit,
+            &AheadCase {
+                name,
+                full: (width, height),
+                start: (401, 113, 180, 140),
+                pad: (40, 30),
+                grid: 8,
+                step: (8, 0),
+                texels,
+            },
+        );
+        assert_eq!(
+            built.refine_builds, 2,
+            "{name}: each refined alpha is built ahead"
+        );
+        assert!(
+            built.refine_source_builds > 0,
+            "{name}: the moments of the source are taken ahead"
+        );
+    }
 }
 
 /// A refined radial gradient under Shift edge, Feather and Contrast and a
@@ -1833,25 +1843,32 @@ fn edged_masks_built_ahead_equal_a_fresh_render() {
         ),
         edged_at(exposure_mask("Brush", brush), -0.03, 0.02, 0.0),
     ];
-    let built = assert_products_built_ahead(
-        &gpu,
-        &photo,
-        &edit,
-        &AheadCase {
-            name: "edged masks",
-            full: (width, height),
-            start: (401, 113, 180, 140),
-            pad: (40, 30),
-            grid: 8,
-            step: (0, 8),
-            texels: 2_000_000,
-        },
-    );
-    assert_eq!(
-        built.edge_builds,
-        [2, 2, 2],
-        "each shifted alpha, Feather's cells and finished alpha are built ahead"
-    );
+    // The second budget cuts each edge pass and each pass of Refine edges
+    // into strips of rows over several slices.
+    for (name, texels) in [
+        ("edged masks", 2_000_000),
+        ("edged masks in strips", 20_000),
+    ] {
+        let built = assert_products_built_ahead(
+            &gpu,
+            &photo,
+            &edit,
+            &AheadCase {
+                name,
+                full: (width, height),
+                start: (401, 113, 180, 140),
+                pad: (40, 30),
+                grid: 8,
+                step: (0, 8),
+                texels,
+            },
+        );
+        assert_eq!(
+            built.edge_builds,
+            [2, 2, 2],
+            "{name}: each shifted alpha, Feather's cells and finished alpha are built ahead"
+        );
+    }
 }
 
 /// The red overlay of a mask under a zoomed window is the overlay the full
