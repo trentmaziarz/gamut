@@ -1460,6 +1460,400 @@ fn a_window_built_ahead_in_slices_equals_one_built_in_one_submit() {
     }
 }
 
+/// What the graph has drawn of the mask products, counter by counter: the
+/// alphas (whole and patched), the brush layers (stamped whole and appended
+/// to), the proxies, the refined alphas (whole and patched), the moments of
+/// the source (whole tiles and strips), and the three edge stages (whole and
+/// patched).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProductBuilds {
+    mask_alpha_builds: u64,
+    alpha_patches: u64,
+    brush_layer_builds: u64,
+    brush_layer_appends: u64,
+    proxy_builds: u64,
+    refine_builds: u64,
+    refine_patches: u64,
+    refine_source_builds: u64,
+    refine_source_strips: u64,
+    edge_builds: [u64; 3],
+    edge_patches: [u64; 3],
+}
+
+impl ProductBuilds {
+    fn of(develop: &Develop) -> Self {
+        let (refine_builds, refine_patches) = develop.refine_builds();
+        let (edge_builds, edge_patches) = develop.edge_builds();
+        ProductBuilds {
+            mask_alpha_builds: develop.mask_alpha_builds(),
+            alpha_patches: develop.brush_patches().0,
+            brush_layer_builds: develop.brush_layer_builds(),
+            brush_layer_appends: develop.brush_layer_appends(),
+            proxy_builds: develop.proxy_builds(),
+            refine_builds,
+            refine_patches,
+            refine_source_builds: develop.refine_source_builds(),
+            refine_source_strips: develop.refine_source_strips(),
+            edge_builds,
+            edge_patches,
+        }
+    }
+
+    /// What was drawn since `before`.
+    fn since(self, before: ProductBuilds) -> ProductBuilds {
+        let three = |a: [u64; 3], b: [u64; 3]| [0, 1, 2].map(|i| a[i] - b[i]);
+        ProductBuilds {
+            mask_alpha_builds: self.mask_alpha_builds - before.mask_alpha_builds,
+            alpha_patches: self.alpha_patches - before.alpha_patches,
+            brush_layer_builds: self.brush_layer_builds - before.brush_layer_builds,
+            brush_layer_appends: self.brush_layer_appends - before.brush_layer_appends,
+            proxy_builds: self.proxy_builds - before.proxy_builds,
+            refine_builds: self.refine_builds - before.refine_builds,
+            refine_patches: self.refine_patches - before.refine_patches,
+            refine_source_builds: self.refine_source_builds - before.refine_source_builds,
+            refine_source_strips: self.refine_source_strips - before.refine_source_strips,
+            edge_builds: three(self.edge_builds, before.edge_builds),
+            edge_patches: three(self.edge_patches, before.edge_patches),
+        }
+    }
+}
+
+/// A pan onto a window built ahead with the products of its masks: the
+/// picture at `full`, the part seen at the start, the pad and the grid of
+/// the padded window, the step of the pan, and the texels of a slice.
+struct AheadCase {
+    name: &'static str,
+    full: (u32, u32),
+    start: (u32, u32, u32, u32),
+    pad: (u32, u32),
+    grid: u32,
+    step: (i64, i64),
+    texels: u64,
+}
+
+/// Renders the window of `case.start`, builds the window a pan by
+/// `case.step` leaves it for in slices of `case.texels`, rendering the
+/// current window between two slices, pans inside the current window until
+/// what is seen leaves it, and swaps the frame built ahead in. The slices
+/// draw every alpha of `edit` and no proxy; the swap draws no mask product
+/// again; its output equals a fresh render of that window byte for byte and
+/// the full render at the golden tolerances; and a slider step of the global
+/// edit and of the first mask after it draws no mask product again either,
+/// and equals a fresh render of the stepped edit byte for byte. Returns
+/// what the slices drew.
+fn assert_products_built_ahead(
+    gpu: &Headless,
+    photo: &Photo,
+    edit: &PhotoEdit,
+    case: &AheadCase,
+) -> ProductBuilds {
+    let name = case.name;
+    let readback = Readback::new(&gpu.device);
+    let at = |rect: (u32, u32, u32, u32), (dx, dy): (i64, i64)| {
+        (
+            (i64::from(rect.0) + dx) as u32,
+            (i64::from(rect.1) + dy) as u32,
+            rect.2,
+            rect.3,
+        )
+    };
+    let window = gamut_gpu::develop::padded_window(case.full, case.start, case.pad, case.grid);
+    let first = ViewWindow {
+        full: case.full,
+        window,
+        visible: case.start,
+    };
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(photo);
+    view_render_of(&mut develop, gpu, &readback, edit, &first);
+    let previous = at(case.start, (-case.step.0, -case.step.1));
+    let ahead = gamut_gpu::develop::window_ahead(
+        case.full, window, previous, case.start, case.pad, case.grid,
+    )
+    .expect("a pan that moves leaves the window");
+
+    // Built ahead in slices, the current window rendered between them.
+    develop.set_ahead_slice_texels(case.texels);
+    let before = ProductBuilds::of(&develop);
+    let slices = develop.ahead_slices();
+    let mut calls = 0u64;
+    loop {
+        calls += 1;
+        let done = develop.build_ahead(edit, case.full, ahead);
+        assert_eq!(done, !develop.ahead_building(), "{name}: call {calls}");
+        if done {
+            break;
+        }
+        assert!(calls < 100_000, "{name}: the build ahead does not end");
+        view_render_of(&mut develop, gpu, &readback, edit, &first);
+    }
+    assert_eq!(
+        develop.ahead_slices() - slices,
+        calls,
+        "{name}: one submit a call"
+    );
+    let built = ProductBuilds::of(&develop).since(before);
+    println!(
+        "{name}: built ahead in {calls} slices of {} texels: {built:?}",
+        case.texels
+    );
+    assert_eq!(
+        built.mask_alpha_builds,
+        edit.masks.len() as u64,
+        "{name}: the slices draw every alpha once"
+    );
+    assert_eq!(built.proxy_builds, 0, "{name}: no slice builds the proxy");
+    assert!(
+        !develop.build_ahead(edit, case.full, ahead),
+        "{name}: complete, nothing left to build"
+    );
+    assert_eq!(
+        develop.ahead_slices() - slices,
+        calls,
+        "{name}: no slice once complete"
+    );
+
+    // The pan inside the current window, then onto the window built ahead.
+    let mut visible = case.start;
+    while gamut_gpu::develop::holds(window, visible) {
+        let panned = ViewWindow { visible, ..first };
+        view_render_of(&mut develop, gpu, &readback, edit, &panned);
+        visible = at(visible, case.step);
+    }
+    assert!(
+        gamut_gpu::develop::holds(ahead, visible),
+        "{name}: {ahead:?} holds {visible:?}"
+    );
+    let reached = ViewWindow {
+        full: case.full,
+        window: ahead,
+        visible,
+    };
+    let (replaces, swaps) = (develop.window_replaces(), develop.window_swaps());
+    let before = ProductBuilds::of(&develop);
+    let swapped = view_render_of(&mut develop, gpu, &readback, edit, &reached);
+    let at_swap = ProductBuilds::of(&develop).since(before);
+    println!("{name}: the swap at {visible:?} drew {at_swap:?}");
+    assert_eq!(
+        develop.window_replaces(),
+        replaces,
+        "{name}: the swap replaces none"
+    );
+    assert_eq!(
+        develop.window_swaps(),
+        swaps + 1,
+        "{name}: the frame ahead is taken"
+    );
+    assert_eq!(
+        at_swap,
+        ProductBuilds::default(),
+        "{name}: the swap draws no mask product again"
+    );
+
+    // A fresh render of the window reached, and the full render.
+    let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+    fresh.set_source(photo);
+    let alone = view_render_of(&mut fresh, gpu, &readback, edit, &reached);
+    assert_eq!(fresh.window_swaps(), 0);
+    let differing = swapped.iter().zip(&alone).filter(|(a, b)| a != b).count();
+    println!(
+        "{name}: bytes of the swap that differ from a fresh render of the window: {differing} of {}",
+        alone.len()
+    );
+    assert_eq!(swapped, alone, "{name}: the swapped window");
+    let full = full_render_of(&mut fresh, gpu, &readback, edit, &reached);
+    let max = max_difference(&full, &swapped);
+    let mean = full
+        .iter()
+        .zip(&swapped)
+        .map(|(a, b)| f64::from(a.abs_diff(*b)))
+        .sum::<f64>()
+        / full.len() as f64;
+    println!("{name}: the swap against the full render: max difference {max}, mean {mean:.4}");
+    assert!(
+        max <= MAX_DIFFERENCE && mean <= MEAN_DIFFERENCE,
+        "{name}: max difference {max}, mean {mean:.4}"
+    );
+
+    // A slider step after the swap: the global exposure and the first
+    // mask's, neither of them part of a mask's shape.
+    let mut stepped = edit.clone();
+    stepped.adjust.exposure += 0.1;
+    stepped.masks[0].adjust.exposure += 0.1;
+    let before = ProductBuilds::of(&develop);
+    let slid = view_render_of(&mut develop, gpu, &readback, &stepped, &reached);
+    let at_step = ProductBuilds::of(&develop).since(before);
+    println!("{name}: a slider step after the swap drew {at_step:?}");
+    assert_eq!(
+        at_step,
+        ProductBuilds::default(),
+        "{name}: a slider step after the swap draws no mask product again"
+    );
+    let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+    fresh.set_source(photo);
+    let alone = view_render_of(&mut fresh, gpu, &readback, &stepped, &reached);
+    let differing = slid.iter().zip(&alone).filter(|(a, b)| a != b).count();
+    println!(
+        "{name}: bytes of the slider step that differ from a fresh render of it: {differing} of {}",
+        alone.len()
+    );
+    assert_eq!(slid, alone, "{name}: the slider step after the swap");
+    assert_ne!(slid, swapped, "{name}: the slider step shows");
+    built
+}
+
+/// The four full masks and a brush mask, every operator on: their alphas and
+/// the brush layer are built ahead with the frame in slices of one row or
+/// one product, and the swap and a slider step after it draw none of them
+/// again. The brush is painted, then painted with auto strokes, whose layer
+/// reads the proxy of the source the current window's render built.
+#[test]
+fn the_four_masks_and_a_brush_mask_built_ahead_equal_a_fresh_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let case = |name| AheadCase {
+        name,
+        full: (SIZE, SIZE),
+        start: (20, 22, 24, 20),
+        pad: (8, 8),
+        grid: 4,
+        step: (4, 0),
+        texels: 1,
+    };
+    for (name, brush) in [
+        ("four masks and a brush mask", painted_source()),
+        (
+            "four masks and an auto brush mask",
+            brush_source(&auto_strokes(60.0)),
+        ),
+    ] {
+        let mut edit = everything_global();
+        edit.masks = vec![
+            exposure_mask("Linear", linear_source()),
+            exposure_mask("Radial", radial_source()),
+            exposure_mask("Luminance", luminance_source()),
+            exposure_mask("Colour", colour_source()),
+            exposure_mask("Brush", brush),
+        ];
+        let built = assert_products_built_ahead(&gpu, &photo, &edit, &case(name));
+        assert_eq!(
+            built.brush_layer_builds, 1,
+            "{name}: the layer is stamped ahead"
+        );
+    }
+}
+
+/// A refined radial gradient and a refined brush, every operator on: the
+/// refine scratch, the moments of the source and each refined alpha are
+/// built ahead with the frame, and the swap and a slider step after it draw
+/// none of them again. The masks of the refined window test.
+#[test]
+fn refined_masks_built_ahead_equal_a_fresh_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let (width, height) = (1100, 600);
+    let photo = blocky_photo(width, height);
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [0.393, 0.25],
+        radius: [0.049, 0.0327],
+        rotation: 0.0,
+        feather: 12.0,
+    });
+    let brush = brush_source(&[stroke(&[[0.425, 0.05], [0.425, 0.5]], 0.016, 20.0, 100.0)]);
+    let mut edit = everything_global();
+    edit.masks = vec![
+        refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
+        refined_at(exposure_mask("Brush", brush), 90.0, 0.02, 70.0),
+    ];
+    let built = assert_products_built_ahead(
+        &gpu,
+        &photo,
+        &edit,
+        &AheadCase {
+            name: "refined masks",
+            full: (width, height),
+            start: (401, 113, 180, 140),
+            pad: (40, 30),
+            grid: 8,
+            step: (8, 0),
+            texels: 2_000_000,
+        },
+    );
+    assert_eq!(built.refine_builds, 2, "each refined alpha is built ahead");
+    assert!(
+        built.refine_source_builds > 0,
+        "the moments of the source are taken ahead"
+    );
+}
+
+/// A refined radial gradient under Shift edge, Feather and Contrast and a
+/// brush under Shift edge and Feather, every operator on: the shifted
+/// alphas, the Feather cells, the finished alphas and the frame's edge
+/// scratch are built ahead with the frame, and the swap and a slider step
+/// after it draw none of them again. The masks of the edged window test.
+#[test]
+fn edged_masks_built_ahead_equal_a_fresh_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let (width, height) = (1100, 600);
+    let photo = blocky_photo(width, height);
+    let radial = MaskSource::Radial(RadialGradient {
+        centre: [0.393, 0.25],
+        radius: [0.049, 0.0327],
+        rotation: 0.0,
+        feather: 12.0,
+    });
+    let brush = brush_source(&[stroke(&[[0.425, 0.05], [0.425, 0.5]], 0.016, 20.0, 100.0)]);
+    let mut edit = everything_global();
+    edit.masks = vec![
+        edged_at(
+            refined_at(exposure_mask("Radial", radial), 100.0, 0.03, 50.0),
+            0.03,
+            0.02,
+            40.0,
+        ),
+        edged_at(exposure_mask("Brush", brush), -0.03, 0.02, 0.0),
+    ];
+    let built = assert_products_built_ahead(
+        &gpu,
+        &photo,
+        &edit,
+        &AheadCase {
+            name: "edged masks",
+            full: (width, height),
+            start: (401, 113, 180, 140),
+            pad: (40, 30),
+            grid: 8,
+            step: (0, 8),
+            texels: 2_000_000,
+        },
+    );
+    assert_eq!(
+        built.edge_builds,
+        [2, 2, 2],
+        "each shifted alpha, Feather's cells and finished alpha are built ahead"
+    );
+}
+
 /// The red overlay of a mask under a zoomed window is the overlay the full
 /// render shows there.
 #[test]

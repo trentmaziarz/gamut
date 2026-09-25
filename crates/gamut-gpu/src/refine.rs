@@ -414,7 +414,7 @@ struct FloatTarget {
 /// amount, the tile, the cells of the tile the moments were taken over, and
 /// the radius of the box and the cells of the box means.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Held {
+pub(crate) struct Held {
     full: (u32, u32),
     origin: (u32, u32),
     size: (u32, u32),
@@ -519,6 +519,23 @@ impl Scratch {
     /// are taken again by the next refine.
     pub(crate) fn forget_source(&mut self) {
         self.held = None;
+    }
+
+    /// Takes the key of the moments out, so the scratch claims none until
+    /// [`Scratch::hold`] sets it again: a frame built ahead records a refine
+    /// in a slice and sets the key once the slice's commands are submitted.
+    pub(crate) fn take_held(&mut self) -> Option<Held> {
+        self.held.take()
+    }
+
+    /// Sets the key [`Scratch::take_held`] took out.
+    pub(crate) fn hold(&mut self, held: Held) {
+        self.held = Some(held);
+    }
+
+    /// Told apart from every scratch before it, on either frame.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 }
 

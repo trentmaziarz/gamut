@@ -179,6 +179,42 @@ pub(crate) fn stamp(brush: &Brush, geometry: &Geometry, first: (usize, usize)) -
     out
 }
 
+/// What stamping the dabs of `brush` into a layer of `geometry` costs a slice
+/// of a frame built ahead, in texels read and written, as
+/// [`crate::develop::AHEAD_SLICE_TEXELS`] counts them: each pixel of a dab's
+/// quad inside the frame counts 2 (the blend reads the layer and writes it),
+/// and 3 for an auto dab, whose fragment also reads the working texture. The
+/// clear of a layer stamped whole is the caller's to count.
+pub(crate) fn stamp_texels(brush: &Brush, geometry: &Geometry) -> u64 {
+    let stamped = stamp(brush, geometry, (0, 0));
+    let aspect = geometry.aspect();
+    let window = geometry.window;
+    let (width, height) = (geometry.size.0 as f32, geometry.size.1 as f32);
+    let pixel = [window.width / width, window.height / height];
+    stamped
+        .runs
+        .iter()
+        .map(|run| {
+            let per_pixel = if run.auto { 3 } else { 2 };
+            let dabs = &stamped.dabs[run.range.start as usize..run.range.end as usize];
+            dabs.iter()
+                .map(|dab| {
+                    let radius = dab.brush[0];
+                    let reach = [radius / aspect[0] + pixel[0], radius / aspect[1] + pixel[1]];
+                    let span = |centre: f32, reach: f32, start: f32, pixel: f32, size: f32| {
+                        let low = ((centre - reach - start) / pixel).floor().clamp(0.0, size);
+                        let high = ((centre + reach - start) / pixel).ceil().clamp(0.0, size);
+                        (high - low) as u64
+                    };
+                    let across = span(dab.centre[0], reach[0], window.x, pixel[0], width);
+                    let down = span(dab.centre[1], reach[1], window.y, pixel[1], height);
+                    across * down * per_pixel
+                })
+                .sum::<u64>()
+        })
+        .sum()
+}
+
 /// How a brush differs from the one a layer holds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Change {
@@ -372,11 +408,14 @@ impl BrushPass {
     }
 }
 
+/// The key of a layer: the brush it holds and the dabs of its last stroke.
+pub(crate) type LayerHeld = (Brush, usize);
+
 struct Layer {
     view: wgpu::TextureView,
     /// The brush the layer holds and the dabs of its last stroke, or `None`
     /// when nothing was drawn yet.
-    held: Option<(Brush, usize)>,
+    held: Option<LayerHeld>,
     dabs: Option<(wgpu::Buffer, u64)>,
 }
 
@@ -437,6 +476,28 @@ impl Layers {
 
     pub(crate) fn len(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Whether layer `index` holds `brush`, so an update would stamp
+    /// nothing.
+    pub(crate) fn holds(&self, index: usize, brush: &Brush) -> bool {
+        self.layers[index]
+            .held
+            .as_ref()
+            .is_some_and(|(held, _)| held == brush)
+    }
+
+    /// Takes the key of layer `index` out, so the layer claims nothing
+    /// until [`Layers::hold`] sets it again: a frame built ahead stamps a
+    /// layer in a slice and sets the key once the slice's commands are
+    /// submitted.
+    pub(crate) fn take_held(&mut self, index: usize) -> Option<LayerHeld> {
+        self.layers[index].held.take()
+    }
+
+    /// Sets the key [`Layers::take_held`] took out.
+    pub(crate) fn hold(&mut self, index: usize, held: LayerHeld) {
+        self.layers[index].held = Some(held);
     }
 
     /// Forgets what every layer with an auto stroke holds, so the next
