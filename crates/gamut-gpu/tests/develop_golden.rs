@@ -3712,18 +3712,19 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     // the source in one pass of three targets, 6 with them in two passes. A
     // Radius step that keeps the side of a cell takes no moments of the
     // source and draws their 4 box means again. `boxed` counts those steps.
-    // The reached field adds the seed and a pass a doubling step: at Radius
-    // 0.05 the radius is 3.2 pixels in cells of one, a flood of 3 cells,
-    // steps 1 and 2, 1 + 2 = 3 passes; at 0.02 it is 1.28 pixels, a flood of
-    // 1 cell, step 1, 1 + 1 = 2 passes. The first three refines below are at
-    // 0.05 and every later one at 0.02, so `refines` refines take
-    // 3 min(refines, 3) + 2 (refines - 3) such passes.
+    // The reached field adds the seed, a pass a doubling step and the pass
+    // that writes it at each pixel: at Radius 0.05 the radius is 3.2 pixels
+    // in cells of one, a flood of 3 cells, steps 1 and 2, 1 + 2 + 1 = 4
+    // passes; at 0.02 it is 1.28 pixels, a flood of 1 cell, step 1,
+    // 1 + 1 + 1 = 3 passes. The first three refines below are at 0.05 and
+    // every later one at 0.02, so `refines` refines take
+    // 4 min(refines, 3) + 3 (refines - 3) such passes.
     let (refine, source) = if develop.refine_fused() {
         (13, 5)
     } else {
         (16, 6)
     };
-    let flooded = |refines: u64| 3 * refines.min(3) + 2 * refines.saturating_sub(3);
+    let flooded = |refines: u64| 4 * refines.min(3) + 3 * refines.saturating_sub(3);
     let builds_after = |develop: &mut Develop, edit: &PhotoEdit, boxed: u64| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
@@ -3834,13 +3835,13 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         "a new source content draws all three"
     );
     assert_eq!(develop.refine_builds().1, 0, "never a part");
-    // Seven refines, three at 0.05 with 3 passes of the flood each and four
-    // at 0.02 with 2: 3 x 3 + 4 x 2 = 17. Fused, 7 x 13 + 2 x 5 + 4 + 17 =
-    // 122 passes.
-    assert_eq!(flooded(7), 17);
+    // Seven refines, three at 0.05 with 4 passes of the reached field each
+    // and four at 0.02 with 3: 3 x 4 + 4 x 3 = 24. Fused, 7 x 13 + 2 x 5 + 4
+    // + 24 = 129 passes.
+    assert_eq!(flooded(7), 24);
     assert_eq!(
         (develop.refine_passes(), develop.refine_tiles()),
-        (7 * refine as u32 + 2 * source as u32 + 4 + 17, 7),
+        (7 * refine as u32 + 2 * source as u32 + 4 + 24, 7),
         "seven refines of one tile, two of them with the moments of the source and one with their box means alone"
     );
 }
@@ -4565,13 +4566,14 @@ fn a_radius_step_to_another_cell_size_takes_the_moments_again() {
 /// of the source (16 and 6 with the solve and the source each drawn in two
 /// passes); with blocks, each of the 6 boxes of the three gathers and of the
 /// 4 boxes of the source has a block pass before it. The reached field adds
-/// its seed and k passes of the flood to every refine, k the doubling steps
-/// whose sum stays at most the radius in cells: 51.2 pixels in cells of 4 at
-/// 1024 pixels wide, 12 cells, 1 + 2 + 4 = 7, k = 3; 67.2 pixels at 1344, 16
-/// cells, 1 + 2 + 4 + 8 = 15, k = 4; 102.4 pixels at 2048, 25 cells, 15 and
-/// 16 more is 31, k = 4. Of the two masks here the first takes the moments
-/// of the source and the second holds them: at 2048 pixels 28 + 5 and 19 + 5
-/// passes, 57 in all, against 18 + 5 and 13 + 5, 41, in the direct loop.
+/// its seed, k passes of the flood and the pass that writes it at each pixel
+/// to every refine, k the doubling steps whose sum stays at most the radius
+/// in cells: 51.2 pixels in cells of 4 at 1024 pixels wide, 12 cells,
+/// 1 + 2 + 4 = 7, k = 3; 67.2 pixels at 1344, 16 cells, 1 + 2 + 4 + 8 = 15,
+/// k = 4; 102.4 pixels at 2048, 25 cells, 15 and 16 more is 31, k = 4. Of the
+/// two masks here the first takes the moments of the source and the second
+/// holds them: at 2048 pixels 28 + 6 and 19 + 6 passes, 59 in all, against
+/// 18 + 6 and 13 + 6, 43, in the direct loop.
 #[test]
 fn a_refined_mask_whose_box_spans_blocks_matches() {
     let _turn = ONE_AT_A_TIME
@@ -4678,7 +4680,9 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         // passes with them in one pass of three targets, 6 with them in a
         // pass of two and a pass of one.
         let (refine, source) = if fused { (13, 5) } else { (16, 6) };
-        let refine = refine + 1 + floods;
+        // The seed, the passes of the flood, and the pass that writes the
+        // reached field at each pixel.
+        let refine = refine + 1 + floods + 1;
         if blocks > 0 {
             assert_eq!(
                 passes,
