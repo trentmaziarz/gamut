@@ -103,6 +103,33 @@ pub const TABLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// The alpha of a mask: one byte per pixel.
 pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
+/// How much of a frame built ahead one slice records, in texels read and
+/// written: 700,000,000. Each pixel a head pass draws counts its reads plus
+/// its one write, so a blur of radius r counts 2 + 2 ceil(r / 2) (the
+/// centre tap and one bilinear read for each pair of taps on each side), a
+/// minimum of radius r counts 2r + 2, and the input transform counts its
+/// taps squared plus 1 (a video frame's 2 planes plus 1).
+///
+/// The reason is the frame time. At 5b8e1b1 replacing the padded window of
+/// timing_24mp.jpg at 100 percent, every operator on, took 36.24 to 54.59
+/// ms. That frame is 3104 by 3744 pixels; its nine head passes draw
+/// 90,146,736 pixels and count 9,867,249,792 texels (blurs of radius 240,
+/// 30 and 180 over 2628 columns or a 2628 by 3268 region, two minimums of
+/// radius 30 and the input over all 11,621,376 pixels). Charging the whole
+/// 54.59 ms to the head passes, the most any of them can cost, gives
+/// 180,751,965 texels a millisecond, so 4 ms is 723,007,862. A slice of
+/// 700,000,000 costs 3.87 ms at that rate, 2.57 ms at the 36.24 ms one,
+/// and the frame takes 15 slices, one a UI frame. Beside a pan inside the
+/// window (p95 1.38 ms) a UI frame stays well inside 16 ms, and the 15
+/// frames are fewer than the 20 steps of 32 pixels a pan takes to cross
+/// the 640 pixel pad. Counting texels rather than pixels keeps a slice's
+/// cost even between an input pass that reads 2 texels a pixel and a base
+/// blur that reads 242.
+///
+/// It is a schedule, not arithmetic: no pixel depends on it, and the timing
+/// phase moves it on the evidence.
+pub const AHEAD_SLICE_TEXELS: u64 = 700_000_000;
+
 /// The rows of the tone curve table: the global edit, then one per mask.
 pub const TABLE_ROWS: u32 = 1 + MAX_MASKS as u32;
 
@@ -530,13 +557,105 @@ pub struct RefineHold {
 }
 
 /// A frame built ahead of a pan: the head passes of the window the pan will
-/// reach, drawn in a submit of their own while the current frame still
-/// serves every render.
+/// reach, drawn in slices, each in a submit of its own, while the current
+/// frame still serves every render.
 struct NextFrame {
     /// The picture size and the padded window of the view it was built for.
     full: (u32, u32),
     window: PixelRect,
     frame: Frame,
+    /// What the slices draw and how far they got.
+    build: AheadBuild,
+}
+
+/// The progress of a frame built ahead: its head passes in the order they
+/// are drawn, and the rows of them the slices submitted so far recorded.
+struct AheadBuild {
+    work: HeadWork,
+    passes: Vec<HeadPass>,
+    /// The pass the next slice begins in, and how many of its rows the
+    /// slices before recorded. Every pass before it is submitted whole.
+    pass: usize,
+    row: u32,
+    /// The source content the strips of the input transform read, while
+    /// they all read the same one. A video frame that arrives between two
+    /// of them leaves none, and the frame then holds no content until a
+    /// render runs its head passes again.
+    content: Option<u64>,
+}
+
+impl AheadBuild {
+    /// Whether every pass is recorded and submitted.
+    fn complete(&self) -> bool {
+        self.pass == self.passes.len()
+    }
+}
+
+/// A head pass of a frame, one render pass each in [`Develop::head_passes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadPass {
+    /// The input transform, or the YUV pass of a video frame, into working.
+    Input,
+    /// The base blur: working into ping, then ping into base.
+    BlurH,
+    BlurV,
+    /// The texture layer's blur: working into ping, then into texture_base.
+    TextureH,
+    TextureV,
+    /// The minimum of the transmission map: working into ping, then into
+    /// transmission.
+    MinimumH,
+    MinimumV,
+    /// The transmission map's smoothing: transmission into ping, then into
+    /// transmission.
+    TransmissionH,
+    TransmissionV,
+}
+
+impl HeadPass {
+    /// The passes that draw the source content when `input`, the texture
+    /// layer when `texture` and the transmission map when `transmission`,
+    /// in the order they run. Each horizontal blur writes ping and the
+    /// vertical one after it reads it, before the next pass writes ping.
+    fn plan(input: bool, texture: bool, transmission: bool) -> Vec<Self> {
+        let mut passes = Vec::with_capacity(9);
+        if input {
+            passes.extend([Self::Input, Self::BlurH, Self::BlurV]);
+        }
+        if texture {
+            passes.extend([Self::TextureH, Self::TextureV]);
+        }
+        if transmission {
+            passes.extend([
+                Self::MinimumH,
+                Self::MinimumV,
+                Self::TransmissionH,
+                Self::TransmissionV,
+            ]);
+        }
+        passes
+    }
+
+    /// The scissor of the pass: the columns under the products region for
+    /// a horizontal blur, the region for a vertical one, none for the input
+    /// transform and the minimum, which cover the whole render.
+    fn scissor(self, work: &HeadWork) -> Option<(u32, u32, u32, u32)> {
+        match self {
+            Self::Input | Self::MinimumH | Self::MinimumV => None,
+            Self::BlurH | Self::TextureH | Self::TransmissionH => {
+                Some(scissor_for(work.products, work.size, true))
+            }
+            Self::BlurV | Self::TextureV | Self::TransmissionV => {
+                Some(scissor_for(work.products, work.size, false))
+            }
+        }
+    }
+
+    /// The pixels the pass draws: its scissor, or the whole render.
+    fn rect(self, work: &HeadWork) -> (u32, u32, u32, u32) {
+        self.scissor(work)
+            .unwrap_or((0, 0, work.size.0, work.size.1))
+    }
 }
 
 /// What [`Develop::render_view`] renders for a view: the arguments of
@@ -728,6 +847,10 @@ pub struct Develop {
     /// its own submit, and how many times it took a frame built ahead.
     window_replaces: u64,
     window_swaps: u64,
+    /// The texels one slice of a frame built ahead records at most, and how
+    /// many slices have been submitted.
+    ahead_slice_texels: u64,
+    ahead_slices: u64,
     out: Option<Output>,
     generation: u64,
     frame_generation: u64,
@@ -918,6 +1041,8 @@ impl Develop {
             next: None,
             window_replaces: 0,
             window_swaps: 0,
+            ahead_slice_texels: AHEAD_SLICE_TEXELS,
+            ahead_slices: 0,
             out: None,
             generation: 0,
             frame_generation: 0,
@@ -1114,10 +1239,64 @@ impl Develop {
     }
 
     /// The picture size and the padded window of the frame built ahead, when
-    /// one is held. A zoomed viewer asks for this window once what is seen
-    /// leaves the one it renders.
+    /// one is held, complete or still building. A zoomed viewer asks for
+    /// this window once what is seen leaves the one it renders.
     pub fn window_ahead(&self) -> Option<((u32, u32), PixelRect)> {
         self.next.as_ref().map(|next| (next.full, next.window))
+    }
+
+    /// Whether a frame built ahead is held with slices left to record. The
+    /// viewer calls [`build_ahead`](Self::build_ahead) once a UI frame while
+    /// it is.
+    pub fn ahead_building(&self) -> bool {
+        self.next
+            .as_ref()
+            .is_some_and(|next| !next.build.complete())
+    }
+
+    /// How many slices of frames built ahead have been submitted.
+    #[doc(hidden)]
+    pub fn ahead_slices(&self) -> u64 {
+        self.ahead_slices
+    }
+
+    /// Sets how many texels one slice of a frame built ahead records at most,
+    /// [`AHEAD_SLICE_TEXELS`] until set. A slice records one row of a pass at
+    /// least, so 1 records one row a slice and `u64::MAX` the whole frame in
+    /// one. A test sets it; the pixels drawn do not depend on it.
+    #[doc(hidden)]
+    pub fn set_ahead_slice_texels(&mut self, texels: u64) {
+        self.ahead_slice_texels = texels.max(1);
+    }
+
+    /// The seven textures of the current frame, or of the frame built ahead,
+    /// by name, with their size, for a test to read back and compare.
+    #[doc(hidden)]
+    pub fn frame_textures(
+        &self,
+        ahead: bool,
+    ) -> Vec<(&'static str, &wgpu::TextureView, (u32, u32))> {
+        let frame = if ahead {
+            self.next.as_ref().map(|next| &next.frame)
+        } else {
+            self.frame.as_ref()
+        };
+        let Some(frame) = frame else {
+            return Vec::new();
+        };
+        let size = (frame.width, frame.height);
+        [
+            ("working", &frame.working),
+            ("ping", &frame.ping),
+            ("base", &frame.base),
+            ("texture base", &frame.texture_base),
+            ("transmission", &frame.transmission),
+            ("developed", &frame.developed),
+            ("developed other", &frame.developed_other),
+        ]
+        .into_iter()
+        .map(|(name, target)| (name, &target.view, size))
+        .collect()
     }
 
     /// How many brush layers have been stamped whole since the graph was
@@ -1401,12 +1580,21 @@ impl Develop {
     }
 
     /// Builds the frame of `window`, a padded window of a zoomed view of the
-    /// picture at `full`, ahead of the pan that will reach it. Its head
-    /// passes run now, in a submit of their own, and the current frame keeps
-    /// serving every render until [`render_view`](Self::render_view) asks
-    /// for that window, which then takes this frame instead of replacing
-    /// its own. A frame already held for the same window is kept; one held
-    /// for another is dropped. Whether a frame was built.
+    /// picture at `full`, ahead of the pan that will reach it, one slice a
+    /// call. The first call makes the frame; each call records at most one
+    /// slice of the head passes left, [`AHEAD_SLICE_TEXELS`] of work, into
+    /// an encoder of its own and submits it before it returns. The current
+    /// frame keeps serving every render meanwhile, and once every slice is
+    /// submitted [`render_view`](Self::render_view) takes this frame when it
+    /// asks for that window, instead of replacing its own. A frame held for
+    /// the same window is kept and built on; one held for another is
+    /// dropped.
+    ///
+    /// Whether this call completed the frame: true from the call that
+    /// submits its last slice, false while slices are left and from a call
+    /// that finds it complete already or `window` rendered by the current
+    /// frame. [`ahead_building`](Self::ahead_building) tells whether slices
+    /// are left.
     ///
     /// The frame holds the head passes of the source content it was built
     /// from. A video frame that arrives before the swap is drawn into it
@@ -1428,41 +1616,135 @@ impl Develop {
                 && f.window == geometry.window
                 && f.sigma_size == geometry.sigma_size
         };
-        if self.next.as_ref().is_some_and(|next| same(&next.frame))
-            || self.frame.as_ref().is_some_and(same)
-        {
+        if self.frame.as_ref().is_some_and(same) {
             return false;
         }
-        // The frame held for another window goes first, so no more than two
-        // frames are held at once.
-        self.next = None;
-        let mut frame =
-            self.build_frame(source, width, height, geometry.window, geometry.sigma_size);
-        let (texture, transmission) = head_products_wanted(edit, &mask_twin::active_masks(edit));
-        let work = HeadWork {
-            size: (width, height),
-            window: geometry.window,
-            sigma_size: geometry.sigma_size,
-            products: geometry.products,
-            texture,
-            transmission,
+        if !self.next.as_ref().is_some_and(|next| same(&next.frame)) {
+            // The frame held for another window goes first, so no more than
+            // two frames are held at once.
+            self.next = None;
+            let frame =
+                self.build_frame(source, width, height, geometry.window, geometry.sigma_size);
+            let (texture, transmission) =
+                head_products_wanted(edit, &mask_twin::active_masks(edit));
+            let passes = HeadPass::plan(frame.content != source.content, texture, transmission);
+            self.next = Some(NextFrame {
+                full,
+                window,
+                frame,
+                build: AheadBuild {
+                    work: HeadWork {
+                        size: (width, height),
+                        window: geometry.window,
+                        sigma_size: geometry.sigma_size,
+                        products: geometry.products,
+                        texture,
+                        transmission,
+                    },
+                    passes,
+                    pass: 0,
+                    row: 0,
+                    content: None,
+                },
+            });
+        }
+        self.ahead_slice()
+    }
+
+    /// Records the next slice of the frame built ahead and submits it:
+    /// strips of whole rows of its passes, in their order, until the next
+    /// strip would pass the slice's texels. The first strip of a pass clears
+    /// its target, as the pass does when it runs whole, and the strips after
+    /// it load it, so every pixel of the target ends as the whole pass leaves
+    /// it. A pass without a scissor is cut into strips of the whole width.
+    /// Whether this slice completed the frame.
+    ///
+    /// The uniforms of the head passes are Develop's, shared with the
+    /// current frame. A slice writes every one its strips read and submits
+    /// before it returns, so a render's writes, which land at the render's
+    /// own submit, never reach its commands.
+    fn ahead_slice(&mut self) -> bool {
+        let Some(mut next) = self.next.take() else {
+            return false;
         };
+        if next.build.complete() {
+            self.next = Some(next);
+            return false;
+        }
+        let source = self.source.as_ref().expect("a frame ahead has a source");
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("develop ahead encoder"),
             });
-        self.head_passes(&mut encoder, &mut frame, &work);
-        // The uniforms the head passes wrote above are Develop's, shared with
-        // the current frame. This submit reads them before any render writes
-        // them again, and a render writes every one it reads in its own.
+        let build = &mut next.build;
+        let mut budget = self.ahead_slice_texels;
+        let mut strips = 0u32;
+        let mut finished = Vec::new();
+        while let Some(&pass) = build.passes.get(build.pass) {
+            let (x, y, w, h) = pass.rect(&build.work);
+            let per_row = u64::from(w) * self.head_pass_texels(pass, &build.work);
+            let left = h - build.row;
+            let fits = (budget / per_row).min(u64::from(left)) as u32;
+            // A slice records one row at least, so a budget under one row
+            // still moves the build.
+            let rows = if strips == 0 { fits.max(1) } else { fits };
+            if rows == 0 {
+                break;
+            }
+            if pass == HeadPass::Input {
+                build.content = match build.content {
+                    _ if build.row == 0 => Some(source.content),
+                    Some(content) if content == source.content => Some(content),
+                    _ => None,
+                };
+            }
+            let load = if build.row == 0 {
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+            } else {
+                wgpu::LoadOp::Load
+            };
+            self.write_head_uniform(pass, &build.work);
+            self.draw_head_pass(
+                &mut encoder,
+                &next.frame,
+                pass,
+                Some((x, y + build.row, w, rows)),
+                load,
+            );
+            strips += 1;
+            budget = budget.saturating_sub(u64::from(rows) * per_row);
+            build.row += rows;
+            if build.row == h {
+                finished.push(pass);
+                build.pass += 1;
+                build.row = 0;
+            }
+        }
         self.queue.submit(Some(encoder.finish()));
-        self.next = Some(NextFrame {
-            full,
-            window,
-            frame,
-        });
-        true
+        self.ahead_slices += 1;
+        // What the frame holds is known only now that its commands are
+        // submitted.
+        let frame = &mut next.frame;
+        for pass in finished {
+            match pass {
+                HeadPass::Input => {
+                    if let Some(content) = build.content {
+                        frame.content = content;
+                    }
+                }
+                HeadPass::BlurV => {
+                    frame.products_region =
+                        Some(scissor_for(build.work.products, build.work.size, false));
+                }
+                HeadPass::TextureV => frame.texture_ready = true,
+                HeadPass::TransmissionV => frame.transmission_ready = true,
+                _ => {}
+            }
+        }
+        let complete = build.complete();
+        self.next = Some(next);
+        complete
     }
 
     /// What `render_window` renders for a zoomed view: the frame holds the
@@ -1528,9 +1810,11 @@ impl Develop {
                 || f.sigma_size != sigma_size
         });
         if stale {
-            // A frame built ahead for this window is swapped in: its head
-            // passes ran in a submit of their own. Without one the frame is
-            // replaced and its head passes run in this submit.
+            // A frame built ahead for this window is swapped in once every
+            // slice of it is submitted: its head passes ran in submits of
+            // their own. Without one the frame is replaced and its head
+            // passes run in this submit; one still building for this window
+            // is dropped, as the frame replaced here serves the window.
             let ahead = self.next.take_if(|next| {
                 let f = &next.frame;
                 (f.width, f.height, f.generation) == (width, height, source.generation)
@@ -1538,11 +1822,12 @@ impl Develop {
                     && f.sigma_size == sigma_size
             });
             match ahead {
-                Some(next) => {
+                Some(next) if next.build.complete() => {
                     self.frame = Some(next.frame);
                     self.window_swaps += 1;
                 }
-                None => {
+                building => {
+                    drop(building);
                     self.frame = Some(self.build_frame(source, width, height, window, sigma_size));
                     self.window_replaces += 1;
                 }
@@ -2284,78 +2569,18 @@ impl Develop {
     /// when it does not hold the source content yet, then the texture layer
     /// and the transmission map when `work` wants them and they were not
     /// drawn since. They read only the frame and the uniforms they write, so
-    /// a frame built ahead runs them in a submit of its own.
+    /// a frame built ahead runs them in submits of its own
+    /// ([`ahead_slice`](Self::ahead_slice)); here each runs whole.
     fn head_passes(&self, encoder: &mut wgpu::CommandEncoder, frame: &mut Frame, work: &HeadWork) {
         let source = self.source.as_ref().expect("a frame has a source");
-        let (width, height) = work.size;
-        let (window, sigma_size, products) = (work.window, work.sigma_size, work.products);
         let rerun = frame.content != source.content;
         if rerun {
             frame.content = source.content;
-            let window_uniform = [window.x, window.y, window.width, window.height];
-            let (head_pipeline, head_label) = match &source.kind {
-                SourceKind::Photo { space, .. } => {
-                    let taps = input_taps((source.width, source.height), window, (width, height));
-                    self.queue.write_buffer(
-                        &self.input_uniform,
-                        0,
-                        bytemuck::bytes_of(&InputUniform {
-                            matrix: matrices::input_matrix(*space).to_wgsl_columns(),
-                            render_size: [width as f32, height as f32],
-                            decode_srgb: 1,
-                            taps,
-                            window: window_uniform,
-                        }),
-                    );
-                    (&self.input.pipeline, "input transform")
-                }
-                SourceKind::Video(planes) => {
-                    self.queue.write_buffer(
-                        &self.video_uniform,
-                        0,
-                        bytemuck::bytes_of(&planes.uniform(window_uniform)),
-                    );
-                    (&self.video.pipeline, "video")
-                }
-            };
-            let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
-            draw(
-                encoder,
-                head_label,
-                head_pipeline,
-                &frame.input_bind,
-                &frame.working.view,
-                None,
-            );
-            // Only the columns under the products region are read by the
-            // vertical pass, and only that region by the develop pass, so
-            // the blur and develop passes are scissored to it plus a margin.
-            let columns = scissor_for(products, (width, height), true);
-            let region = scissor_for(products, (width, height), false);
-            draw(
-                encoder,
-                "blur h",
-                &self.blur.pipeline,
-                &frame.blur_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                encoder,
-                "blur v",
-                &self.blur.pipeline,
-                &frame.blur_v_bind,
-                &frame.base.view,
-                Some(region),
-            );
         }
         // The head-pass products of M3. Each is drawn once when its slider
         // leaves 0 and again only after the head passes ran or the scissor
         // moved, never on a plain slider change.
-        let columns = scissor_for(products, (width, height), true);
-        let region = scissor_for(products, (width, height), false);
+        let region = scissor_for(work.products, work.size, false);
         if rerun || frame.products_region != Some(region) {
             frame.texture_ready = false;
             frame.transmission_ready = false;
@@ -2380,35 +2605,79 @@ impl Develop {
                 }
             }
         }
-        if work.texture && !frame.texture_ready {
-            let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
-            write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
-            draw(
-                encoder,
-                "texture blur h",
-                &self.blur.pipeline,
-                &frame.texture_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                encoder,
-                "texture blur v",
-                &self.blur.pipeline,
-                &frame.texture_v_bind,
-                &frame.texture_base.view,
-                Some(region),
-            );
+        let texture = work.texture && !frame.texture_ready;
+        let transmission = work.transmission && !frame.transmission_ready;
+        let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+        for pass in HeadPass::plan(rerun, texture, transmission) {
+            self.write_head_uniform(pass, work);
+            self.draw_head_pass(encoder, frame, pass, pass.scissor(work), clear);
+        }
+        if texture {
             frame.texture_ready = true;
         }
-        if work.transmission && !frame.transmission_ready {
-            let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
-            let a = source.atmosphere;
-            for (buffer, direction, stage) in [
-                (&self.minimum_h_uniform, [1, 0], 0),
-                (&self.minimum_v_uniform, [0, 1], 1),
-            ] {
+        if transmission {
+            frame.transmission_ready = true;
+        }
+    }
+
+    /// Writes the uniform `pass` reads for `work`. Each head pass has a
+    /// buffer of its own, so a submit holds every pass's value at once.
+    fn write_head_uniform(&self, pass: HeadPass, work: &HeadWork) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let (width, height) = work.size;
+        let (window, sigma_size) = (work.window, work.sigma_size);
+        match pass {
+            HeadPass::Input => {
+                let window_uniform = [window.x, window.y, window.width, window.height];
+                match &source.kind {
+                    SourceKind::Photo { space, .. } => {
+                        let taps =
+                            input_taps((source.width, source.height), window, (width, height));
+                        self.queue.write_buffer(
+                            &self.input_uniform,
+                            0,
+                            bytemuck::bytes_of(&InputUniform {
+                                matrix: matrices::input_matrix(*space).to_wgsl_columns(),
+                                render_size: [width as f32, height as f32],
+                                decode_srgb: 1,
+                                taps,
+                                window: window_uniform,
+                            }),
+                        );
+                    }
+                    SourceKind::Video(planes) => {
+                        self.queue.write_buffer(
+                            &self.video_uniform,
+                            0,
+                            bytemuck::bytes_of(&planes.uniform(window_uniform)),
+                        );
+                    }
+                }
+            }
+            HeadPass::BlurH | HeadPass::BlurV => {
+                let sigma = basic::base_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::BlurH {
+                    write_blur(&self.queue, &self.blur_h_uniform, [1, 0], 1, sigma);
+                } else {
+                    write_blur(&self.queue, &self.blur_v_uniform, [0, 1], 0, sigma);
+                }
+            }
+            HeadPass::TextureH | HeadPass::TextureV => {
+                let sigma = local::texture_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::TextureH {
+                    write_blur(&self.queue, &self.texture_h_uniform, [1, 0], 1, sigma);
+                } else {
+                    write_blur(&self.queue, &self.texture_v_uniform, [0, 1], 0, sigma);
+                }
+            }
+            HeadPass::MinimumH | HeadPass::MinimumV => {
+                let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1);
+                let a = source.atmosphere;
+                let (buffer, direction, stage) = if pass == HeadPass::MinimumH {
+                    (&self.minimum_h_uniform, [1, 0], 0)
+                } else {
+                    (&self.minimum_v_uniform, [0, 1], 1)
+                };
                 self.queue.write_buffer(
                     buffer,
                     0,
@@ -2420,45 +2689,111 @@ impl Develop {
                     }),
                 );
             }
-            let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
-            write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
-            write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
-            // The minimum runs over the whole render: the smoothing reads
-            // the map beyond the scissor on every side.
-            draw(
-                encoder,
-                "minimum h",
-                &self.minimum.pipeline,
-                &frame.minimum_h_bind,
-                &frame.ping.view,
-                None,
-            );
-            draw(
-                encoder,
-                "minimum v",
-                &self.minimum.pipeline,
-                &frame.minimum_v_bind,
-                &frame.transmission.view,
-                None,
-            );
-            draw(
-                encoder,
-                "transmission blur h",
-                &self.blur.pipeline,
-                &frame.smooth_h_bind,
-                &frame.ping.view,
-                Some(columns),
-            );
-            draw(
-                encoder,
-                "transmission blur v",
-                &self.blur.pipeline,
-                &frame.smooth_v_bind,
-                &frame.transmission.view,
-                Some(region),
-            );
-            frame.transmission_ready = true;
+            HeadPass::TransmissionH | HeadPass::TransmissionV => {
+                let sigma = dehaze::smoothing_sigma(sigma_size.0, sigma_size.1);
+                if pass == HeadPass::TransmissionH {
+                    write_blur(&self.queue, &self.smooth_h_uniform, [1, 0], 0, sigma);
+                } else {
+                    write_blur(&self.queue, &self.smooth_v_uniform, [0, 1], 0, sigma);
+                }
+            }
         }
+    }
+
+    /// Records `pass` of `frame` under `scissor`, beginning with `load`: a
+    /// clear for the whole pass or its first strip, a load for the strips
+    /// after it.
+    fn draw_head_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        pass: HeadPass,
+        scissor: Option<(u32, u32, u32, u32)>,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let blur = &self.blur.pipeline;
+        let minimum = &self.minimum.pipeline;
+        let (label, pipeline, bind, target) = match pass {
+            HeadPass::Input => {
+                let (label, pipeline) = match &source.kind {
+                    SourceKind::Photo { .. } => ("input transform", &self.input.pipeline),
+                    SourceKind::Video(_) => ("video", &self.video.pipeline),
+                };
+                (label, pipeline, &frame.input_bind, &frame.working)
+            }
+            HeadPass::BlurH => ("blur h", blur, &frame.blur_h_bind, &frame.ping),
+            HeadPass::BlurV => ("blur v", blur, &frame.blur_v_bind, &frame.base),
+            HeadPass::TextureH => ("texture blur h", blur, &frame.texture_h_bind, &frame.ping),
+            HeadPass::TextureV => (
+                "texture blur v",
+                blur,
+                &frame.texture_v_bind,
+                &frame.texture_base,
+            ),
+            HeadPass::MinimumH => ("minimum h", minimum, &frame.minimum_h_bind, &frame.ping),
+            HeadPass::MinimumV => (
+                "minimum v",
+                minimum,
+                &frame.minimum_v_bind,
+                &frame.transmission,
+            ),
+            HeadPass::TransmissionH => (
+                "transmission blur h",
+                blur,
+                &frame.smooth_h_bind,
+                &frame.ping,
+            ),
+            HeadPass::TransmissionV => (
+                "transmission blur v",
+                blur,
+                &frame.smooth_v_bind,
+                &frame.transmission,
+            ),
+        };
+        draw_loading(encoder, label, pipeline, bind, &target.view, scissor, load);
+    }
+
+    /// What one pixel of `pass` costs, in texels read and written (see
+    /// [`AHEAD_SLICE_TEXELS`]): the reads its shader makes for the pixel
+    /// plus its one write.
+    fn head_pass_texels(&self, pass: HeadPass, work: &HeadWork) -> u64 {
+        let source = self.source.as_ref().expect("a frame has a source");
+        let sigma_size = work.sigma_size;
+        // A blur reads its centre and one bilinear read for each pair of
+        // taps on each side (blur.wgsl).
+        let blur = |sigma: f32| {
+            let radius = basic::blur_radius(sigma).max(0) as u64;
+            1 + 2 * radius.div_ceil(2)
+        };
+        let reads = match pass {
+            HeadPass::Input => match &source.kind {
+                SourceKind::Photo { .. } => {
+                    let taps = u64::from(input_taps(
+                        (source.width, source.height),
+                        work.window,
+                        work.size,
+                    ));
+                    taps * taps
+                }
+                // The luma plane and the chroma plane.
+                SourceKind::Video(_) => 2,
+            },
+            HeadPass::BlurH | HeadPass::BlurV => {
+                blur(basic::base_sigma(sigma_size.0, sigma_size.1))
+            }
+            HeadPass::TextureH | HeadPass::TextureV => {
+                blur(local::texture_sigma(sigma_size.0, sigma_size.1))
+            }
+            HeadPass::MinimumH | HeadPass::MinimumV => {
+                let radius = dehaze::patch_radius(sigma_size.0, sigma_size.1).max(0) as u64;
+                2 * radius + 1
+            }
+            HeadPass::TransmissionH | HeadPass::TransmissionV => {
+                blur(dehaze::smoothing_sigma(sigma_size.0, sigma_size.1))
+            }
+        };
+        reads + 1
     }
 
     fn build_frame(

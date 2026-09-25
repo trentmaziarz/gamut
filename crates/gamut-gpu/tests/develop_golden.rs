@@ -1316,6 +1316,150 @@ fn a_window_built_ahead_and_swapped_in_equals_a_fresh_render_of_it() {
     }
 }
 
+/// A window built ahead in slices, each in a submit of its own, holds what
+/// the same window built in one submit holds, byte for byte in all seven
+/// textures of its frame. The slices are one row of a pass each, then 3001
+/// texels each, which cuts passes and runs strips of two passes in one
+/// slice. Between two slices the current frame renders another window or
+/// its own, which writes the input uniform with another window, so a slice
+/// that read a render's uniform would differ here. Swapped in, the frame
+/// built in slices renders what a fresh render of its window renders, and
+/// its textures are that render's, byte for byte.
+#[test]
+fn a_window_built_ahead_in_slices_equals_one_built_in_one_submit() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = synthetic_photo();
+    let edit = zoomed_edit();
+    let readback = Readback::new(&gpu.device);
+    const FULL: (u32, u32) = (SIZE, SIZE);
+    const PAD: (u32, u32) = (8, 8);
+    const GRID: u32 = 4;
+    const STEP: (i64, i64) = (4, 0);
+    let start = (20, 22, 24, 20);
+    let window = gamut_gpu::develop::padded_window(FULL, start, PAD, GRID);
+    let at = |rect: (u32, u32, u32, u32), (dx, dy): (i64, i64)| {
+        (
+            (i64::from(rect.0) + dx) as u32,
+            (i64::from(rect.1) + dy) as u32,
+            rect.2,
+            rect.3,
+        )
+    };
+    let first = ViewWindow {
+        full: FULL,
+        window,
+        visible: start,
+    };
+    let elsewhere = ViewWindow {
+        full: FULL,
+        window: (0, 0, 32, 32),
+        visible: (4, 4, 20, 16),
+    };
+    let previous = at(start, (-STEP.0, -STEP.1));
+    let ahead = gamut_gpu::develop::window_ahead(FULL, window, previous, start, PAD, GRID)
+        .expect("a pan that moves leaves the window");
+    let read = |develop: &Develop, ahead: bool| -> Vec<(&'static str, Vec<u8>)> {
+        develop
+            .frame_textures(ahead)
+            .into_iter()
+            .map(|(name, view, (w, h))| (name, readback.read(&gpu.device, &gpu.queue, view, w, h)))
+            .collect()
+    };
+
+    // The window built in one submit.
+    let mut whole = Develop::new(&gpu.device, &gpu.queue);
+    whole.set_source(&photo);
+    view_render_of(&mut whole, &gpu, &readback, &edit, &first);
+    whole.set_ahead_slice_texels(u64::MAX);
+    assert!(whole.build_ahead(&edit, FULL, ahead), "one call builds it");
+    assert_eq!(whole.ahead_slices(), 1, "in one submit");
+    assert!(!whole.ahead_building());
+    let one = read(&whole, true);
+    assert_eq!(one.len(), 7, "the seven textures of a frame");
+
+    // The pan's exit from the window, where the swap happens.
+    let mut visible = start;
+    while gamut_gpu::develop::holds(window, visible) {
+        visible = at(visible, STEP);
+    }
+    let reached = ViewWindow {
+        full: FULL,
+        window: ahead,
+        visible,
+    };
+    let mut fresh = Develop::new(&gpu.device, &gpu.queue);
+    fresh.set_source(&photo);
+    let alone = view_render_of(&mut fresh, &gpu, &readback, &edit, &reached);
+    assert_eq!(fresh.window_swaps(), 0);
+    let rendered = read(&fresh, false);
+
+    for texels in [1, 3001] {
+        let mut sliced = Develop::new(&gpu.device, &gpu.queue);
+        sliced.set_source(&photo);
+        view_render_of(&mut sliced, &gpu, &readback, &edit, &first);
+        sliced.set_ahead_slice_texels(texels);
+        let mut calls = 0u64;
+        loop {
+            calls += 1;
+            let done = sliced.build_ahead(&edit, FULL, ahead);
+            assert_eq!(done, !sliced.ahead_building(), "call {calls}");
+            assert_eq!(sliced.window_ahead(), Some((FULL, ahead)));
+            if done {
+                break;
+            }
+            let view = if calls % 2 == 1 { &elsewhere } else { &first };
+            view_render_of(&mut sliced, &gpu, &readback, &edit, view);
+        }
+        assert_eq!(sliced.ahead_slices(), calls, "one submit a call");
+        assert!(calls > 9, "the nine head passes cut over {calls} submits");
+        assert!(
+            !sliced.build_ahead(&edit, FULL, ahead),
+            "complete, nothing left to build"
+        );
+        assert_eq!(sliced.ahead_slices(), calls, "no slice once complete");
+        let pieces = read(&sliced, true);
+        assert_eq!(pieces.len(), one.len());
+        for ((name, a), (_, b)) in pieces.iter().zip(&one) {
+            let differing = a.iter().zip(b).filter(|(a, b)| a != b).count();
+            println!(
+                "slices of {texels} texels, {calls} submits: {name}: bytes that differ from one submit: {differing} of {}",
+                b.len()
+            );
+            assert_eq!(a, b, "{name} in slices of {texels} texels");
+        }
+
+        // Swapped in where the pan leaves the current window.
+        view_render_of(&mut sliced, &gpu, &readback, &edit, &first);
+        let (replaces, swaps) = (sliced.window_replaces(), sliced.window_swaps());
+        let swapped = view_render_of(&mut sliced, &gpu, &readback, &edit, &reached);
+        assert_eq!(sliced.window_replaces(), replaces, "the swap replaces none");
+        assert_eq!(sliced.window_swaps(), swaps + 1, "the frame ahead is taken");
+        let differing = swapped.iter().zip(&alone).filter(|(a, b)| a != b).count();
+        println!(
+            "slices of {texels} texels: swapped in at {visible:?}, bytes that differ from a fresh render of it: {differing} of {}",
+            alone.len()
+        );
+        assert_eq!(swapped, alone, "the swapped window, slices of {texels}");
+        let now = read(&sliced, false);
+        assert_eq!(now.len(), rendered.len());
+        for ((name, a), (_, b)) in now.iter().zip(&rendered) {
+            let differing = a.iter().zip(b).filter(|(a, b)| a != b).count();
+            println!(
+                "slices of {texels} texels: swapped {name}: bytes that differ from a fresh render's: {differing} of {}",
+                b.len()
+            );
+            assert_eq!(a, b, "swapped {name} in slices of {texels} texels");
+        }
+    }
+}
+
 /// The red overlay of a mask under a zoomed window is the overlay the full
 /// render shows there.
 #[test]
