@@ -19,7 +19,7 @@ use gamut_core::mask::{
 };
 use gamut_core::{Adjustments, CropRect, ExportPreset, Mask, PhotoEdit};
 use gamut_gpu::{Develop, EdgePasses, Headless, Readback, ViewWindow};
-use gamut_media::Photo;
+use gamut_media::{Photo, fixtures, open_photo};
 use half::f16;
 
 const SIZE: u32 = 64;
@@ -3712,11 +3712,18 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     // the source in one pass of three targets, 6 with them in two passes. A
     // Radius step that keeps the side of a cell takes no moments of the
     // source and draws their 4 box means again. `boxed` counts those steps.
+    // The reached field adds the seed and a pass a doubling step: at Radius
+    // 0.05 the radius is 3.2 pixels in cells of one, a flood of 3 cells,
+    // steps 1 and 2, 1 + 2 = 3 passes; at 0.02 it is 1.28 pixels, a flood of
+    // 1 cell, step 1, 1 + 1 = 2 passes. The first three refines below are at
+    // 0.05 and every later one at 0.02, so `refines` refines take
+    // 3 min(refines, 3) + 2 (refines - 3) such passes.
     let (refine, source) = if develop.refine_fused() {
         (13, 5)
     } else {
         (16, 6)
     };
+    let flooded = |refines: u64| 3 * refines.min(3) + 2 * refines.saturating_sub(3);
     let builds_after = |develop: &mut Develop, edit: &PhotoEdit, boxed: u64| -> (u64, u64, u64) {
         develop
             .render(edit, CropRect::FULL, (SIZE, SIZE), (SIZE, SIZE))
@@ -3734,8 +3741,8 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         );
         assert_eq!(
             u64::from(develop.refine_passes()),
-            refine * refines + source * sources + 4 * boxed,
-            "{refine} passes a refine, {source} a source and 4 a box of the source"
+            refine * refines + source * sources + 4 * boxed + flooded(refines),
+            "{refine} passes a refine, {source} a source, 4 a box of the source and the flood"
         );
         (develop.mask_alpha_builds(), refines, sources)
     };
@@ -3785,11 +3792,11 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
     // On the 64 pixel photo a Radius of 0.05 and one of 0.02 both take
     // cells of one pixel, with a box of 2 cells and of 1.
     let geometry = Geometry::full((SIZE, SIZE), (SIZE, SIZE));
-    for (radius, cells) in [(0.05, 2), (0.02, 1)] {
+    for (radius, cells, flood) in [(0.05, 2, 3), (0.02, 1, 1)] {
         let mut refine = edit.masks[0].refine;
         refine.radius = radius;
         let plan = Plan::for_geometry(&refine, &geometry);
-        assert_eq!((plan.step, plan.cells), (1, cells));
+        assert_eq!((plan.step, plan.cells, plan.flood), (1, cells, flood));
     }
     edit.masks[0].refine.radius = 0.02;
     assert_eq!(
@@ -3827,9 +3834,13 @@ fn a_develop_slider_draws_no_refine_pass_and_a_refine_slider_draws_no_alpha() {
         "a new source content draws all three"
     );
     assert_eq!(develop.refine_builds().1, 0, "never a part");
+    // Seven refines, three at 0.05 with 3 passes of the flood each and four
+    // at 0.02 with 2: 3 x 3 + 4 x 2 = 17. Fused, 7 x 13 + 2 x 5 + 4 + 17 =
+    // 122 passes.
+    assert_eq!(flooded(7), 17);
     assert_eq!(
         (develop.refine_passes(), develop.refine_tiles()),
-        (7 * refine as u32 + 2 * source as u32 + 4, 7),
+        (7 * refine as u32 + 2 * source as u32 + 4 + 17, 7),
         "seven refines of one tile, two of them with the moments of the source and one with their box means alone"
     );
 }
@@ -3912,14 +3923,17 @@ fn a_refined_mask_on_a_photo_wider_than_1024_pixels_matches() {
 /// A scratch budget under the bytes of the grid of cells cuts a refine into
 /// tiles, and the tiles draw byte for byte what one tile draws. On the 1101
 /// by 90 photo of the test above, the grid is 551 by 45 cells of two pixels
-/// at a radius of 0.015 (24,795 cells of 224 bytes) and 276 by 23 cells of
-/// four at 0.03 (6,348 cells of 224 bytes), each with a margin of 20 cells.
-/// A budget of 157 by 157 cells at a step of 2 gives tiles of 157 cells a
-/// side, which write 228 pixels a row. One of 79 by 79 cells at a step of 4
-/// gives tiles of 104 cells, the floor of two margins and 64, which write
-/// 244. Each cuts the 1101 pixels into 5 tiles; the default budget holds
-/// either grid in one. A stroke along the whole photo, with a hard rim over
-/// the row edge at 60, crosses every cut between the tiles.
+/// at a radius of 0.015 (24,795 cells of 232 bytes) and 276 by 23 cells of
+/// four at 0.03 (6,348 cells of 232 bytes), each with a margin of 29 cells:
+/// three boxes of 6, the 2 cells beside of the gathers, the cell beside of
+/// the reached field and its flood of 8 cells (16.5 pixels of radius in cells
+/// of 2, 33 in cells of 4), 18 + 2 + 1 + 8 = 29. A budget of 157 by 157 cells
+/// at a step of 2 gives tiles of 157 cells a side, which write
+/// (157 - 2 x 29 - 3) x 2 = 192 pixels a row: 6 tiles. One of 79 by 79 cells
+/// at a step of 4 gives tiles of 122 cells, the floor of two margins and 64,
+/// which write (122 - 61) x 4 = 244: 5 tiles. The default budget holds either
+/// grid in one. A stroke along the whole photo, with a hard rim over the row
+/// edge at 60, crosses every cut between the tiles.
 #[test]
 fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     let _turn = ONE_AT_A_TIME
@@ -3934,26 +3948,43 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     let size = (photo.width, photo.height);
     let readback = Readback::new(&gpu.device);
     // The radius, the step, the cells a side of the budget, the bytes of a
-    // cell, and the side of a tile.
-    for (radius, step, budget_side, cell_bytes, side) in
-        [(0.015, 2, 157u64, 224u64, 157u32), (0.03, 4, 79, 224, 104)]
-    {
+    // cell, the side of a tile, and the tiles a mask.
+    for (radius, step, budget_side, cell_bytes, side, cut) in [
+        (0.015, 2, 157u64, 232u64, 157u32, 6u32),
+        (0.03, 4, 79, 232, 122, 5),
+    ] {
         let plan = Plan::for_geometry(
             &refined_at(Mask::default(), 100.0, radius, 50.0).refine,
             &Geometry::full(size, size),
         );
-        assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 20));
+        assert_eq!(plan.flood, 8);
+        assert_eq!(plan.margin(), 3 * 6 + 2 + 1 + 8);
+        assert_eq!((plan.step, plan.cells, plan.margin()), (step, 6, 29));
+        assert_eq!(side.max(2 * 29 + 64), side);
+        assert_eq!(1101u32.div_ceil((side - 2 * 29 - 3) * step), cut);
         let budget = budget_side * budget_side * cell_bytes;
         let (_, grid) = plan.grid();
         assert!(
             u64::from(grid.0 * grid.1) * cell_bytes > budget,
             "the budget is under the bytes of the grid"
         );
-        // A stroke across the photo, its centre on row 52 and its hard rim
-        // 5 pixels over the row edge at 60, refined alone; then with the
-        // radial gradient and the stroke down the photo of the test above,
-        // all three refined.
-        let band = brush_source(&[stroke(&[[0.02, 0.578], [0.98, 0.578]], 0.012, 20.0, 100.0)]);
+        // A stroke across the photo over the darker rows from 60 down, its
+        // centre on row 76 and its hard rim 5 pixels over the row edge at 60
+        // into the bright rows, refined alone; then with the radial gradient
+        // and the stroke down the photo of the test above, all three
+        // refined. Under the connectivity prior, ruled 2026-09-24, a band
+        // whose inside the bright rows reach through like colour holds
+        // still: the band of this test before T-19, centred on row 52 over
+        // the bright rows, moved no pixel at Radius 0.03. Over the darker
+        // rows the inside is out of the outside's reach and the spill
+        // leaves: the twin moves 5238 pixels alone and 5541 with the other
+        // two masks in cells of 2, 5363 and 5348 in cells of 4.
+        let band = brush_source(&[stroke(
+            &[[0.02, 76.0 / 90.0], [0.98, 76.0 / 90.0]],
+            21.0 / 1101.0,
+            20.0,
+            100.0,
+        )]);
         let radial = MaskSource::Radial(RadialGradient {
             centre: [0.4995, 0.5],
             radius: [0.0309, 0.05],
@@ -3997,8 +4028,8 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
             println!("{name}: refine_tiles {tiles} then {one_tile}; the twin moves {moved} pixels");
             assert_eq!(
                 (tiles, one_tile),
-                (5 * refined_masks, refined_masks),
-                "{name}: 5 tiles a mask at {budget} bytes, then 1"
+                (cut * refined_masks, refined_masks),
+                "{name}: {cut} tiles a mask at {budget} bytes, then 1"
             );
             let differing = tiled.iter().zip(&whole).filter(|(a, b)| a != b).count();
             assert_eq!(tiled.len(), whole.len());
@@ -4524,10 +4555,14 @@ fn a_radius_step_to_another_cell_size_takes_the_moments_again() {
 /// A refine of one tile is 13 passes, and 5 more when it takes the moments
 /// of the source (16 and 6 with the solve and the source each drawn in two
 /// passes); with blocks, each of the 6 boxes of the three gathers and of the
-/// 4 boxes of the source has a block pass before it. Of the two masks here
-/// the first takes the moments of the source and the second holds them: 28
-/// and 19 passes, 47 in all, against 18 and 13, 31, in the direct loop (32
-/// and 22, 54, against 22 and 16, 38, in two passes each).
+/// 4 boxes of the source has a block pass before it. The reached field adds
+/// its seed and k passes of the flood to every refine, k the doubling steps
+/// whose sum stays at most the radius in cells: 51.2 pixels in cells of 4 at
+/// 1024 pixels wide, 12 cells, 1 + 2 + 4 = 7, k = 3; 67.2 pixels at 1344, 16
+/// cells, 1 + 2 + 4 + 8 = 15, k = 4; 102.4 pixels at 2048, 25 cells, 15 and
+/// 16 more is 31, k = 4. Of the two masks here the first takes the moments
+/// of the source and the second holds them: at 2048 pixels 28 + 5 and 19 + 5
+/// passes, 57 in all, against 18 + 5 and 13 + 5, 41, in the direct loop.
 #[test]
 fn a_refined_mask_whose_box_spans_blocks_matches() {
     let _turn = ONE_AT_A_TIME
@@ -4540,11 +4575,11 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
     println!("adapter: {}", gpu.describe());
     let readback = Readback::new(&gpu.device);
     // The width, the box in cells either side, its blocks and the cells left
-    // over, and the block edge the masks lie over.
-    for (width, cells, blocks, singles, edge) in [
-        (1024u32, 9u32, 0u32, 19u32, 576f32),
-        (1344, 12, 3, 1, 768.0),
-        (2048, 18, 4, 5, 1152.0),
+    // over, the block edge the masks lie over, and the passes of the flood.
+    for (width, cells, blocks, singles, edge, floods) in [
+        (1024u32, 9u32, 0u32, 19u32, 576f32, 3u32),
+        (1344, 12, 3, 1, 768.0, 4),
+        (2048, 18, 4, 5, 1152.0, 4),
     ] {
         let photo = blocky_photo(width, 160);
         let size = (photo.width, photo.height);
@@ -4554,6 +4589,12 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
         );
         assert_eq!((plan.step, plan.cells), (4, cells));
         assert_eq!(plan.grid().1, (width / 4, 40));
+        assert_eq!(plan.flood, width * 5 / 100 / 4);
+        let steps = (0..)
+            .map(|k| (1u32 << k) * 2 - 1)
+            .take_while(|sum| *sum <= plan.flood)
+            .count() as u32;
+        assert_eq!(steps, floods);
         let taps = 2 * cells + 1;
         assert_eq!(
             if taps < 24 {
@@ -4623,10 +4664,12 @@ fn a_refined_mask_whose_box_spans_blocks_matches() {
             "{name}: refine_passes {passes} with blocks, {direct_passes} in the direct loop, the source and the solve fused {fused}; the twin moves {moved} pixels"
         );
         // A refine without blocks: 13 passes with the solve in one pass of
-        // four targets, 16 with it in two passes of two. The moments of the
-        // source without blocks: 5 passes with them in one pass of three
-        // targets, 6 with them in a pass of two and a pass of one.
+        // four targets, 16 with it in two passes of two, and the seed and the
+        // passes of the flood. The moments of the source without blocks: 5
+        // passes with them in one pass of three targets, 6 with them in a
+        // pass of two and a pass of one.
         let (refine, source) = if fused { (13, 5) } else { (16, 6) };
+        let refine = refine + 1 + floods;
         if blocks > 0 {
             assert_eq!(
                 passes,
@@ -5126,19 +5169,85 @@ fn a_two_tone_object_under_a_loose_refined_mask_is_kept_whole() {
     check_on("refined mask over a two-tone object", &photo, &snapped);
 }
 
-/// A mask that is soft at the scale of the box is soft on purpose: Refine
-/// edges runs its passes and returns it as drawn.
+/// The change of a refined alpha from the alpha as drawn over the pixels the
+/// mask covers, mean and max in codes of alpha, on the twin at Amount 100.
+fn soft_change(photo: &Photo, mask: &Mask) -> (f32, f32) {
+    let stored: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| {
+            basic::decode_rgb8([px[0], px[1], px[2]], photo.source)
+                .map(|c| half(c, Rounding::Nearest))
+        })
+        .collect();
+    let geometry = Geometry::full((photo.width, photo.height), (photo.width, photo.height));
+    let store = |v: f32| half(v, Rounding::Nearest);
+    let mut drawn = mask.clone();
+    drawn.refine = Refine::default();
+    let p: Vec<f32> =
+        mask_twin::alpha_image_before_the_store(&drawn, &stored, &geometry, None, &store)
+            .into_iter()
+            .map(mask_twin::stored_alpha)
+            .collect();
+    let q = gamut_color::refine::refined(&p, &stored, &geometry, &mask.refine, &|m| m);
+    let changes: Vec<f32> = p
+        .iter()
+        .zip(&q)
+        .filter(|(p, _)| **p > 0.0)
+        .map(|(p, q)| (q - p).abs() * 255.0)
+        .collect();
+    let mean = changes.iter().sum::<f32>() / changes.len() as f32;
+    (mean, changes.iter().copied().fold(0.0, f32::max))
+}
+
+/// A mask that is soft at the scale of the box changes no more than the soft
+/// bar allows, and the GPU matches the twin. The bar, ruled 2026-09-21: where
+/// the mask's gradient is wider than the radius, the refined change is at most
+/// x1.00 of the baseline guided filter's change on the same input (the ruled
+/// colour guided filter at the eps of sensitivity 50, t18-design-pass
+/// summary2.py), on the mean and on the max.
+///
+/// At Radius 0.02 (1.28 pixels) the twin returns the soft radial as drawn. At
+/// Radius 0.05 (3.2 pixels) its gradient is wider than the radius: 3.46 pixels
+/// from alpha 0.9 to 0.1 on the ray through the worst pixel (a median of 3.98
+/// over 72 rays). Measured 2026-09-25 under the connectivity prior
+/// (tools-2026-09-24-t19/soft_radial_bar.txt), over the 883 pixels the mask
+/// covers: the baseline changes the alpha by 23.509 codes on the mean and
+/// 63.611 at most, the ruled design by 0.678 and 25.722, x0.03 and x0.40.
+/// The render moves by 8 codes at most, at pixel (34, 40), 67 pixels in all.
+/// The snap before T-19 left this mask unchanged, which this test asserted
+/// until the bar was measured.
 #[test]
-fn a_soft_refined_mask_comes_back_as_drawn() {
+fn a_soft_refined_mask_stays_inside_the_soft_bar_and_matches() {
+    const BASELINE_MEAN: f32 = 23.509;
+    const BASELINE_MAX: f32 = 63.611;
     let photo = synthetic_photo();
     let soft = exposure_mask("Soft", radial_source());
     let plain = cpu_reference(&photo, &masked(vec![soft.clone()]), Rounding::Nearest, 0);
     for radius in [0.02, 0.05] {
-        let edit = masked(vec![refined_at(soft.clone(), 100.0, radius, 50.0)]);
+        let refined = refined_at(soft.clone(), 100.0, radius, 50.0);
+        let edit = masked(vec![refined.clone()]);
         let with = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
         let most = most_over(&with, &plain, |_, _| true);
-        println!("soft mask at a radius of {radius}: refine edges moves it {most} codes at most");
-        assert!(most <= 1, "radius {radius}: moved by {most} codes");
+        let (mean, max) = soft_change(&photo, &refined);
+        println!(
+            "soft mask at a radius of {radius}: refine edges moves it {most} codes at most; the alpha changes by {mean:.3} codes on the mean and {max:.3} at most"
+        );
+        if radius == 0.02 {
+            assert!(most <= 1, "radius {radius}: moved by {most} codes");
+        } else {
+            assert!(
+                mean <= BASELINE_MEAN && max <= BASELINE_MAX,
+                "radius {radius}: the change {mean:.3}/{max:.3} codes passes the baseline's {BASELINE_MEAN}/{BASELINE_MAX}"
+            );
+            println!(
+                "soft mask at a radius of {radius}: x{:.2} on the mean, x{:.2} on the max",
+                mean / BASELINE_MEAN,
+                max / BASELINE_MAX
+            );
+        }
         check_masks(&format!("soft refined mask at a radius of {radius}"), &edit);
     }
 }
@@ -5303,6 +5412,195 @@ fn a_refined_mask_under_a_crop_window_and_a_zoomed_window_matches_the_full_rende
             .count();
         println!("refine edges moves {moved} pixels of the window");
         assert!(moved > 200, "refine edges shows inside the window");
+    }
+}
+
+/// example.heic, 1280 by 854 pixels: the church tower of case 9 of the T-19
+/// design pass stands about column 822 from row 85 to 225, dark slate over
+/// pale stone, with sky on both sides.
+fn tower_heic() -> Photo {
+    let photo = open_photo(&fixtures::require("example.heic")).expect("open the fixture");
+    assert_eq!((photo.width, photo.height), (1280, 854));
+    photo
+}
+
+/// Case 9's stroke: one stroke of radius 70 pixels and feather 50 down the
+/// tower, from (820, 100) to (822, 235) in pixels of the photo, as the T-19
+/// design pass places it (t18-design-pass/cases.py), refined at `radius`.
+fn stroke_down_the_heic_tower(radius: f32) -> PhotoEdit {
+    let (w, h) = (1280.0, 854.0);
+    let tower = brush_source(&[stroke(
+        &[[820.0 / w, 100.0 / h], [822.0 / w, 235.0 / h]],
+        70.0 / w,
+        50.0,
+        100.0,
+    )]);
+    masked(vec![refined_at(
+        exposure_mask("Tower", tower),
+        100.0,
+        radius,
+        50.0,
+    )])
+}
+
+/// Case 9 of the T-19 design pass: a stroke drawn much wider than the tower
+/// it covers, with sky on both sides, refined at Radius 0.01, 0.03 and 0.05.
+/// The reached field lets the sky the outside reaches leave the mask; the
+/// GPU matches the twin at each radius.
+#[test]
+fn case_9s_stroke_down_the_tower_refined_at_three_radii_matches() {
+    let photo = tower_heic();
+    let size = (photo.width, photo.height);
+    // Radius, then the side of a cell, the box and the flood in cells: 12.8
+    // pixels in cells of 1; 38.4 in cells of 4; 64 in cells of 4.
+    for (radius, plan_of) in [(0.01, (1, 9, 12)), (0.03, (4, 7, 9)), (0.05, (4, 11, 16))] {
+        let edit = stroke_down_the_heic_tower(radius);
+        let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+        assert_eq!((plan.step, plan.cells, plan.flood), plan_of);
+        // The spill beside the tower is a small part of the whole photo, so
+        // the share assert_the_refine_shows asks of a render is not asked
+        // here: the twin has to move some pixels at each radius.
+        let mut plain = edit.clone();
+        plain.masks[0].refine = Refine::default();
+        let with = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+        let without = cpu_reference(&photo, &plain, Rounding::Nearest, 0);
+        let moved = with.iter().zip(&without).filter(|(a, b)| a != b).count();
+        let name = format!("case 9's stroke down the tower at Radius {radius}");
+        println!("{name}: refine edges moves {moved} pixels of the twin");
+        assert!(moved > 0, "{name}: refine edges moves no pixel");
+        check_on(&name, &photo, &edit);
+    }
+}
+
+/// Case 9's stroke at Radius 0.05 under a scratch budget of 150 by 150 cells
+/// is drawn in tiles, and the tiles give byte for byte what one tile gives.
+/// The grid is 320 by 214 cells of 4 pixels, 68,480 cells of 232 bytes, over
+/// the budget. The margin is 3 boxes of 11, the 2 cells beside of the
+/// gathers, the cell beside of the reached field and its flood of 16 cells,
+/// 33 + 2 + 1 + 16 = 52, so a tile is the floor of 2 x 52 + 64 = 168 cells a
+/// side and writes (168 - 2 x 52 - 3) x 4 = 244 pixels a row and a column:
+/// 6 tiles across 1280 pixels and 4 down 854, 24 in all.
+#[test]
+fn case_9s_stroke_in_tiles_of_a_small_budget_gives_what_one_tile_gives() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = tower_heic();
+    let size = (photo.width, photo.height);
+    let edit = stroke_down_the_heic_tower(0.05);
+    let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+    assert_eq!((plan.step, plan.cells, plan.flood), (4, 11, 16));
+    assert_eq!(plan.margin(), 3 * 11 + 2 + 1 + 16);
+    assert_eq!(plan.grid().1, (320, 214));
+    let cell_bytes = 232u64;
+    let budget = 150 * 150 * cell_bytes;
+    assert!(
+        320 * 214 * cell_bytes > budget,
+        "the budget is under the grid"
+    );
+    let side = 150u32.max(2 * plan.margin() + 64);
+    assert_eq!(side, 168);
+    let span = (side - 2 * plan.margin() - 3) * plan.step;
+    assert_eq!(span, 244);
+    let cut = 1280u32.div_ceil(span) * 854u32.div_ceil(span);
+    assert_eq!(cut, 24);
+    let readback = Readback::new(&gpu.device);
+    // A graph of its own for each budget, so its counters read the tiles of
+    // this render alone.
+    let render = |budget: Option<u64>| -> (Vec<u8>, u32) {
+        let develop = Develop::new(&gpu.device, &gpu.queue);
+        let mut develop = match budget {
+            Some(bytes) => develop.with_refine_scratch_budget(bytes),
+            None => develop,
+        };
+        develop.set_source(&photo);
+        let view = develop
+            .render(&edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        let pixels = readback.read(&gpu.device, &gpu.queue, view, size.0, size.1);
+        (pixels, develop.refine_tiles())
+    };
+    let (tiled, tiles) = render(Some(budget));
+    let (whole, one_tile) = render(None);
+    let differing = tiled.iter().zip(&whole).filter(|(a, b)| a != b).count();
+    println!(
+        "case 9's stroke at Radius 0.05: refine_tiles {tiles} then {one_tile}; {differing} bytes of the tiles differ from one tile"
+    );
+    assert_eq!((tiles, one_tile), (cut, 1));
+    assert_eq!(tiled.len(), whole.len());
+    assert_eq!(differing, 0, "the tiles differ from one tile");
+}
+
+/// A zoomed viewer on case 9's tower at Radius 0.01, 0.03 and 0.05: a
+/// window of the tower padded by the reach of Refine edges, which holds the
+/// flood of the reached field, gives what the full render gives on the
+/// pixels it shows.
+#[test]
+fn a_zoomed_window_on_case_9s_tower_matches_the_full_render() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let photo = tower_heic();
+    let full = (photo.width, photo.height);
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(&photo);
+    // The tower and the sky beside it, on odd pixels off the cell grid.
+    let visible = (761, 81, 121, 161);
+    for radius in [0.01, 0.03, 0.05] {
+        let edit = stroke_down_the_heic_tower(radius);
+        let mut unrefined = edit.clone();
+        unrefined.masks[0].refine = Refine::default();
+        let reach = gamut_color::refine::reach(&edit.masks[0].refine.sanitised(), full);
+        let view = ViewWindow {
+            full,
+            window: gamut_gpu::develop::padded_window(full, visible, (reach, reach), 1),
+            visible,
+        };
+        let whole = full_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let zoomed = view_render_of(&mut develop, &gpu, &readback, &edit, &view);
+        let without = view_render_of(&mut develop, &gpu, &readback, &unrefined, &view);
+        let max = max_difference(&whole, &zoomed);
+        let mean = whole
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(zoomed.as_chunks::<4>().0)
+            .flat_map(|(a, b)| (0..3).map(move |k| f64::from(a[k].abs_diff(b[k]))))
+            .sum::<f64>()
+            / (whole.len() / 4 * 3) as f64;
+        let moved = zoomed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(without.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "case 9's tower in a zoomed window at Radius {radius}, a reach of {reach} pixels: max difference {max}, mean {mean:.4}; refine edges moves {moved} pixels of the window"
+        );
+        assert!(
+            max <= MAX_DIFFERENCE,
+            "Radius {radius}: max difference {max}"
+        );
+        assert!(
+            mean <= MEAN_DIFFERENCE,
+            "Radius {radius}: mean difference {mean}"
+        );
+        assert!(
+            moved > 0,
+            "Radius {radius}: refine edges shows inside the window"
+        );
     }
 }
 
