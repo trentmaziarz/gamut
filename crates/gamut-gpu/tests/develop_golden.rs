@@ -5604,6 +5604,403 @@ fn a_zoomed_window_on_case_9s_tower_matches_the_full_render() {
     }
 }
 
+/// Portrait_8.jpg, 1200 by 1800 pixels once turned upright: a field under a
+/// sky, with the horizon about row 1030 over columns 1032 to 1127, where
+/// cases 1a and 8 of the T-18 benchmark place their radial.
+fn portrait_8() -> Photo {
+    let photo = open_photo(&fixtures::require("Portrait_8.jpg")).expect("open the fixture");
+    assert_eq!((photo.width, photo.height), (1200, 1800));
+    photo
+}
+
+/// The radial of cases 1a and 8 (t18-design-pass/benchlib.py `ellipse`):
+/// centre (1080, 1130), 360 pixels across and 100 + `rim_over` down, feather
+/// 10, lifting the exposure one stop, refined at `radius` with an amount of
+/// 100 and a sensitivity of 50.
+fn radial_at_the_horizon(rim_over: f32, radius: f32) -> PhotoEdit {
+    let long = 1800.0;
+    let mut mask = Mask::new(
+        "Radial",
+        MaskSource::Radial(RadialGradient {
+            centre: [1080.0 / 1200.0, 1130.0 / 1800.0],
+            radius: [360.0 / long, (100.0 + rim_over) / long],
+            rotation: 0.0,
+            feather: 10.0,
+        }),
+    );
+    mask.adjust.exposure = 1.0;
+    masked(vec![refined_at(mask, 100.0, radius, 50.0)])
+}
+
+/// The rows and columns of Portrait_8.jpg benchlib reads a case at: the
+/// columns 1032 to 1127 of `c1_regions`, and the gap of case 8, 4 to 16 rows
+/// under the horizon, or the sky row of case 1, 10 to 26 rows over it.
+const HORIZON_COLUMNS: std::ops::Range<u32> = 1032..1128;
+const GAP_ROWS: std::ops::Range<u32> = 1034..1046;
+const RIM_ROWS: std::ops::Range<u32> = 1004..1020;
+
+/// The indices of the pixels of a region of a photo `width` pixels wide.
+fn region(width: u32, rows: std::ops::Range<u32>) -> Vec<usize> {
+    rows.flat_map(|y| HORIZON_COLUMNS.map(move |x| (y * width + x) as usize))
+        .collect()
+}
+
+/// Reads an R8Unorm alpha of `size` one byte a pixel, code for code: the
+/// readback writes 8-bit sRGB, which folds the codes over 75 together.
+fn read_alpha(gpu: &Headless, source: &wgpu::TextureView, size: (u32, u32)) -> Vec<u8> {
+    const SHADER: &str = "
+        @group(0) @binding(0) var source: texture_2d<f32>;
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+            let x = f32(i32(index & 1u) * 4 - 1);
+            let y = f32(i32(index & 2u) * 2 - 1);
+            return vec4<f32>(x, y, 0.0, 1.0);
+        }
+        @fragment
+        fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+            return vec4<f32>(textureLoad(source, vec2<i32>(position.xy), 0).r, 0.0, 0.0, 1.0);
+        }
+    ";
+    let device = &gpu.device;
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("alpha reader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("alpha reader layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("alpha reader"),
+        layout: Some(
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("alpha reader"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            }),
+        ),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let extent = wgpu::Extent3d {
+        width: size.0,
+        height: size.1,
+        depth_or_array_layers: 1,
+    };
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("alpha reader target"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("alpha reader"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(source),
+        }],
+    });
+    let row =
+        size.0.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("alpha reader buffer"),
+        size: u64::from(row) * u64::from(size.1),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("alpha reader"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("alpha reader"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        target.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(size.1),
+            },
+        },
+        extent,
+    );
+    let submission = gpu.queue.submit(Some(encoder.finish()));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .expect("wait for the alpha");
+    receiver
+        .recv()
+        .expect("map callback ran")
+        .expect("map the alpha");
+    let alpha = {
+        let mapped = buffer.get_mapped_range(..).expect("mapped alpha");
+        mapped
+            .chunks_exact(row as usize)
+            .flat_map(|line| line[..size.0 as usize].to_vec())
+            .collect()
+    };
+    buffer.unmap();
+    alpha
+}
+
+/// What the GPU draws of an edit with one refined mask.
+struct RefineReadings {
+    /// The render.
+    refined: Vec<[u8; 3]>,
+    /// The render with Refine edges off.
+    unrefined: Vec<[u8; 3]>,
+    /// The refined alpha of mask 0, one byte a pixel.
+    alpha: Vec<u8>,
+}
+
+/// [`RefineReadings`] of `edit` on `photo`, or `None` when the machine has no
+/// adapter.
+fn gpu_refine_readings(photo: &Photo, edit: &PhotoEdit) -> Option<RefineReadings> {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = Headless::new()?;
+    let size = (photo.width, photo.height);
+    let readback = Readback::new(&gpu.device);
+    let mut develop = Develop::new(&gpu.device, &gpu.queue);
+    develop.set_source(photo);
+    let render = |develop: &mut Develop, edit: &PhotoEdit| -> Vec<[u8; 3]> {
+        let view = develop
+            .render(edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        readback
+            .read(&gpu.device, &gpu.queue, view, size.0, size.1)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| [px[0], px[1], px[2]])
+            .collect()
+    };
+    let refined = render(&mut develop, edit);
+    let (view, frame) = develop.mask_product(0).expect("mask 0 is drawn");
+    assert_eq!(frame, size);
+    let alpha = read_alpha(&gpu, view, size);
+    let mut plain = edit.clone();
+    plain.masks[0].refine = Refine::default();
+    let unrefined = render(&mut develop, &plain);
+    Some(RefineReadings {
+        refined,
+        unrefined,
+        alpha,
+    })
+}
+
+/// The twin's refined alpha of mask 0 of `edit` on `photo`, as the GPU
+/// stores it, one byte a pixel: the working pixels in half floats rounded
+/// as `rounding` rounds, as `cpu_reference` takes them.
+fn twin_refined_alpha(photo: &Photo, edit: &PhotoEdit, rounding: Rounding) -> Vec<u8> {
+    let size = (photo.width, photo.height);
+    let store = |v: f32| half(v, rounding);
+    let stored: Vec<[f32; 3]> = photo
+        .rgba8
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| basic::decode_rgb8([px[0], px[1], px[2]], photo.source).map(store))
+        .collect();
+    mask_twin::alpha_image_before_the_store(
+        &edit.masks[0],
+        &stored,
+        &Geometry::full(size, size),
+        None,
+        &store,
+    )
+    .into_iter()
+    .map(|alpha| (mask_twin::stored_alpha(alpha) * 255.0).round() as u8)
+    .collect()
+}
+
+/// The mean of an alpha over `pixels`, 0 to 1.
+fn mean_alpha(alpha: &[u8], pixels: &[usize]) -> f64 {
+    pixels.iter().map(|i| f64::from(alpha[*i])).sum::<f64>() / pixels.len() as f64 / 255.0
+}
+
+/// The largest difference over `pixels` of the GPU's alpha from the closer
+/// of the twin's two, in codes: the twin takes the working pixels rounded
+/// either way, as the golden tests take the GPU's half float stores.
+fn most_apart(gpu: &[u8], twins: &[Vec<u8>; 2], pixels: &[usize]) -> i32 {
+    pixels
+        .iter()
+        .map(|i| {
+            twins
+                .iter()
+                .map(|twin| (i32::from(gpu[*i]) - i32::from(twin[*i])).abs())
+                .min()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// benchlib's rim row: the move of a render, the largest channel difference
+/// from the photo in codes, against the move of the unrefined render, over
+/// `pixels`. The largest, and how many pixels differ by more than 3 codes.
+fn rim_moves(
+    photo: &Photo,
+    refined: &[[u8; 3]],
+    unrefined: &[[u8; 3]],
+    pixels: &[usize],
+) -> (i32, usize) {
+    let source = photo.rgba8.as_chunks::<4>().0;
+    let move_of = |render: &[[u8; 3]], i: usize| -> i32 {
+        (0..3)
+            .map(|k| (i32::from(render[i][k]) - i32::from(source[i][k])).abs())
+            .max()
+            .unwrap_or(0)
+    };
+    let gaps: Vec<i32> = pixels
+        .iter()
+        .map(|i| (move_of(refined, *i) - move_of(unrefined, *i)).abs())
+        .collect();
+    (
+        gaps.iter().copied().max().unwrap_or(0),
+        gaps.iter().filter(|gap| **gap > 3).count(),
+    )
+}
+
+/// Case 8 of the T-18 benchmark: the radial of layout a drawn 20 pixels short
+/// of the horizon (ry 80, feather 10), lifting the exposure a stop, refined
+/// at Radius 0.01, 0.03 and 0.05. The move grows the mask down into the field
+/// between its rim and the horizon: the twin fills the gap to a mean alpha of
+/// 0.000, 0.731 and 0.706 on the guide of the app, ACEScct of the working
+/// pixels in Rec.2020. The benchmark's 0.256 and 0.209 come from its own
+/// guide, ACEScct of the pixels in sRGB primaries. The GPU matches the twin
+/// at each radius, and the mean alpha of the gap is printed for both.
+#[test]
+fn case_8s_radial_short_of_the_horizon_refined_at_three_radii_matches() {
+    let photo = portrait_8();
+    let size = (photo.width, photo.height);
+    let gap = region(photo.width, GAP_ROWS);
+    assert_eq!(gap.len(), 1152);
+    // Radius, then the side of a cell, the box and the flood in cells: 18
+    // pixels in cells of 2; 54 in cells of 4; 90 in cells of 4.
+    for (radius, plan_of) in [(0.01, (2, 6, 9)), (0.03, (4, 10, 13)), (0.05, (4, 16, 22))] {
+        let edit = radial_at_the_horizon(-20.0, radius);
+        let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+        assert_eq!((plan.step, plan.cells, plan.flood), plan_of);
+        let name = format!("case 8's radial short of the horizon at Radius {radius}");
+        let twins = [Rounding::Nearest, Rounding::TowardZero]
+            .map(|rounding| twin_refined_alpha(&photo, &edit, rounding));
+        if let Some(RefineReadings { alpha: gpu, .. }) = gpu_refine_readings(&photo, &edit) {
+            println!(
+                "{name}: gap mean alpha gpu {:.3}, twin {:.3}; the alphas apart by at most {} codes on the gap",
+                mean_alpha(&gpu, &gap),
+                mean_alpha(&twins[0], &gap),
+                most_apart(&gpu, &twins, &gap)
+            );
+        }
+        check_on(&name, &photo, &edit);
+    }
+}
+
+/// Layout a of case 1 of the T-18 benchmark: the radial over the horizon (ry
+/// 134, feather 10), lifting the exposure a stop, refined at Radius 0.01. The
+/// rim row, the sky 10 to 26 rows over the horizon, keeps some of the move;
+/// benchlib reads the twin's worst pixel there at 28 codes and 64 of 1536
+/// pixels over 3 codes on its own guide and move model. The GPU matches the
+/// twin, and the rim row's largest move and count over 3 are printed for
+/// both, with how far their alphas lie apart there.
+#[test]
+fn layout_as_radial_over_the_horizon_at_radius_0_01_matches() {
+    let photo = portrait_8();
+    let size = (photo.width, photo.height);
+    let rim = region(photo.width, RIM_ROWS);
+    assert_eq!(rim.len(), 1536);
+    let edit = radial_at_the_horizon(34.0, 0.01);
+    let plan = Plan::for_geometry(&edit.masks[0].refine, &Geometry::full(size, size));
+    assert_eq!((plan.step, plan.cells, plan.flood), (2, 6, 9));
+    let name = "layout a's radial over the horizon at Radius 0.01";
+    let mut plain = edit.clone();
+    plain.masks[0].refine = Refine::default();
+    let twin_refined = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
+    let twin_unrefined = cpu_reference(&photo, &plain, Rounding::Nearest, 0);
+    let (twin_most, twin_over) = rim_moves(&photo, &twin_refined, &twin_unrefined, &rim);
+    let twins = [Rounding::Nearest, Rounding::TowardZero]
+        .map(|rounding| twin_refined_alpha(&photo, &edit, rounding));
+    if let Some(RefineReadings {
+        refined,
+        unrefined,
+        alpha: gpu,
+    }) = gpu_refine_readings(&photo, &edit)
+    {
+        let (most, over) = rim_moves(&photo, &refined, &unrefined, &rim);
+        println!(
+            "{name}: rim row gpu worst pixel {most} codes, {over} of {} px over 3; twin worst pixel {twin_most} codes, {twin_over} px over 3; rim mean alpha gpu {:.3}, twin {:.3}, apart by at most {} codes",
+            rim.len(),
+            mean_alpha(&gpu, &rim),
+            mean_alpha(&twins[0], &rim),
+            most_apart(&gpu, &twins, &rim)
+        );
+    }
+    check_on(name, &photo, &edit);
+}
+
 /// `mask` with Shift edge, Feather and Contrast at these values: shares of the
 /// longer side of the photo for the first two. On the 64 pixel photos a shift
 /// of 0.02 is one pixel a side along each axis and a feather of 0.01 a sigma

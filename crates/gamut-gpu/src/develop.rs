@@ -1821,6 +1821,17 @@ impl Develop {
         Some((view, (frame.width, frame.height)))
     }
 
+    /// The alpha mask `index` hands to the blend on the frame of the last
+    /// render, and the size of that frame: the refined alpha while Refine
+    /// edges alone is on. A test reads its bytes to hold the refined alpha to
+    /// the twin's.
+    #[doc(hidden)]
+    pub fn mask_product(&self, index: usize) -> Option<(&wgpu::TextureView, (u32, u32))> {
+        let frame = self.frame.as_ref()?;
+        let slot = frame.masks.get(index)?.as_ref()?;
+        Some((product_view(slot), (frame.width, frame.height)))
+    }
+
     /// How far Refine edges and the edge controls read around a pixel at a
     /// render of `full`: the widest reach among the masks this edit draws,
     /// each Refine edges' and its edge controls' together, and the margin of
