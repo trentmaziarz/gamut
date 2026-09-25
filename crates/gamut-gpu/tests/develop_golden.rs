@@ -3091,6 +3091,318 @@ fn the_tiles_of_a_small_budget_give_what_one_tile_gives() {
     }
 }
 
+/// Reads the bytes of `view`, a view of an R8Unorm texture of `size` pixels,
+/// one a pixel, row by row from the top left. The texture cannot be copied
+/// from, so a pass loads each texel into a target of the same format that
+/// can; a unorm code loaded and stored again is the same code.
+fn read_r8(gpu: &Headless, view: &wgpu::TextureView, size: (u32, u32)) -> Vec<u8> {
+    const SHADER: &str = "
+        @vertex
+        fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+            let x = f32(i32(index & 1u) * 4 - 1);
+            let y = f32(i32(index >> 1u) * 4 - 1);
+            return vec4<f32>(x, y, 0.0, 1.0);
+        }
+        @group(0) @binding(0) var source: texture_2d<f32>;
+        @fragment
+        fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+            return textureLoad(source, vec2<i32>(position.xy), 0);
+        }
+    ";
+    let device = &gpu.device;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("r8 copy"),
+        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("r8 copy"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("r8 copy"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("r8 copy"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let extent = wgpu::Extent3d {
+        width: size.0,
+        height: size.1,
+        depth_or_array_layers: 1,
+    };
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("r8 copy"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("r8 copy"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(view),
+        }],
+    });
+    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = size.0.div_ceil(alignment) * alignment;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("r8 copy"),
+        size: u64::from(padded) * u64::from(size.1),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("r8 copy"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("r8 copy"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        target.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(size.1),
+            },
+        },
+        extent,
+    );
+    let submission = gpu.queue.submit(Some(encoder.finish()));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .expect("wait for the copy");
+    receiver
+        .recv()
+        .expect("map callback ran")
+        .expect("map the copy");
+    let mut bytes = Vec::with_capacity((size.0 * size.1) as usize);
+    {
+        let mapped = buffer
+            .get_mapped_range(..)
+            .expect("mapped range of the copy");
+        for row in mapped.chunks_exact(padded as usize) {
+            bytes.extend_from_slice(&row[..size.0 as usize]);
+        }
+    }
+    buffer.unmap();
+    bytes
+}
+
+/// The budget of the scratch in the test below: 112,560 cells of 224 bytes,
+/// 335 by 336. Its square side is 335, as 1340 is the default budget's, and
+/// like the default budget it holds one column more than that square.
+const SMALL_SCRATCH_BUDGET: u64 = 335 * 336 * 224;
+
+/// Two refined masks of one frame at different steps share its scratch and
+/// keep it inside the budget, and each draws the refined alpha it draws
+/// alone. The 24 megapixel photo of the timing test at the default budget
+/// ran 212 s on the fallback adapter, so this is its case at a quarter of
+/// each side: a 1500 by 1000 photo under 25,213,440 bytes
+/// ([`SMALL_SCRATCH_BUDGET`]). A Radius of 0.05 is 75 pixels there: cells of
+/// 4, a grid of 375 by 250 (93,750 cells, one tile of 375). One of 0.0012 is
+/// 1.8 pixels: cells of one, a grid of 1500 by 1000, tiled at 335 alone.
+/// After 0.05, the step 1 mask would want 375 by 335 (125,625 cells), so it
+/// cuts its tiles at 300, the most rows 375 columns leave: 375 by 300 is
+/// 112,500 cells, and 375 by 301 would be 112,875. After 0.0012, the step 4
+/// mask would want 375 by 335, so it cuts at 336: 336 by 335 is 112,560,
+/// and 337 by 335 would be 112,895. These are the cuts at 1198 and 1341 of
+/// the 24 megapixel photo at the default budget.
+#[test]
+fn two_masks_at_different_steps_hold_their_scratch_inside_the_budget() {
+    let _turn = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gpu) = Headless::new() else {
+        println!("no adapter, skipped");
+        return;
+    };
+    println!("adapter: {}", gpu.describe());
+    let started = std::time::Instant::now();
+    let photo = blocky_photo(1500, 1000);
+    let size = (photo.width, photo.height);
+    // Two radial gradients with a firm rim, one over the other's edge.
+    let radial = |centre: [f32; 2], radius: [f32; 2]| {
+        MaskSource::Radial(RadialGradient {
+            centre,
+            radius,
+            rotation: 0.0,
+            feather: 10.0,
+        })
+    };
+    let coarse = refined_at(
+        exposure_mask("Coarse", radial([0.45, 0.5], [0.25, 0.3])),
+        100.0,
+        0.05,
+        50.0,
+    );
+    let fine = refined_at(
+        exposure_mask("Fine", radial([0.6, 0.45], [0.2, 0.25])),
+        100.0,
+        0.0012,
+        50.0,
+    );
+    for (mask, step, grid) in [(&coarse, 4, (375, 250)), (&fine, 1, (1500, 1000))] {
+        let plan = Plan::for_geometry(&mask.refine, &Geometry::full(size, size));
+        assert_eq!((plan.step, plan.grid().1), (step, grid));
+    }
+    // The refined alpha of each mask of `masks` on a graph of its own, and
+    // the scratch the last of them drew with.
+    let render = |masks: &[&Mask]| -> (Vec<Vec<u8>>, gamut_gpu::develop::RefineHold) {
+        let mut develop =
+            Develop::new(&gpu.device, &gpu.queue).with_refine_scratch_budget(SMALL_SCRATCH_BUDGET);
+        develop.set_source(&photo);
+        let edit = masked(masks.iter().map(|&mask| mask.clone()).collect());
+        develop
+            .render(&edit, CropRect::FULL, size, size)
+            .expect("a source is set");
+        let alphas = (0..masks.len())
+            .map(|index| {
+                let (view, frame) = develop.refined_alpha(index).expect("the mask is refined");
+                assert_eq!(frame, size);
+                read_r8(&gpu, view, size)
+            })
+            .collect();
+        (alphas, develop.refine_last_hold().expect("a refine ran"))
+    };
+    let said = |hold: &gamut_gpu::develop::RefineHold| {
+        format!(
+            "held {}x{}, side {}, made {}, branch {}",
+            hold.size.0, hold.size.1, hold.side, hold.made, hold.branch
+        )
+    };
+    let mut alone = Vec::new();
+    for (mask, held, side) in [(&coarse, (375, 250), 375), (&fine, (335, 335), 335)] {
+        let (mut alphas, hold) = render(&[mask]);
+        assert_eq!(
+            (hold.size, hold.side, hold.made, hold.branch),
+            (held, side, true, "First"),
+            "{}: the scratch alone",
+            mask.name
+        );
+        let alpha = alphas.remove(0);
+        let inside = alpha.iter().filter(|&&a| a == 255).count();
+        let partial = alpha.iter().filter(|&&a| a > 0 && a < 255).count();
+        println!(
+            "{} alone: {}; {inside} pixels at 255, {partial} between 0 and 255",
+            mask.name,
+            said(&hold)
+        );
+        assert!(
+            inside > 0 && partial > 0,
+            "{}: the refined alpha has an edge",
+            mask.name
+        );
+        alone.push((mask.name.clone(), alpha));
+    }
+    let alone_of = |mask: &Mask| -> &Vec<u8> {
+        &alone
+            .iter()
+            .find(|(name, _)| *name == mask.name)
+            .expect("rendered alone")
+            .1
+    };
+    // The order of the list, then the size held and the side of the tiles
+    // after the second mask.
+    for (order, masks, held, side) in [
+        ("0.05 then 0.0012", [&coarse, &fine], (375, 300), 300),
+        ("0.0012 then 0.05", [&fine, &coarse], (336, 335), 336),
+    ] {
+        let (alphas, hold) = render(&masks);
+        println!("{order}: {}", said(&hold));
+        assert_eq!(
+            (hold.size, hold.side, hold.made, hold.branch),
+            (held, side, true, "Cut"),
+            "{order}: the scratch of the second mask"
+        );
+        let bytes = u64::from(hold.size.0) * u64::from(hold.size.1) * 224;
+        assert!(bytes <= SMALL_SCRATCH_BUDGET, "{order}: {bytes} bytes");
+        for (index, mask) in masks.into_iter().enumerate() {
+            let differing = alphas[index]
+                .iter()
+                .zip(alone_of(mask))
+                .filter(|(a, b)| a != b)
+                .count();
+            println!(
+                "{order}: mask {} ({}) differs from itself alone in {differing} bytes",
+                index + 1,
+                mask.name
+            );
+            assert_eq!(
+                differing,
+                0,
+                "{order}: mask {} beside the other differs from it alone",
+                index + 1
+            );
+        }
+    }
+    println!("{:.1} s", started.elapsed().as_secs_f64());
+}
+
 /// The photo, the mask and the render of the two tests of a Radius step:
 /// blocks of colour 1420 pixels wide and 160 rows, where a Radius of 0.05
 /// and one of 0.049 both take cells of 4 pixels, with a box of 13 cells

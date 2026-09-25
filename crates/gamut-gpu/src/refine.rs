@@ -190,7 +190,127 @@ pub(crate) fn tile_side(plan: &Plan, budget: u64) -> u32 {
     } else {
         budget_side(budget).min(grid.0.max(grid.1))
     };
-    side.max(plan.margin() * 2 + 64)
+    side.max(tile_floor(plan))
+}
+
+/// The fewest cells a side a tile of this plan holds: what the boxes of the
+/// gathers and a few pixels around them need.
+pub(crate) fn tile_floor(plan: &Plan) -> u32 {
+    plan.margin() * 2 + 64
+}
+
+/// Which part of [`hold`] gave the size of the scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Branch {
+    /// No scratch was held: the plan's wanted cells.
+    First,
+    /// The per-axis maximum of the held size and the plan's wanted cells.
+    Fits,
+    /// The plan's tiles cut smaller than [`tile_side`], so that the per-axis
+    /// maximum fits the budget.
+    Cut,
+    /// No side from the plan's floor up fits beside the held size: the
+    /// scratch is made again at the plan's wanted cells, or kept as it is
+    /// when it already holds them, as after a make by this branch.
+    Floor,
+}
+
+impl Branch {
+    /// The name of the branch, as a test reads it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Branch::First => "First",
+            Branch::Fits => "Fits",
+            Branch::Cut => "Cut",
+            Branch::Floor => "Floor",
+        }
+    }
+}
+
+/// The size of the scratch a plan draws with, the side its tiles are cut
+/// at, whether the scratch is made for it, and by which branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hold {
+    /// The cells a side the targets of cells hold.
+    pub(crate) size: (u32, u32),
+    /// The most cells a side a tile of the plan holds.
+    pub(crate) side: u32,
+    /// Whether the scratch is made, at `size`.
+    pub(crate) made: bool,
+    pub(crate) branch: Branch,
+}
+
+/// The scratch a plan draws with, from the size of the scratch the frame
+/// holds, if any, and the budget of the scratch in bytes. Every mask of a
+/// frame shares its scratch, and two masks at different steps render one
+/// after the other every frame, so the scratch keeps what both want rather
+/// than be made again for each: the per-axis maximum of the held size and
+/// what the plan wants when that fits the budget. When it does not, the
+/// plan's tiles are cut at the largest side from its floor up whose maximum
+/// fits, and the scratch keeps its size or grows inside the budget. When no
+/// side does, a scratch that already holds what the plan wants at
+/// [`tile_side`] on both axes is kept as it is, over the budget, and the
+/// tiles are cut at that side: a plan repeated after a floor branch makes
+/// nothing again. Only otherwise is the scratch made again at what the plan
+/// wants, which may be smaller than what was held.
+pub(crate) fn hold(held: Option<(u32, u32)>, plan: &Plan, budget: u64) -> Hold {
+    let (_, grid) = plan.grid();
+    let most = tile_side(plan, budget);
+    let wanted = |side: u32| (grid.0.min(side), grid.1.min(side));
+    let Some(held) = held else {
+        return Hold {
+            size: wanted(most),
+            side: most,
+            made: true,
+            branch: Branch::First,
+        };
+    };
+    // What is held and what the plan wants with tiles of `side` cells.
+    let joined = |side: u32| {
+        let wanted = wanted(side);
+        (held.0.max(wanted.0), held.1.max(wanted.1))
+    };
+    let fits = |size: (u32, u32)| u64::from(size.0) * u64::from(size.1) * CELL_BYTES <= budget;
+    let grown = |side: u32, branch: Branch| {
+        let size = joined(side);
+        Hold {
+            size,
+            side,
+            made: size != held,
+            branch,
+        }
+    };
+    if fits(joined(most)) {
+        return grown(most, Branch::Fits);
+    }
+    if joined(most) == held {
+        return Hold {
+            size: held,
+            side: most,
+            made: false,
+            branch: Branch::Floor,
+        };
+    }
+    let floor = tile_floor(plan);
+    if !fits(joined(floor)) {
+        return Hold {
+            size: wanted(most),
+            side: most,
+            made: true,
+            branch: Branch::Floor,
+        };
+    }
+    // The maximum grows with the side: the floor fits and `most` does not.
+    let (mut fit, mut over) = (floor, most);
+    while over - fit > 1 {
+        let side = fit + (over - fit) / 2;
+        if fits(joined(side)) {
+            fit = side;
+        } else {
+            over = side;
+        }
+    }
+    grown(fit, Branch::Cut)
 }
 
 /// The cells a block pass writes for a box pass over `area` along one axis
@@ -526,6 +646,9 @@ pub(crate) struct RefinePass {
     /// Every box sums its cells in the direct loop, whatever its size, so a
     /// test can hold the block sums to it.
     direct_box: bool,
+    /// What [`hold`] gave the last plan drawn, so a test can read the size
+    /// of the scratch and the side of the tiles.
+    pub(crate) last_hold: Option<Hold>,
 }
 
 const SHADER: &str = include_str!("shaders/refine.wgsl");
@@ -646,6 +769,7 @@ impl RefinePass {
             refine_passes: 0,
             refine_tiles: 0,
             direct_box: false,
+            last_hold: None,
         }
     }
 
@@ -718,16 +842,26 @@ impl RefinePass {
         plan: &Plan,
         over: Rect,
     ) -> u32 {
-        let (_, grid) = plan.grid();
-        let side = tile_side(plan, self.scratch_budget);
-        let wanted = (grid.0.min(side), grid.1.min(side));
-        if scratch
-            .as_ref()
-            .is_none_or(|held| held.size.0 < wanted.0 || held.size.1 < wanted.1)
-        {
-            let size = scratch.as_ref().map_or(wanted, |held| {
-                (held.size.0.max(wanted.0), held.size.1.max(wanted.1))
-            });
+        let held = scratch.as_ref().map(|held| held.size);
+        let hold = hold(held, plan, self.scratch_budget);
+        self.last_hold = Some(hold);
+        if hold.made {
+            let size = hold.size;
+            if let (Branch::Floor, Some(held)) = (hold.branch, held) {
+                log::warn!(
+                    "the refine scratch of {}x{} cells and the {}x{} a plan wants \
+                     pass the budget of {} bytes at its floor of {} cells a tile: \
+                     made again at {}x{}",
+                    held.0,
+                    held.1,
+                    size.0,
+                    size.1,
+                    self.scratch_budget,
+                    tile_floor(plan),
+                    size.0,
+                    size.1
+                );
+            }
             self.scratches += 1;
             let float = |label: &str| FloatTarget {
                 view: target(device, label, MOMENT_FORMAT, size.0, size.1).view,
@@ -744,7 +878,7 @@ impl RefinePass {
             });
         }
         let scratch = scratch.as_mut().expect("made above");
-        let tiles = tiles(plan, over, side);
+        let tiles = tiles(plan, over, hold.side);
         if refined.slots < tiles.len() as u32 {
             refined.slots = (tiles.len() as u32).next_power_of_two();
             refined.uniform = self.uniform_buffer(device, refined.slots);
@@ -1713,5 +1847,338 @@ mod tests {
         assert!(budget_side(SCRATCH_BUDGET_BYTES) < limit);
         let plan = plan(0.05, (6000, 4000), (960, 0), (4032, 4000));
         assert!(tile_side(&plan, SCRATCH_BUDGET_BYTES) < limit);
+    }
+
+    /// What a walk of plans through [`hold`] held, from no scratch, in one
+    /// frame whose plans all take the photo whole.
+    struct Walk {
+        /// What [`hold`] gave after each plan.
+        steps: Vec<Hold>,
+        /// How many times the scratch was made.
+        made: u32,
+        /// How many plans left the scratch over the budget.
+        over: u32,
+        /// How many plans the floor branch made the scratch for.
+        floors: u32,
+        /// Every rule a plan broke, one line each.
+        broken: Vec<String>,
+    }
+
+    /// Walks `radii` in order on a photo of `photo` pixels, rendered whole,
+    /// through [`hold`] under `budget`, and checks after each plan that the
+    /// scratch is inside the budget (or, after a floor branch, made at what
+    /// the plan wants or kept as held at [`tile_side`]), that it holds what
+    /// the plan wants at the side its tiles are cut at, that the side lies
+    /// from the plan's floor to [`tile_side`], and that the scratch shrinks
+    /// only when the floor branch makes it again.
+    fn walk(name: &str, photo: (u32, u32), radii: &[f32], budget: u64, print: bool) -> Walk {
+        let mut out = Walk {
+            steps: Vec::new(),
+            made: 0,
+            over: 0,
+            floors: 0,
+            broken: Vec::new(),
+        };
+        let mut held = None;
+        for (index, &radius) in radii.iter().enumerate() {
+            let plan = plan(radius, photo, (0, 0), photo);
+            let hold = hold(held, &plan, budget);
+            let (_, grid) = plan.grid();
+            let wanted = (grid.0.min(hold.side), grid.1.min(hold.side));
+            let bytes = u64::from(hold.size.0) * u64::from(hold.size.1) * CELL_BYTES;
+            let (floor, most) = (tile_floor(&plan), tile_side(&plan, budget));
+            let at = format!(
+                "{name}, plan {} (radius {radius}, step {}, grid {}x{})",
+                index + 1,
+                plan.step,
+                grid.0,
+                grid.1
+            );
+            let mut broken = Vec::new();
+            if hold.branch == Branch::Floor {
+                out.floors += 1;
+                if hold.made && hold.size != wanted {
+                    broken.push(format!(
+                        "the floor branch holds {:?}, not a scratch made at {wanted:?}",
+                        hold.size
+                    ));
+                }
+                if !hold.made && (Some(hold.size) != held || hold.side != most) {
+                    broken.push(format!(
+                        "the floor branch keeps {:?} at side {}, not {held:?} at {most}",
+                        hold.size, hold.side
+                    ));
+                }
+            } else if bytes > budget {
+                broken.push(format!(
+                    "held {}x{} is {bytes} bytes, over {budget}",
+                    hold.size.0, hold.size.1
+                ));
+            }
+            if bytes > budget {
+                out.over += 1;
+            }
+            if hold.size.0 < wanted.0 || hold.size.1 < wanted.1 {
+                broken.push(format!(
+                    "held {:?} does not cover {wanted:?} at side {}",
+                    hold.size, hold.side
+                ));
+            }
+            if !(floor..=most).contains(&hold.side) {
+                broken.push(format!("side {} outside {floor} to {most}", hold.side));
+            }
+            let shrank =
+                held.is_some_and(|size: (u32, u32)| hold.size.0 < size.0 || hold.size.1 < size.1);
+            if shrank && hold.branch != Branch::Floor {
+                broken.push(format!(
+                    "the scratch shrank from {held:?} to {:?}",
+                    hold.size
+                ));
+            }
+            if !hold.made && Some(hold.size) != held {
+                broken.push(format!("{:?} held without a make over {held:?}", hold.size));
+            }
+            if hold.made {
+                out.made += 1;
+            }
+            if print {
+                println!(
+                    "{at}: side {} of {floor} to {most}, held {}x{} = {bytes} bytes, {} ({:?})",
+                    hold.side,
+                    hold.size.0,
+                    hold.size.1,
+                    if hold.made { "made" } else { "kept" },
+                    hold.branch
+                );
+            }
+            out.broken
+                .extend(broken.into_iter().map(|line| format!("{at}: {line}")));
+            out.steps.push(hold);
+            held = Some(hold.size);
+        }
+        out
+    }
+
+    /// Two masks of one frame at different steps render alternately every
+    /// frame and share its scratch: whatever the order of their plans, the
+    /// scratch stays inside the budget, and a step that does not fit beside
+    /// what is held cuts its tiles smaller rather than grow the scratch.
+    #[test]
+    fn a_frame_of_plans_at_steps_1_to_4_keeps_its_scratch_inside_the_budget() {
+        use std::collections::BTreeSet;
+
+        // The name, the photo, the radii in order, the budget, and after each
+        // plan the size held and the side of its tiles, and the makes.
+        struct Case {
+            name: &'static str,
+            photo: (u32, u32),
+            radii: Vec<f32>,
+            budget: u64,
+            held: Vec<((u32, u32), u32)>,
+            made: u32,
+        }
+        let budget = SCRATCH_BUDGET_BYTES;
+        let small = 16 * 1024 * 1024;
+        let cases = [
+            // The 24 megapixel photo: step 4 whole, then step 1 cut at the
+            // rows 1500 columns leave the budget.
+            Case {
+                name: "A 0.05 then 0.0012",
+                photo: (6000, 4000),
+                radii: vec![0.05, 0.0012],
+                budget,
+                held: vec![((1500, 1000), 1500), ((1500, 1198), 1198)],
+                made: 2,
+            },
+            Case {
+                name: "A 0.0012 then 0.05",
+                photo: (6000, 4000),
+                radii: vec![0.0012, 0.05],
+                budget,
+                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
+                made: 2,
+            },
+            // The worst found: a step 3 grid of 2731 by 658 cells, whole.
+            Case {
+                name: "B 0.0035 then 0.001",
+                photo: (8192, 1974),
+                radii: vec![0.0035, 0.001],
+                budget,
+                held: vec![((2731, 658), 2731), ((2731, 658), 658)],
+                made: 1,
+            },
+            Case {
+                name: "B 0.0035, 0.001, 0.05, 0.0025",
+                photo: (8192, 1974),
+                radii: vec![0.0035, 0.001, 0.05, 0.0025],
+                budget,
+                held: vec![
+                    ((2731, 658), 2731),
+                    ((2731, 658), 658),
+                    ((2731, 658), 2048),
+                    ((2731, 658), 658),
+                ],
+                made: 1,
+            },
+            Case {
+                name: "B 0.001 then 0.0035",
+                photo: (8192, 1974),
+                radii: vec![0.001, 0.0035],
+                budget,
+                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
+                made: 2,
+            },
+            // The control: no grid of the largest square photo is whole.
+            Case {
+                name: "C 0.05, 0.001, 0.0025, 0.0035",
+                photo: (8192, 8192),
+                radii: vec![0.05, 0.001, 0.0025, 0.0035],
+                budget,
+                held: vec![((1340, 1340), 1340); 4],
+                made: 1,
+            },
+            // Two masks on the 24 megapixel photo, rendered alternately ten
+            // times: made twice, then held.
+            Case {
+                name: "D 0.05 and 0.0012 ten times",
+                photo: (6000, 4000),
+                radii: [0.05, 0.0012].repeat(10),
+                budget,
+                held: [((1500, 1000), 1500), ((1500, 1198), 1198)]
+                    .into_iter()
+                    .chain([((1500, 1198), 1500), ((1500, 1198), 1198)].repeat(9))
+                    .collect(),
+                made: 2,
+            },
+            // The floor branch: at 16 MiB the box of step 4 at 0.049 needs
+            // 278 cells a side, and 278 by 278 passes the budget alone. The
+            // same plan three more times keeps what the floor branch made.
+            Case {
+                name: "E 0.03 then 0.049 at 16 MiB",
+                photo: (1280, 4000),
+                radii: vec![0.03, 0.049, 0.049, 0.049, 0.049],
+                budget: small,
+                held: vec![
+                    ((273, 273), 273),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                    ((278, 278), 278),
+                ],
+                made: 2,
+            },
+        ];
+        let mut broken = Vec::new();
+        for case in &cases {
+            let walk = walk(case.name, case.photo, &case.radii, case.budget, true);
+            broken.extend(walk.broken);
+            let read: Vec<_> = walk
+                .steps
+                .iter()
+                .map(|hold| (hold.size, hold.side))
+                .collect();
+            if read != case.held {
+                broken.push(format!(
+                    "{}: held and sides {read:?}, expected {:?}",
+                    case.name, case.held
+                ));
+            }
+            if walk.made != case.made {
+                broken.push(format!(
+                    "{}: made {} times, expected {}",
+                    case.name, walk.made, case.made
+                ));
+            }
+            println!("{}: made {} times", case.name, walk.made);
+        }
+        // Case D's two masks: made at most twice over the ten renders.
+        let alternate = walk("D", (6000, 4000), &[0.05, 0.0012].repeat(10), budget, false);
+        if alternate.made > 2 {
+            broken.push(format!("D: made {} times over ten renders", alternate.made));
+        }
+        // Case E's second plan is the floor branch, made again at what it
+        // wants and over the small budget, as one box needs. The same plan
+        // after it keeps that scratch as it is.
+        let floor = walk(
+            "E",
+            (1280, 4000),
+            &[0.03, 0.049, 0.049, 0.049, 0.049],
+            small,
+            false,
+        );
+        let last = floor.steps[1];
+        if (last.branch, last.made) != (Branch::Floor, true) {
+            broken.push(format!("E: plan 2 is {last:?}, not the floor branch"));
+        }
+        for (index, kept) in floor.steps.iter().enumerate().skip(2) {
+            if kept.made || kept.size != last.size {
+                broken.push(format!(
+                    "E: plan {} is {kept:?}, not {:?} kept",
+                    index + 1,
+                    last.size
+                ));
+            }
+        }
+
+        // The sweep: every order of four radii, 12, 20 and 28 pixels and 0.05
+        // of the longer side (steps 1 to 4), each order walked twice, on
+        // eight photos.
+        let orders: Vec<[usize; 4]> = (0..256usize)
+            .map(|code| [code & 3, (code >> 2) & 3, (code >> 4) & 3, (code >> 6) & 3])
+            .filter(|order| order.iter().fold(0, |seen, index| seen | 1 << index) == 15)
+            .collect();
+        assert_eq!(orders.len(), 24);
+        let photos = [
+            (6000, 4000),
+            (8192, 1974),
+            (8192, 8192),
+            (8192, 1000),
+            (4032, 3024),
+            (1280, 1600),
+            (8192, 200),
+            (1974, 8192),
+        ];
+        let (mut plans, mut over, mut floors) = (0, 0, 0);
+        for photo in photos {
+            let longer = photo.0.max(photo.1) as f32;
+            let radii = [12.0 / longer, 20.0 / longer, 28.0 / longer, 0.05];
+            let mut sizes = BTreeSet::new();
+            let (mut photo_over, mut photo_floors) = (0, 0);
+            for order in &orders {
+                let twice: Vec<f32> = order.iter().chain(order).map(|&k| radii[k]).collect();
+                let name = format!("sweep {}x{} order {order:?}", photo.0, photo.1);
+                let walk = walk(&name, photo, &twice, budget, false);
+                plans += walk.steps.len();
+                photo_over += walk.over;
+                photo_floors += walk.floors;
+                sizes.extend(walk.steps.iter().map(|hold| hold.size));
+                broken.extend(walk.broken);
+            }
+            let sizes: Vec<String> = sizes
+                .iter()
+                .map(|size| {
+                    let bytes = u64::from(size.0) * u64::from(size.1) * CELL_BYTES;
+                    format!("{}x{} = {bytes} bytes", size.0, size.1)
+                })
+                .collect();
+            println!(
+                "sweep {}x{}: {photo_over} over the budget, {photo_floors} floor branch, held {}",
+                photo.0,
+                photo.1,
+                sizes.join(", ")
+            );
+            over += photo_over;
+            floors += photo_floors;
+        }
+        println!("sweep: {plans} plans, {over} over the budget, {floors} floor branch");
+        if over != 0 || floors != 0 {
+            broken.push(format!(
+                "sweep: {over} plans over the budget and {floors} floor branch, expected 0 and 0"
+            ));
+        }
+        for line in &broken {
+            println!("broken: {line}");
+        }
+        assert!(broken.is_empty(), "{} broken", broken.len());
     }
 }
