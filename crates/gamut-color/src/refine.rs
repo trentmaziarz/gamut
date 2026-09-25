@@ -248,10 +248,10 @@ impl Plan {
     /// The flood's cells of the reached field gather 1 weighs its inside by,
     /// [`Plan::flood`], are not in the margin, ruled 2026-09-26. The flood's
     /// reads clamp at the edge of the render's grid, so where the flood's
-    /// steps reach past a window's pad, the window may differ from the full
-    /// render by at most 1e-3 of an alpha; the twin measured 2.5e-4 at
-    /// Radius 0.012. A tile of the GPU clamps its flood at the tile's edge
-    /// the same way.
+    /// steps reach past a window's pad, a window padded by the reach equals
+    /// the full render within 4e-3 of an alpha, one 8-bit code, ruled
+    /// 2026-09-26 on the 3.98e-3 the twin measured at Radius 0.03. A tile of
+    /// the GPU clamps its flood at the tile's edge the same way.
     pub fn margin(&self) -> u32 {
         GATHERS as u32 * self.cells + (GATHERS as u32 - 1)
     }
@@ -260,8 +260,9 @@ impl Plan {
     /// the cell beside for the bilinear step of the last gather, and the cell
     /// a window may cut at its border. Three boxes of 0.71 Radius make it
     /// about 2.13 Radius, and the cells beside add four cells. The flood's
-    /// steps may read past it, within 1e-3 of an alpha (see
-    /// [`Plan::margin`]).
+    /// steps may read past it: a window padded by it equals the full render
+    /// within 4e-3 of an alpha, one 8-bit code, ruled 2026-09-26 on the
+    /// measured 3.98e-3 at Radius 0.03 (see [`Plan::margin`]).
     pub fn reach(&self) -> u32 {
         (self.margin() + 2) * self.step
     }
@@ -282,8 +283,9 @@ impl Plan {
 /// [`Plan::reach`] of a sanitised refine on a render whose whole picture is
 /// `full` pixels, or 0 while it is off: what a window is padded by. It holds
 /// the boxes' reach alone, about 2.13 Radius, and not the flood's cells of
-/// the reached field, ruled 2026-09-26: a window padded by it gives the full
-/// render within 1e-3 of an alpha.
+/// the reached field: a window padded by it equals the full render within
+/// 4e-3 of an alpha, one 8-bit code, ruled 2026-09-26 on the measured
+/// 3.98e-3 at Radius 0.03.
 pub fn reach(refine: &Refine, full: (u32, u32)) -> u32 {
     if refine.is_off() {
         0
@@ -1191,9 +1193,11 @@ mod tests {
         // The reach holds the boxes' cells and not the flood's, ruled
         // 2026-09-26: where the flood's steps reach past the pad, the flood
         // clamps at the window's edge and the window may differ from the
-        // full render by at most 1e-3 of an alpha on any pixel. Measured
-        // 2.5e-4 (2.49058e-4) on 1 pixel of 3000 of the block at Radius
-        // 0.012, 5.96e-8 on the stripes at 0.03, and 0 at 0.05.
+        // full render by at most 4e-3 of an alpha, one 8-bit code, on any
+        // pixel. Measured 2.5e-4 (2.49058e-4) on 1 pixel of 3000 of the
+        // block at Radius 0.012, 5.96e-8 on the stripes at 0.03, and 0 at
+        // 0.05.
+        const BOUND: f32 = 4e-3;
         for radius in [0.012, 0.03, 0.05] {
             let refine = on(100.0, radius, 60.0);
             let plan = Plan::new(&refine, (640, 480), (0, 0), (640, 480));
@@ -1203,15 +1207,30 @@ mod tests {
                 "the mask has an edge in what is wanted"
             );
             let most = most_apart(&whole, &window);
-            assert!(most <= 1e-3, "radius {radius}: {most}");
+            assert!(most <= BOUND, "radius {radius}: {most}");
             // The same on a picture whose reached field carries its whole
             // flood toward the window's edge.
             let (pixels, alpha) = block_at_the_end(full_size());
             let (whole, window) =
                 whole_and_window_of(&pixels, &alpha, full_size(), radius, plan.reach());
             let most = most_apart(&whole, &window);
-            assert!(most <= 1e-3, "the block at radius {radius}: {most}");
+            assert!(most <= BOUND, "the block at radius {radius}: {most}");
         }
+        // Where the bound binds: the worst picture of a sweep of the block's
+        // end from column 462 on, with 2, 8 and 20 flat columns. At Radius
+        // 0.03 (reach 50) the block ending before column 511 with 20 flat
+        // columns read 3.98e-3 (0.003976576) of an alpha on 3 pixels of
+        // 3000 over 1e-3, and 0 padded by the reach with the flood's cells
+        // (68 pixels).
+        let radius = 0.03;
+        let plan = Plan::new(&on(100.0, radius, 60.0), full_size(), (0, 0), full_size());
+        assert_eq!(plan.reach(), 50);
+        let (pixels, alpha) = block_ending_with(full_size(), 511, 20);
+        let (whole, window) =
+            whole_and_window_of(&pixels, &alpha, full_size(), radius, plan.reach());
+        let most = most_apart(&whole, &window);
+        assert!(most <= BOUND, "the block ending at 511: {most}");
+        assert!(most > 1e-3, "the block ending at 511 reads {most}");
     }
 
     fn full_size() -> (u32, u32) {
@@ -1230,13 +1249,19 @@ mod tests {
 
     /// [`block_at_the_end`] with the rectangle ending before column `end`.
     fn block_ending_at(full: (u32, u32), end: u32) -> (Vec<[f32; 3]>, Vec<f32>) {
+        block_ending_with(full, end, 8)
+    }
+
+    /// [`block_ending_at`] with the last `flat` columns of the rectangle and
+    /// the outside beside it one flat colour.
+    fn block_ending_with(full: (u32, u32), end: u32, flat: u32) -> (Vec<[f32; 3]>, Vec<f32>) {
         let wave = |d: f32, rate: f32, phase: f32| 0.5 + 0.5 * (d * rate + phase).sin();
         let mut pixels = Vec::new();
         let mut alpha = Vec::new();
         for y in 0..full.1 {
             for x in 0..full.0 {
                 let d = y as f32;
-                pixels.push(if x + 8 >= end && (210..330).contains(&y) {
+                pixels.push(if x + flat >= end && (210..330).contains(&y) {
                     [0.3, 0.35, 0.6]
                 } else {
                     [
