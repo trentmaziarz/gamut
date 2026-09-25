@@ -840,12 +840,17 @@ fn edge_slider_steps(
         };
         let drawn = Drawn::of(develop);
         let (p50, p95, max) = stepped_at(gpu, develop, base, view, step);
-        drawn.hold(develop, first, &format!("a {name} slider"));
+        let now = Drawn::of(develop);
         println!(
-            "{name} slider step {at}, the three at {}{note}, {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {}",
+            "{name} slider step {at}, the three at {}{note}, {RENDERS} renders: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {}; mask_alpha_builds {} then {}, refine_builds {:?} then {:?}",
             line.name,
-            drawn.passes_since(develop, RENDERS)
+            drawn.passes_since(develop, RENDERS),
+            drawn.alphas,
+            now.alphas,
+            drawn.refines,
+            now.refines
         );
+        drawn.hold(develop, first, &format!("a {name} slider"));
         p95
     })
 }
