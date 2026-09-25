@@ -15,7 +15,8 @@
 //! and not the whole photo; a pan of 32 source pixels a step inside the
 //! padded window, which develops what came into view and runs no head pass;
 //! the same slider step at 400 percent; and, for the record, what replacing
-//! the padded window costs and how often a steady pan pays it.
+//! the padded window costs and how often a steady pan pays it. The two
+//! slider steps print the T-12 figures beside them.
 //!
 //! The brush is measured last, over all of the above: a fifth mask that is a
 //! brush of 500 strokes of 50 points carrying exposure, clarity and a curve.
@@ -23,7 +24,12 @@
 //! and painting at 100 and at 400 percent, one appended point a frame for
 //! 100 frames, are held to the gate. What stamping the whole layer over the
 //! padded window costs, and what replacing the window costs with the brush
-//! in it, are printed for the record.
+//! in it, are printed for the record. Then a steady pan of 32 source pixels
+//! a frame at 100 percent with the five masks, right, down, left and up,
+//! crosses the edge of the window at least three times, with the window
+//! ahead of it built as the viewer builds it, one slice a frame. It holds
+//! that no crossing replaces the window in one submit, and its p95 and its
+//! maximum are held to the gate.
 //!
 //! The auto brush comes after it: a sixth mask that is a brush of 500 auto
 //! strokes of 50 points, a third of them painted with a pen whose pressure
@@ -57,7 +63,7 @@ use gamut_core::mask::{
     ColourRange, Edge, LinearGradient, LuminanceRange, MaskSource, RadialGradient, Refine,
 };
 use gamut_core::{Adjustments, CropRect, Mask, PhotoEdit};
-use gamut_gpu::develop::{PixelRect, holds, padded_window};
+use gamut_gpu::develop::{PixelRect, holds, padded_window, pan_exit, window_ahead};
 use gamut_gpu::{Develop, EdgePasses, Headless, ViewWindow};
 use gamut_media::{fixtures, open_photo};
 
@@ -119,14 +125,142 @@ fn timed_view(gpu: &Headless, develop: &mut Develop, edit: &PhotoEdit, view: &Vi
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-/// The median, the 95th percentile and the maximum of `RENDERS` timed runs.
+/// The median, the 95th percentile and the maximum of timed runs, `RENDERS`
+/// of them but for the pan across the window edge.
 fn percentiles(mut times: Vec<f64>) -> (f64, f64, f64) {
     times.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
-    (
-        times[RENDERS / 2],
-        times[(RENDERS * 95 / 100).min(RENDERS - 1)],
-        times[RENDERS - 1],
-    )
+    let n = times.len();
+    (times[n / 2], times[(n * 95 / 100).min(n - 1)], times[n - 1])
+}
+
+/// The legs of the steady pan across the window edge: a direction on each
+/// axis and a count of [`PAN_STEP`] steps. Right and left 64 steps, down and
+/// up 36, so the pan ends where it began after 200 frames, and every
+/// rectangle seen of timing_24mp.jpg at 100 percent stays inside the photo.
+const EDGE_PAN_LEGS: [((i64, i64), u32); 4] =
+    [((1, 0), 64), ((0, 1), 36), ((-1, 0), 64), ((0, -1), 36)];
+
+/// The rectangles seen on each frame of a steady pan from `start` through
+/// `legs`, one [`PAN_STEP`] a frame.
+fn pan_legs(start: PixelRect, legs: &[((i64, i64), u32)]) -> Vec<PixelRect> {
+    let step = i64::from(PAN_STEP);
+    let mut at = start;
+    let mut path = Vec::new();
+    for &((dx, dy), steps) in legs {
+        for _ in 0..steps {
+            at.0 = u32::try_from(i64::from(at.0) + dx * step).expect("the pan stays in the photo");
+            at.1 = u32::try_from(i64::from(at.1) + dy * step).expect("the pan stays in the photo");
+            path.push(at);
+        }
+    }
+    path
+}
+
+/// What a pan across the edge of the window drew, beside its frame times.
+struct EdgePan {
+    times: Vec<f64>,
+    /// Frames whose window was not the one of the frame before.
+    crossings: u64,
+    /// Renders that replaced the frame and ran the head passes in one submit.
+    replaces: u64,
+    /// Renders that took the frame built ahead.
+    swaps: u64,
+    /// Slices of frames built ahead submitted.
+    slices: u64,
+}
+
+/// A pan through `path` as the zoomed viewer draws it, one UI frame a
+/// rectangle seen, after an untimed render of `start`. Each frame asks for
+/// the window the viewer asks for: the one rendered while it holds what is
+/// seen, else the one built ahead when it holds it, else a new padded one.
+/// It renders that and then drives the build ahead as the viewer does, once
+/// a frame while the pan moves. Each frame is timed from the render to the
+/// device poll after both.
+fn pan_across_edge(
+    gpu: &Headless,
+    develop: &mut Develop,
+    edit: &PhotoEdit,
+    start: &ViewWindow,
+    pad: (u32, u32),
+    path: &[PixelRect],
+) -> EdgePan {
+    let full = start.full;
+    timed_view(gpu, develop, edit, start);
+    let (replaces, swaps, slices) = (
+        develop.window_replaces(),
+        develop.window_swaps(),
+        develop.ahead_slices(),
+    );
+    let (mut window, mut previous) = (start.window, start.visible);
+    let mut crossings = 0;
+    let mut times = Vec::with_capacity(path.len());
+    for &visible in path {
+        let asked = if holds(window, visible) {
+            window
+        } else {
+            crossings += 1;
+            develop
+                .window_ahead()
+                .filter(|&(held, ahead)| held == full && holds(ahead, visible))
+                .map_or_else(
+                    || padded_window(full, visible, pad, WINDOW_GRID),
+                    |(_, ahead)| ahead,
+                )
+        };
+        let started = Instant::now();
+        let view = ViewWindow {
+            full,
+            window: asked,
+            visible,
+        };
+        develop.render_view(edit, &view).expect("the source is set");
+        drive_ahead(develop, edit, &view, previous, pad);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        times.push(started.elapsed().as_secs_f64() * 1000.0);
+        (window, previous) = (asked, visible);
+    }
+    EdgePan {
+        times,
+        crossings,
+        replaces: develop.window_replaces() - replaces,
+        swaps: develop.window_swaps() - swaps,
+        slices: develop.ahead_slices() - slices,
+    }
+}
+
+/// The build ahead as the viewer drives it once a UI frame, after a render
+/// of `view` where the frame before showed `previous`: nothing on a jump;
+/// the frame still building on a pause; else the window held ahead while it
+/// holds where the pan leaves the window rendered, a new one otherwise.
+fn drive_ahead(
+    develop: &mut Develop,
+    edit: &PhotoEdit,
+    view: &ViewWindow,
+    previous: PixelRect,
+    pad: (u32, u32),
+) {
+    let (full, window, visible) = (view.full, view.window, view.visible);
+    // A step of more than the pad is a jump, not a pan.
+    if previous.0.abs_diff(visible.0) > pad.0 || previous.1.abs_diff(visible.1) > pad.1 {
+        return;
+    }
+    let built = develop
+        .window_ahead()
+        .filter(|&(held, _)| held == full)
+        .map(|(_, ahead)| ahead);
+    let wanted = if previous == visible {
+        built.filter(|_| develop.ahead_building())
+    } else {
+        pan_exit(full, window, previous, visible).and_then(|exit| match built {
+            Some(built) if holds(built, exit) => Some(built),
+            _ => window_ahead(full, window, previous, visible, pad, WINDOW_GRID),
+        })
+    };
+    if let Some(ahead) = wanted {
+        develop.build_ahead(edit, full, ahead);
+    }
 }
 
 /// `RENDERS` renders of a zoomed view with the exposure slider stepping.
@@ -844,7 +978,7 @@ fn develop_at_viewer_size_is_fast_enough() {
         assert_eq!(develop.mask_alpha_builds() - builds, 4);
         let (step_p50, step_p95, step_max) = stepped_view(&gpu, &mut develop, &masked, &actual);
         println!(
-            "slider step at 100 percent, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms"
+            "slider step at 100 percent, {RENDERS} renders: p50 {step_p50:.2} ms, p95 {step_p95:.2} ms, max {step_max:.2} ms; T-12 read p95 1.44 to 1.63 ms (not asserted against it)"
         );
 
         // A pan of 32 source pixels a step, there and back inside the pad:
@@ -914,7 +1048,7 @@ fn develop_at_viewer_size_is_fast_enough() {
         );
         let (deep_p50, deep_p95, deep_max) = stepped_view(&gpu, &mut develop, &masked, &deep);
         println!(
-            "slider step at 400 percent, {RENDERS} renders: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
+            "slider step at 400 percent, {RENDERS} renders: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms; T-12 read p95 0.29 to 0.38 ms (not asserted against it)"
         );
         zoomed_p95 = Some((step_p95, pan_p95, deep_p95));
     }
@@ -945,6 +1079,7 @@ fn develop_at_viewer_size_is_fast_enough() {
         "a slider stamped the brush layer again"
     );
     let mut brush_p95 = None;
+    let mut edge_pan = None;
     if info.device_type == wgpu::DeviceType::Cpu {
         println!("zoomed brush lines skipped on a CPU adapter");
     } else {
@@ -1012,6 +1147,41 @@ fn develop_at_viewer_size_is_fast_enough() {
             "painting at 400 percent, one appended point a frame, {RENDERS} frames: p50 {deep_p50:.2} ms, p95 {deep_p95:.2} ms, max {deep_max:.2} ms"
         );
         brush_p95 = Some((step_p95, paint_p95, deep_p95));
+
+        // A steady pan at 100 percent with the five masks, right, down, left
+        // and up, across the edge of the window, with the window ahead of it
+        // built one slice a frame as the viewer builds it. No crossing
+        // replaces the window in one submit: each takes the frame built
+        // ahead.
+        let path = pan_legs(actual.visible, &EDGE_PAN_LEGS);
+        assert!(
+            path.iter()
+                .all(|&(x, y, w, h)| x + w <= full.0 && y + h <= full.1),
+            "the pan stays inside the photo"
+        );
+        let pan = pan_across_edge(&gpu, &mut develop, &painted, &actual, pad, &path);
+        let frames = pan.times.len();
+        let (p50, p95, max) = percentiles(pan.times);
+        println!(
+            "steady pan of {PAN_STEP} source pixels a frame across the window edge at 100 percent with the five masks, right, down, left and up, {frames} frames: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {} crossings, {} swaps, {} replaces, {} slices run",
+            pan.crossings, pan.swaps, pan.replaces, pan.slices
+        );
+        assert!(
+            pan.crossings >= 3,
+            "the pan crossed the window edge {} times, not 3 or more",
+            pan.crossings
+        );
+        assert_eq!(
+            pan.replaces, 0,
+            "a pan across the window edge replaced the window in one submit"
+        );
+        assert!(
+            pan.swaps >= pan.crossings,
+            "{} swaps for {} crossings: a crossing did not take the frame built ahead",
+            pan.swaps,
+            pan.crossings
+        );
+        edge_pan = Some((p95, max));
     }
 
     // The auto brush, over all of that: a sixth mask of 500 auto strokes, a
@@ -1429,6 +1599,16 @@ fn develop_at_viewer_size_is_fast_enough() {
     }
 
     if std::env::var(GATE).as_deref() == Ok("1") {
+        if let Some((p95, max)) = edge_pan {
+            assert!(
+                p95 < GATE_MS,
+                "p95 of a steady pan across the window edge, {p95:.2} ms, is not under {GATE_MS} ms"
+            );
+            assert!(
+                max < GATE_MS,
+                "max of a steady pan across the window edge, {max:.2} ms, is not under {GATE_MS} ms"
+            );
+        }
         if let Some([develop_p95, shift_p95, feather_p95, contrast_p95]) = edged_p95 {
             for (p95, what) in [
                 (develop_p95, "a slider step with two edged masks"),

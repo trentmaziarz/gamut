@@ -13,14 +13,20 @@
 //! source and stamps the layer again, and its p95 must stay inside a frame
 //! at 30 fps as well. So must two more runs of 100 frames: the same mask
 //! with Refine edges at 100, and with Shift edge, Feather and Contrast on
-//! over that.
+//! over that. The last run pans the view at 100 percent across the frame
+//! while the clip plays, 32 source pixels a frame, back and forth for 200
+//! frames, across the edge of the window at least three times, with the
+//! window ahead of the pan built as the viewer builds it; its p95 must stay
+//! inside a frame at 30 fps, and its maximum is printed beside it.
 
 use std::time::Instant;
 
 use gamut_core::brush::{Brush, SharedStroke, Stroke};
 use gamut_core::mask::MaskSource;
 use gamut_core::{CropAspect, CropRect, Mask, PhotoEdit};
-use gamut_gpu::develop::{padded_window, render_size_for_crop};
+use gamut_gpu::develop::{
+    PixelRect, holds, padded_window, pan_exit, render_size_for_crop, window_ahead,
+};
 use gamut_gpu::{Develop, Headless, ViewWindow};
 use gamut_media::hwaccel::nvdec_available;
 use gamut_media::{Decoder, VideoSource, fixtures};
@@ -43,6 +49,64 @@ const GATE: &str = "GAMUT_TIMING_GATE";
 /// points each.
 const AUTO_STROKES: usize = 200;
 const STROKE_POINTS: usize = 50;
+
+/// The pan of one frame while the clip plays, in source pixels, how many
+/// frames the pan runs, and the grid the viewer snaps its padded window to.
+const PAN_STEP: u32 = 32;
+const PAN_FRAMES: usize = 200;
+const WINDOW_GRID: u32 = 64;
+
+/// The rectangles seen on each frame of a pan from `start` of [`PAN_STEP`]
+/// a frame across the frame of `full` pixels and back, turning where the
+/// next step would leave it.
+fn pan_back_and_forth(full: (u32, u32), start: PixelRect, frames: usize) -> Vec<PixelRect> {
+    let room = full.0 - start.2;
+    let (mut x, mut right) = (start.0, true);
+    (0..frames)
+        .map(|_| {
+            if right && x + PAN_STEP > room {
+                right = false;
+            } else if !right && x < PAN_STEP {
+                right = true;
+            }
+            x = if right { x + PAN_STEP } else { x - PAN_STEP };
+            (x, start.1, start.2, start.3)
+        })
+        .collect()
+}
+
+/// The build ahead as the viewer drives it once a UI frame, after a render
+/// of `view` where the frame before showed `previous`: nothing on a jump;
+/// the frame still building on a pause; else the window held ahead while it
+/// holds where the pan leaves the window rendered, a new one otherwise.
+fn drive_ahead(
+    develop: &mut Develop,
+    edit: &PhotoEdit,
+    view: &ViewWindow,
+    previous: PixelRect,
+    pad: (u32, u32),
+) {
+    let (full, window, visible) = (view.full, view.window, view.visible);
+    // A step of more than the pad is a jump, not a pan.
+    if previous.0.abs_diff(visible.0) > pad.0 || previous.1.abs_diff(visible.1) > pad.1 {
+        return;
+    }
+    let built = develop
+        .window_ahead()
+        .filter(|&(held, _)| held == full)
+        .map(|(_, ahead)| ahead);
+    let wanted = if previous == visible {
+        built.filter(|_| develop.ahead_building())
+    } else {
+        pan_exit(full, window, previous, visible).and_then(|exit| match built {
+            Some(built) if holds(built, exit) => Some(built),
+            _ => window_ahead(full, window, previous, visible, pad, WINDOW_GRID),
+        })
+    };
+    if let Some(ahead) = wanted {
+        develop.build_ahead(edit, full, ahead);
+    }
+}
 
 /// A number from 0 to 1 that is the same on every run.
 fn next(seed: &mut u32) -> f32 {
@@ -359,7 +423,93 @@ fn playback_at_4k30_is_fast_enough() {
         edged_p95 = Some(p95);
     }
 
+    // The view at 100 percent panned across the frame while the clip plays,
+    // 32 source pixels a frame, back and forth. Each frame asks for the
+    // window the viewer asks for: the one rendered while it holds what is
+    // seen, else the one built ahead when it holds it, else a new padded
+    // one; it renders that and then drives the build ahead as the viewer
+    // does. Every frame is new content, so the head passes run over the
+    // window on each one, and a swap draws the new frame into the one built
+    // ahead.
+    let pad = (OUTPUT.0 / 2, OUTPUT.1 / 2);
+    let pan_edit = PhotoEdit::default();
+    let frame = source
+        .next_frame()
+        .expect("decode")
+        .expect("the clip is long enough for the pan");
+    develop.set_video_frame(&frame, colour, rotation);
+    develop
+        .render_view(&pan_edit, &view)
+        .expect("the source is set");
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("wait for the render");
+    let (replaces, swaps, slices) = (
+        develop.window_replaces(),
+        develop.window_swaps(),
+        develop.ahead_slices(),
+    );
+    let (mut window, mut previous) = (view.window, view.visible);
+    let mut crossings = 0u64;
+    let mut panned = Vec::with_capacity(PAN_FRAMES);
+    for (i, visible) in pan_back_and_forth(full, view.visible, PAN_FRAMES)
+        .into_iter()
+        .enumerate()
+    {
+        let asked = if holds(window, visible) {
+            window
+        } else {
+            crossings += 1;
+            develop
+                .window_ahead()
+                .filter(|&(held, ahead)| held == full && holds(ahead, visible))
+                .map_or_else(
+                    || padded_window(full, visible, pad, WINDOW_GRID),
+                    |(_, ahead)| ahead,
+                )
+        };
+        let started = Instant::now();
+        let frame = source
+            .next_frame()
+            .expect("decode")
+            .unwrap_or_else(|| panic!("the clip ended at frame {i} of the pan"));
+        develop.set_video_frame(&frame, colour, rotation);
+        let at = ViewWindow {
+            full,
+            window: asked,
+            visible,
+        };
+        develop
+            .render_view(&pan_edit, &at)
+            .expect("the source is set");
+        drive_ahead(&mut develop, &pan_edit, &at, previous, pad);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the render");
+        panned.push(started.elapsed().as_secs_f64() * 1000.0);
+        (window, previous) = (asked, visible);
+    }
+    panned.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let n = panned.len();
+    let pan_p95 = panned[(n * 95 / 100).min(n - 1)];
+    println!(
+        "playback with the view at 100 percent panned {PAN_STEP} source pixels a frame across the window edge, back and forth, {n} frames: p50 {:.2} ms, p95 {pan_p95:.2} ms, max {:.2} ms; {crossings} crossings, {} swaps, {} replaces, {} slices run",
+        panned[n / 2],
+        panned[n - 1],
+        develop.window_swaps() - swaps,
+        develop.window_replaces() - replaces,
+        develop.ahead_slices() - slices
+    );
+    assert!(
+        crossings >= 3,
+        "the pan crossed the window edge {crossings} times, not 3 or more"
+    );
+
     if std::env::var(GATE).as_deref() == Ok("1") {
+        assert!(
+            pan_p95 < GATE_P95_MS,
+            "p95 of playback panned across the window edge at 100 percent, {pan_p95:.2} ms, is not under {GATE_P95_MS:.1} ms"
+        );
         if let Some(edged_p95) = edged_p95 {
             assert!(
                 edged_p95 < GATE_P95_MS,
