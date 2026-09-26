@@ -1903,6 +1903,12 @@ mod tests {
         assert_eq!(wgsl_constant("UNREACHED_HIGH"), twin::UNREACHED_HIGH);
         assert_eq!(wgsl_constant("LEAVE_LOW"), twin::LEAVE_LOW);
         assert_eq!(wgsl_constant("LEAVE_HIGH"), twin::LEAVE_HIGH);
+        assert_eq!(wgsl_constant("KAPPA"), twin::KAPPA);
+        assert_eq!(wgsl_constant("BETA_LOW"), twin::BETA_LOW);
+        assert_eq!(wgsl_constant("BETA_HIGH"), twin::BETA_HIGH);
+        assert_eq!(wgsl_constant("GAIN_LOW"), twin::GAIN_LOW);
+        assert_eq!(wgsl_constant("GAIN_HIGH"), twin::GAIN_HIGH);
+        assert_eq!(wgsl_constant("GAIN_ROOT"), twin::GAIN_ROOT);
         assert_eq!(wgsl_u32_constant("BLOCK"), BLOCK);
         assert_eq!(wgsl_u32_constant("BLOCK_TAPS"), BLOCK_TAPS);
         // The shader writes the three gathers out as the loop of `run`, the

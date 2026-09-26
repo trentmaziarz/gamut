@@ -43,6 +43,20 @@
 //! back as drawn. Where the guide is flat the classes do not separate and
 //! the mask comes back bit for bit.
 //!
+//! A soft rim over a weak edge holds still, [`hold`]: where the box is no
+//! wider than the mask's own ramp, the move comes in only across an edge
+//! whose classes lie about two [`GAIN_ROOT`] apart or more,
+//!
+//! ```text
+//! spp  = max(E[p] - E[p p], 0),  W = spp (2 b + 1) step / KAPPA
+//! beta = b step / max(W, 1e-6)
+//! gain = GAIN_ROOT / max(|mu1 - mu0|, 1e-9)
+//! c    = smoothstep(0.15, 0.8, d2) gate
+//!        (1 - (1 - smoothstep(0.95, 1.1, beta)) smoothstep(0.45, 0.6, gain))
+//! ```
+//!
+//! with `beta` taken once a mask and `gain` in each gather.
+//!
 //! A reached field `rf` says how far each place is joined to the outside of
 //! the mask through like colour: seeded on the cell grid by the outside as
 //! drawn and spread in a bounded number of passes, [`reached`]. A pixel
@@ -160,6 +174,32 @@ pub const UNREACHED_HIGH: f32 = 0.02;
 /// The reached field over which a pixel may leave the mask.
 pub const LEAVE_LOW: f32 = 0.2;
 pub const LEAVE_HIGH: f32 = 0.5;
+
+/// The mean of `s (1 - s)` over a smoothstep ramp `s`, 9/70: a ramp of
+/// width `W` wholly inside a box of side `L` gives `E[p (1 - p)]` of
+/// `KAPPA W / L`, so the mask's own ramp is `W = E[p (1 - p)] L / KAPPA`.
+/// Ruled 2026-09-26 (D-4, lead c's hold), kept by D-11.
+pub const KAPPA: f32 = 9.0 / 70.0;
+
+/// The box's half width against the mask's ramp, `beta`, over which a soft
+/// rim may move whatever the edge under it: under [`BETA_LOW`] the box is no
+/// wider than the ramp and the rim moves only across a strong edge. Ruled
+/// 2026-09-26 (D-4), kept by D-9 and D-11.
+pub const BETA_LOW: f32 = 0.95;
+pub const BETA_HIGH: f32 = 1.1;
+
+/// The gain of the classes, [`GAIN_ROOT`] over the length of `mu1 - mu0`,
+/// over which a rim the box is no wider than holds still: a gain of 0.6 is a
+/// class step of about 1.7 eps roots at Sensitivity 50, and 0.45 about 2.2.
+/// Ruled 2026-09-26 (D-4), kept by D-9 and D-11.
+pub const GAIN_LOW: f32 = 0.45;
+pub const GAIN_HIGH: f32 = 0.6;
+
+/// The colour step the gain is read against: the eps root at Sensitivity 50,
+/// `0.1 (0.005 / 0.1)^0.5`, a constant, so the hold reads one class step the
+/// same at every Sensitivity. Ruled 2026-09-26 (D-11, candidate e of the
+/// D-9 design round).
+pub const GAIN_ROOT: f32 = 0.022_360_7;
 
 /// The eps of the filter at a sensitivity of 0 to 100: a log scale from
 /// [`EPS_LOOSE`] squared to [`EPS_STRICT`] squared.
@@ -509,12 +549,43 @@ pub fn gate(mask: &[f32; MASK_MOMENTS], unreached: f32) -> f32 {
     both(mask) * smooth(unreached, UNREACHED_LOW, UNREACHED_HIGH)
 }
 
+/// The box's half width against the mask's own ramp, from the means of the
+/// mask's moments: `spp = max(E[p] - E[p p], 0)` is the box mean of
+/// `p (1 - p)`, the ramp is `W = spp (2 b + 1) step / KAPPA` pixels wide, and
+/// `beta = b step / max(W, 1e-6)`, with `b` the box's radius in cells. Taken
+/// once a mask, beside the [`gate`].
+pub fn beta_of(mask: &[f32; MASK_MOMENTS], plan: &Plan) -> f32 {
+    let spp = (mask[0] - mask[1]).max(0.0);
+    let width = spp * (2 * plan.cells + 1) as f32 * plan.step as f32 / KAPPA;
+    plan.cells as f32 * plan.step as f32 / width.max(SHARE_FLOOR)
+}
+
+/// The gain of the classes: [`GAIN_ROOT`] over the length of the class step
+/// `delta = mu1 - mu0`, how far `est` moves for a colour step of one
+/// [`GAIN_ROOT`] along the line between the classes.
+pub fn gain_of(delta: [f32; 3]) -> f32 {
+    let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    GAIN_ROOT / length.max(SEPARATION_FLOOR)
+}
+
+/// How far a gather's move comes in over a soft rim, 0 to 1: 0 where the box
+/// is no wider than the mask's ramp ([`beta_of`] under [`BETA_LOW`]) and the
+/// classes lie less than about 1.7 [`GAIN_ROOT`] apart ([`gain_of`] over
+/// [`GAIN_HIGH`]), and 1 where the box is wider or the edge strong. A soft
+/// rim over a weak edge holds still. Ruled 2026-09-26 (D-4, D-9 and D-11).
+pub fn hold(beta: f32, gain: f32) -> f32 {
+    1.0 - (1.0 - smooth(beta, BETA_LOW, BETA_HIGH)) * smooth(gain, GAIN_LOW, GAIN_HIGH)
+}
+
 /// What one gather solves in one cell from the means of the source's and its
-/// own moments and the [`gate`] of gather 1, in the order of [`SOLVED`].
+/// own moments, the [`gate`] of gather 1 and the mask's [`beta_of`], in the
+/// order of [`SOLVED`]. The move is scaled by [`hold`] of the beta and the
+/// gather's own [`gain_of`].
 pub fn solve(
     source: &[f32; SOURCE_MOMENTS],
     gather: &[f32; GATHER_MOMENTS],
     gate: f32,
+    beta: f32,
     eps: f32,
 ) -> [f32; SOLVED] {
     let n1 = gather[0];
@@ -560,7 +631,8 @@ pub fn solve(
         inv[2] * delta[0] + inv[4] * delta[1] + inv[5] * delta[2],
     ];
     let d2 = (delta[0] * a[0] + delta[1] * a[1] + delta[2] * a[2]).max(0.0);
-    let c = smooth(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate;
+    let gain = gain_of(delta);
+    let c = smooth(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate * hold(beta, gain);
     let over = d2.max(SEPARATION_FLOOR);
     let mid = [
         (mu1[0] + mu0[0]) / 2.0,
@@ -656,6 +728,7 @@ pub fn gathered(
         .collect();
     let mut q = alpha.to_vec();
     let mut gates = Vec::new();
+    let mut betas = Vec::new();
     for gather in 0..GATHERS {
         // The weight of the inside class: the mask so far where the outside
         // does not reach it, and alpha a move added above the mask as drawn
@@ -674,11 +747,15 @@ pub fn gathered(
                 .zip(&mask)
                 .map(|(own, mask)| store(gate(mask, own[0])))
                 .collect();
+            // The box against the mask's ramp, once a mask, beside the gate.
+            betas = mask.iter().map(|mask| beta_of(mask, plan)).collect();
         }
         let solved: Vec<[f32; SOLVED]> = means
             .iter()
             .enumerate()
-            .map(|(cell, gather)| solve(&source[cell], gather, gates[cell], plan.eps).map(store))
+            .map(|(cell, gather)| {
+                solve(&source[cell], gather, gates[cell], betas[cell], plan.eps).map(store)
+            })
             .collect();
         q = alpha
             .iter()
@@ -966,7 +1043,14 @@ mod tests {
         let mask = mask_means(&alpha, &plan, IDENTITY);
         let gather = gather_means(&alpha, &guides, &plan, IDENTITY);
         let cell = (8 * grid.0 + edge) as usize;
-        let solved = solve(&source[cell], &gather[cell], both(&mask[cell]), plan.eps);
+        let beta = beta_of(&mask[cell], &plan);
+        let solved = solve(
+            &source[cell],
+            &gather[cell],
+            both(&mask[cell]),
+            beta,
+            plan.eps,
+        );
         assert!(solved[5] > 0.99, "the move is allowed here: {}", solved[5]);
         let place = |g: [f32; 3]| {
             let along = (solved[0] * g[0] + solved[1] * g[1] + solved[2] * g[2]) - solved[3];
@@ -1016,6 +1100,100 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(most <= 0.02, "a ramp of {width} pixels moved by {most}");
         }
+    }
+
+    /// A soft rim over a weak edge: a grey step of the guide, in ACEScct, at
+    /// column 100 of 200 x 16, the right side `roots` eps roots of
+    /// Sensitivity 50 brighter along the grey axis, under a mask that ramps
+    /// from 1 to 0 about column 104 across 7 pixels, as wide as the box's
+    /// radius at Radius 10 px (cells of 1 pixel, a box of 7 cells). The
+    /// plan, the mask as drawn and the result of the last gather.
+    fn soft_rim_over(roots: f32) -> (Plan, Vec<f32>, Vec<f32>) {
+        let size = (200, 16);
+        let plan = Plan {
+            full: size,
+            origin: (0, 0),
+            size,
+            step: 1,
+            cells: 7,
+            flood: 10,
+            eps: eps(50.0),
+            amount: 1.0,
+        };
+        let rise = roots * eps(50.0).sqrt() / 3.0f32.sqrt();
+        let guides: Vec<[f32; 3]> = (0..size.0 * size.1)
+            .map(|i| {
+                if i % size.0 < size.0 / 2 {
+                    [0.3; 3]
+                } else {
+                    [0.3 + rise; 3]
+                }
+            })
+            .collect();
+        let alpha = ramp_alpha(size, 104.0, (plan.cells * plan.step) as f32);
+        let out = gathered(&alpha, &guides, &plan, IDENTITY);
+        (plan, alpha, out)
+    }
+
+    #[test]
+    fn a_soft_rim_over_a_weak_edge_holds_still() {
+        // A class step of one eps root. The ruled line of 2026-09-24 snaps
+        // the rim onto the step and moves it by a whole alpha; lead e
+        // (t24d_e_s50, numpy) moves it by 0.
+        let (_, alpha, out) = soft_rim_over(1.0);
+        let most = most_apart(&out, &alpha);
+        assert!(most <= 0.004, "the soft rim moved by {most}");
+    }
+
+    #[test]
+    fn a_hard_edge_still_moves() {
+        // The same ramp over a class step of four eps roots. At the scale of
+        // the box the ramp is as soft as the rim above, so only the gain
+        // lets the move through.
+        let (plan, alpha, out) = soft_rim_over(4.0);
+        let mask = mask_means(&alpha, &plan, IDENTITY);
+        let (_, grid) = plan.grid();
+        for x in 99..=108 {
+            let beta = beta_of(&mask[(8 * grid.0 + x) as usize], &plan);
+            assert!(beta < BETA_LOW, "the box at column {x} reads beta {beta}");
+        }
+        // It moves as the ruled line moves: row 8 snaps onto the step at
+        // column 100, read from column 94 to 112. The ruled line
+        // (a2_grow_rt7) and lead e (t24d_e_s50) in numpy read this row, 0
+        // apart.
+        let ruled = [
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0,
+        ];
+        for (x, want) in (94..113).zip(ruled) {
+            let got = out[8 * 200 + x];
+            assert!(
+                (got - want).abs() < 1e-3,
+                "the hard edge at {x}: {got}, not {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_reads_its_fixed_points() {
+        // The box no wider than the ramp and a weak edge hold the move; a box
+        // wider than the ramp, or a strong edge, lets it through.
+        assert_eq!(hold(0.9, 0.7), 0.0);
+        assert_eq!(hold(1.2, 0.7), 1.0);
+        assert_eq!(hold(0.9, 0.4), 1.0);
+        // The gain is GAIN_ROOT over the length of the class step: a step of
+        // GAIN_ROOT / 0.7 along the grey axis reads 0.7 and holds, one of
+        // GAIN_ROOT / 0.4 reads 0.4 and moves.
+        let along = |length: f32| [length / 3.0f32.sqrt(); 3];
+        let weak = gain_of(along(GAIN_ROOT / 0.7));
+        assert!((weak - 0.7).abs() < 1e-5, "{weak}");
+        assert_eq!(hold(0.9, weak), 0.0);
+        let strong = gain_of(along(GAIN_ROOT / 0.4));
+        assert!((strong - 0.4).abs() < 1e-5, "{strong}");
+        assert_eq!(hold(0.9, strong), 1.0);
+        // No class step: the floor keeps it finite, and it holds.
+        assert!(gain_of([0.0; 3]).is_finite());
+        assert_eq!(hold(0.9, gain_of([0.0; 3])), 0.0);
     }
 
     /// A dark disc with a grain on a bright field with the same, under a mask
@@ -1112,6 +1290,7 @@ mod tests {
             &[0.0; SOURCE_MOMENTS],
             &[0.0; 4],
             gate(&[0.0; 2], 0.0),
+            0.0,
             eps(100.0),
         );
         assert!(solved.iter().all(|v| v.is_finite()));
