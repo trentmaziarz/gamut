@@ -31,9 +31,11 @@
 //! leg of one crossing comes before it and is not timed, so the pan holds
 //! two frames when the measurement starts. It holds that no crossing
 //! replaces the window in one submit and that no frame of the measured pan
-//! makes textures of its own, and its p95 and its maximum are held to the
-//! gate. The frames it leaves are dropped after it, so the lines after it
-//! time renders that hold one frame.
+//! makes textures of its own, and its p95 is held to the gate. At most one
+//! of its frames may reach the gate, and its maximum is printed: the frames
+//! over it are device waits on random frames, attributed 2026-09-26 (T-26)
+//! and ruled by Trent (D-10). The frames it leaves are dropped after it, so
+//! the lines after it time renders that hold one frame.
 //!
 //! The auto brush comes after it: a sixth mask that is a brush of 500 auto
 //! strokes of 50 points, a third of them painted with a pen whose pressure
@@ -1255,9 +1257,10 @@ fn develop_at_viewer_size_is_fast_enough() {
             pan.warm_up_crossings
         );
         let frames = pan.times.len();
+        let over = pan.times.iter().filter(|t| **t >= GATE_MS).count();
         let (p50, p95, max) = percentiles(pan.times);
         println!(
-            "steady pan of {PAN_STEP} source pixels a frame across the window edge at 100 percent with the five masks, right, down, left and up, {frames} frames after the warm-up: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms; {} crossings, {} swaps, {} replaces, {} slices run, {} frame makes",
+            "steady pan of {PAN_STEP} source pixels a frame across the window edge at 100 percent with the five masks, right, down, left and up, {frames} frames after the warm-up: p50 {p50:.2} ms, p95 {p95:.2} ms, max {max:.2} ms, {over} of {frames} frames at or over {GATE_MS} ms; {} crossings, {} swaps, {} replaces, {} slices run, {} frame makes",
             pan.crossings, pan.swaps, pan.replaces, pan.slices, pan.frame_makes
         );
         assert!(
@@ -1280,7 +1283,7 @@ fn develop_at_viewer_size_is_fast_enough() {
             "the steady pan after the warm-up made {} frames with textures of their own",
             pan.frame_makes
         );
-        edge_pan = Some((p95, max));
+        edge_pan = Some((p95, max, over, frames));
 
         // The frame the pan left built ahead, and the one kept for its
         // textures, are dropped, as a render at another zoom drops them, so
@@ -1718,14 +1721,16 @@ fn develop_at_viewer_size_is_fast_enough() {
     }
 
     if std::env::var(GATE).as_deref() == Ok("1") {
-        if let Some((p95, max)) = edge_pan {
+        if let Some((p95, max, over, frames)) = edge_pan {
             assert!(
                 p95 < GATE_MS,
                 "p95 of a steady pan across the window edge, {p95:.2} ms, is not under {GATE_MS} ms"
             );
+            // At most one frame of the pan at or over the gate, not its max under it:
+            // the spikes are device waits on random frames (T-26, 2026-09-26; D-10, Trent).
             assert!(
-                max < GATE_MS,
-                "max of a steady pan across the window edge, {max:.2} ms, is not under {GATE_MS} ms"
+                over <= 1,
+                "frames over {GATE_MS} ms of a steady pan across the window edge: {over} of {frames}, not at most 1; max {max:.2} ms"
             );
         }
         if let Some([develop_p95, shift_p95, feather_p95, contrast_p95]) = edged_p95 {
