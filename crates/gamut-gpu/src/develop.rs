@@ -147,11 +147,12 @@ pub const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 ///   dab of a layer stamped whole (`dab_texels` in brush_layer.rs);
 /// - a strip of a pass of Refine edges, per texel of the pass (a cell or,
 ///   for the apply, a pixel) what it reads and writes: step squared pixels
-///   and 3 targets for the moments of the source, 18 step squared + 1 for a
-///   moved gather, the cells a box reads and writes, 19 for the apply
-///   (`texel_cost` in refine.rs; over one tile the family sums to 39 a pixel
-///   of its work, 19 a pixel it writes and 28 c + 62 a cell, c the radius of
-///   its box in cells, with every box in the direct loop);
+///   and 3 targets for the moments of the source, 19 for a pass of the
+///   flood, 18 step squared + 1 for a moved gather, the cells a box reads
+///   and writes, 19 for the apply (`texel_cost` in refine.rs; over one tile
+///   the family sums to 44 a pixel of its work, 19 a pixel it writes and
+///   28 c + 66 + 19 k a cell, c the radius of its box in cells and k the
+///   passes of the flood, with every box in the direct loop);
 /// - a strip of a pass of the edge products, 3 a pixel of each pass of Shift
 ///   edge, step squared + 1 a cell for Feather's cells and 2 r + 2 a cell for
 ///   each of its two blurs (r its radius in cells), 6 a pixel for the
@@ -1167,6 +1168,9 @@ pub struct Develop {
     mask_curves_uploaded: [Option<(ToneCurves, ToneCurves)>; MAX_MASKS],
     /// How many mask alphas have been drawn, for the cache test.
     alpha_builds: u64,
+    /// The reach the last window was padded by past the head passes', and
+    /// the size of the whole picture it was chosen at.
+    held_reach: Option<((u32, u32), u32)>,
     /// How many brush layers have been drawn whole, and how many times new
     /// dabs were stamped onto a layer, for the cache test.
     layer_builds: u64,
@@ -1380,6 +1384,7 @@ impl Develop {
             curves_uploaded: None,
             mask_curves_uploaded: Default::default(),
             alpha_builds: 0,
+            held_reach: None,
             layer_builds: 0,
             layer_appends: 0,
             alpha_patches: 0,
@@ -1820,6 +1825,17 @@ impl Develop {
         Some((view, (frame.width, frame.height)))
     }
 
+    /// The alpha mask `index` hands to the blend on the frame of the last
+    /// render, and the size of that frame: the refined alpha while Refine
+    /// edges alone is on. A test reads its bytes to hold the refined alpha to
+    /// the twin's.
+    #[doc(hidden)]
+    pub fn mask_product(&self, index: usize) -> Option<(&wgpu::TextureView, (u32, u32))> {
+        let frame = self.frame.as_ref()?;
+        let slot = frame.masks.get(index)?.as_ref()?;
+        Some((product_view(slot), (frame.width, frame.height)))
+    }
+
     /// How far Refine edges and the edge controls read around a pixel at a
     /// render of `full`: the widest reach among the masks this edit draws,
     /// each Refine edges' and its edge controls' together, and the margin of
@@ -1827,7 +1843,6 @@ impl Develop {
     /// steps, so a Radius or an edge slider replaces the window of a zoomed
     /// viewer a few times over its travel and not at every step.
     fn refine_reach(&self, edit: &PhotoEdit, full: (u32, u32)) -> u32 {
-        const STEP: u32 = 64;
         let shown = self.overlay.and_then(|index| edit.masks.get(index));
         let reach = mask_twin::active_masks(edit)
             .iter()
@@ -1841,8 +1856,30 @@ impl Develop {
         if reach == 0 {
             0
         } else {
-            (reach + PRODUCTS_MARGIN).div_ceil(STEP) * STEP
+            (reach + PRODUCTS_MARGIN).div_ceil(REACH_STEP) * REACH_STEP
         }
+    }
+
+    /// [`refine_reach`](Self::refine_reach), or the reach the last window of
+    /// the same whole picture was padded by while the new one lies at most
+    /// one step below it. A window padded past the reach gives what the full
+    /// render gives, so an edge slider whose reach moves back and forth
+    /// across a step replaces the window once and not at each crossing, and
+    /// the alphas held over the padded frame stay held.
+    fn window_reach(&mut self, edit: &PhotoEdit, full: (u32, u32)) -> u32 {
+        let reach = self.refine_reach(edit, full);
+        let reach = match self.held_reach {
+            Some((at, held)) if at == full && reach > 0 && reach <= held => {
+                if held - reach <= REACH_STEP {
+                    held
+                } else {
+                    reach
+                }
+            }
+            _ => reach,
+        };
+        self.held_reach = (reach > 0).then_some((full, reach));
+        reach
     }
 
     /// How many times the reference proxy of an auto brush was built. It is
@@ -1899,7 +1936,7 @@ impl Develop {
         let full = render_size_for_crop(crop, output_size);
         let (full_w, full_h) = (full.0 as f32, full.1 as f32);
         let reach = (basic::blur_radius(basic::base_sigma(full.0, full.1)).max(0) as u32)
-            .max(self.refine_reach(edit, full)) as f32;
+            .max(self.window_reach(edit, full)) as f32;
         let x0 = (crop.x * full_w - reach).floor().max(0.0);
         let y0 = (crop.y * full_h - reach).floor().max(0.0);
         let x1 = ((crop.x + crop.width) * full_w + reach).ceil().min(full_w);
@@ -2759,12 +2796,14 @@ impl Develop {
 
     /// What `render_window` renders for a zoomed view: the frame holds the
     /// window plus the reach of the widest head pass on every side, or of
-    /// Refine edges when a mask's reaches further.
-    fn view_geometry(&self, edit: &PhotoEdit, view: &ViewWindow) -> ViewGeometry {
+    /// Refine edges when a mask's reaches further, held as
+    /// [`window_reach`](Self::window_reach) holds it, so a frame built ahead
+    /// and the render that swaps it in pad the window alike.
+    fn view_geometry(&mut self, edit: &PhotoEdit, view: &ViewWindow) -> ViewGeometry {
         let full = (view.full.0.max(1), view.full.1.max(1));
         let (wx, wy, ww, wh) = clamp_rect(view.window, (0, 0, full.0, full.1));
         let (vx, vy, vw, vh) = clamp_rect(view.visible, (wx, wy, ww, wh));
-        let reach = head_pass_reach(full).max(self.refine_reach(edit, full));
+        let reach = head_pass_reach(full).max(self.window_reach(edit, full));
         // The frame is the window and the reach on every side, moved inside
         // the picture where it would pass an edge, and cut to the picture
         // only where the picture is shorter: so windows of one size have
@@ -4416,6 +4455,10 @@ fn clamp_rect(rect: (u32, u32, u32, u32), bounds: (u32, u32, u32, u32)) -> (u32,
 
 /// The margin of [`scissor_for`] in pixels.
 const PRODUCTS_MARGIN: u32 = 2;
+
+/// The step the reach of Refine edges and the edge controls goes up in
+/// above the reach of the head passes.
+const REACH_STEP: u32 = 64;
 
 /// The pixels the blur must reach: the crop with a margin of two pixels
 /// for the output pass's sampling, over the whole height when

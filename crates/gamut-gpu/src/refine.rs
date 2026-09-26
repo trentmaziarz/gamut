@@ -13,28 +13,38 @@
 //! a pass; Gamut asks the adapter for up to 64
 //! ([`crate::video::wanted_limits`]), which is four.
 //!
-//! A tile is drawn in 18 passes. Five take the moments of the source, in one
-//! pass of three targets, and their box means; they depend on no mask and no
-//! gather, so they are kept while the source, the radius and the tile stay
-//! the same, and a tile then costs 13. The moments themselves depend on the
-//! side of a cell and the grid alone, never on the radius of the box, and
-//! keep targets of their own: a Radius step that keeps the side of a cell
-//! draws the four box means of the source over them and not the moments, 17
-//! passes. The moments are taken over the cells the gathers work over,
-//! joined with the cells already held: a refine over cells they cover takes
-//! none, and a refine over cells they partly cover takes them over the strips
-//! it adds, at most four rectangles. Each of the three gathers takes four:
-//! the moments of `q` over the cells, their box means across and down, and
-//! the solve in one pass of four targets. The two later gathers take `q` at
-//! each pixel as they sum it, the mask moved by what the gather before
+//! A tile is drawn in 18 + 1 + k passes, k the flood's passes below. Five
+//! take the moments of the source, in one pass of three targets, and their
+//! box means; they depend on no mask and no gather, so they are kept while
+//! the source, the radius and the tile stay the same, and a tile then costs
+//! 13 + 1 + k. The moments themselves depend on the side of a cell and the
+//! grid alone, never on the radius of the box, and keep targets of their own:
+//! a Radius step that keeps the side of a cell draws the four box means of the
+//! source over them and not the moments, 17 + 1 + k passes. The moments are
+//! taken over the cells the gathers work over, joined with the cells already
+//! held: a refine over cells they cover takes none, and a refine over cells
+//! they partly cover takes them over the strips it adds, at most four
+//! rectangles. The reached field of the mask then takes 1 + k: a seed pass,
+//! `1 - Ec[p]` a cell, and one pass a doubling step of 1, 2, 4, ... cells
+//! while the steps sum to at most [`Plan::flood`], k = 6 at Radius 0.05, 5 at
+//! 0.03 and 4 at 0.01 on a longer side of 6000 pixels. The flood passes read
+//! `Ec[I]` from the source's moments `r[0]` and take turns between two
+//! R32Float targets, the last pass writing `flood[0]`, which the first
+//! gather reads bilinearly at each pixel; the solve carries each cell's in the
+//! spare fourth channel of `v[3]`, and the later gathers and the apply mix it
+//! from there with the rest of what was solved. Each of the three gathers takes
+//! four: the moments of `wq` over the cells, their box means across and down,
+//! and the solve in one pass of four targets. The two later gathers take `q`
+//! at each pixel as they sum it, the mask moved by what the gather before
 //! solved, so `q` is never stored between gathers. The apply after the last
 //! gather moves the mask at full resolution into the r8unorm refined alpha.
 //!
 //! A device that draws into no more than 32 bytes a sample, such as one made
 //! with wgpu's default limits, draws the moments of the source in a pass of
 //! two targets and a pass of one, and the solve in two passes of two: the
-//! source takes six, a gather five, and a tile 22, or 16 with the moments of
-//! the source held and 20 on a Radius step that keeps the side of a cell.
+//! source takes six, a gather five, and a tile 22 + 1 + k, or 16 + 1 + k with
+//! the moments of the source held and 20 + 1 + k on a Radius step that keeps
+//! the side of a cell.
 //! The RTX 4080 Laptop GPU on Vulkan and DX12 WARP both offer 128 bytes, so
 //! both draw the fused source and the fused solve.
 //!
@@ -42,10 +52,12 @@
 //! has a block pass before it, which sums [`BLOCK`] cells from every cell on
 //! along the axis; the box then adds those sums [`BLOCK`] cells apart and the
 //! cells left over, in place of every cell. The ten box passes of a tile gain
-//! ten block passes: 28 passes, 19 with the moments of the source held, and
-//! 27 on a Radius step that keeps the side of a cell, whose four box means of
-//! the source each draw their block pass (32, 22 and 30 with the source and
-//! the solve drawn in two passes each). A box keeps its cells, each held at
+//! ten block passes: 28 + 1 + k passes, 19 + 1 + k with the moments of the
+//! source held, and 27 + 1 + k on a Radius step that keeps the side of a
+//! cell, whose four box means of the source each draw their block pass (32,
+//! 22 and 30, each + 1 + k, with the source and the solve drawn in two passes
+//! each). At Radius 0.05 on a longer side of 6000 pixels, k = 6: 35, 26 and
+//! 34. A box keeps its cells, each held at
 //! the edges as before; only the order of the sum changes. A smaller box
 //! sums every cell in the direct loop, which measured no slower (see
 //! [`BLOCK_TAPS`]): a block pass is a pass of its own, and a box of few cells
@@ -69,6 +81,17 @@ const MOMENT_BYTES: u64 = 16;
 const SOURCE_TARGETS: usize = 3;
 const FAR_TARGETS: usize = 3;
 const SOLVED_TARGETS: usize = 4;
+
+/// The format of the two targets the reached field takes turns between, one
+/// number a cell.
+pub(crate) const FLOOD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+/// The bytes a cell costs a flood target.
+const FLOOD_BYTES: u64 = 4;
+
+/// How many flood targets a scratch holds: a pass of the flood reads one and
+/// writes the other.
+const FLOOD_TARGETS: usize = 2;
 
 /// The most bytes the scratch of a frame takes, its targets of cells, unless
 /// one box needs more.
@@ -101,17 +124,31 @@ pub(crate) fn box_blocks(cells: u32) -> u32 {
 }
 
 /// The bytes one cell of a tile costs the scratch, at every step. Counted
-/// are the fourteen Rgba32Float targets of cells, 16 bytes a cell each: the
-/// three `r` (the source's moments), the three `s` (their box means), the
-/// three `f` (the far side of every box mean), `g` (the far side of the box
-/// mean of the mask's moments) and the four `v` (what a gather solved), 224
-/// bytes. `q` is never stored, and the refined alpha belongs to its mask and
-/// is not counted. The block passes before the boxes add no target: they
-/// write `v[0]` and `v[1]`, which no pass reads before the first gather or
-/// between the moments of a gather and its solve, and every box lies there
-/// (see [`RefinePass::run`]).
-pub(crate) const CELL_BYTES: u64 =
-    (2 * SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64 * MOMENT_BYTES;
+/// are the sixteen targets of cells: fourteen Rgba32Float, 16 bytes a cell
+/// each, the three `r` (the source's moments), the three `s` (their box
+/// means), the three `f` (the far side of every box mean), `g` (the far side
+/// of the box mean of the mask's moments) and the four `v` (what a gather
+/// solved), 224 bytes; and the two R32Float `flood` (the reached field), 4
+/// bytes a cell each, 8 bytes. 232 bytes. `q` is never stored, and the
+/// refined alpha belongs to its mask and is not counted. The block passes
+/// before the boxes add no target: they write `v[0]` and `v[1]`, which no
+/// pass reads before the first gather or between the moments of a gather and
+/// its solve, and every box lies there (see [`RefinePass::run`]).
+pub(crate) const CELL_BYTES: u64 = (2 * SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS) as u64
+    * MOMENT_BYTES
+    + FLOOD_TARGETS as u64 * FLOOD_BYTES;
+
+/// The steps of the passes of the flood, in cells: 1, 2, 4, ... while they
+/// sum to at most `flood` cells, as the twin's `reached` takes them.
+pub(crate) fn flood_steps(flood: u32) -> Vec<u32> {
+    let (mut total, mut step, mut steps) = (0, 1, Vec::new());
+    while total + step <= flood {
+        steps.push(step);
+        total += step;
+        step *= 2;
+    }
+    steps
+}
 
 /// The most cells a side a square tile holds within `budget` bytes.
 pub(crate) fn budget_side(budget: u64) -> u32 {
@@ -137,8 +174,9 @@ pub(crate) struct RefineUniform {
     pub(crate) amount: f32,
     /// How many blocks of [`BLOCK`] cells a box adds, 0 for the direct loop.
     pub(crate) blocks: u32,
-    /// The struct of the shader is 8 byte aligned.
-    pub(crate) pad: u32,
+    /// The step of a pass of the flood in cells, 0 in every other pass. It
+    /// fills the struct of the shader to its 8 byte alignment.
+    pub(crate) flood_step: u32,
 }
 
 /// One tile of a refine: the pixels of the render it writes and the cells
@@ -170,7 +208,7 @@ impl Tile {
             eps: plan.eps,
             amount: plan.amount,
             blocks: box_blocks(plan.cells),
-            pad: 0,
+            flood_step: 0,
         }
     }
 }
@@ -180,7 +218,10 @@ impl Tile {
 /// side is then the larger side of the grid. Otherwise as many as
 /// a square of `budget` bytes holds and no more than the larger side of the
 /// grid. Either way at least what the boxes of the gathers and a few pixels
-/// around them need.
+/// around them need: [`Plan::margin`] on either side and 64 cells. The
+/// flood's cells of the reached field are not in the margin (ruled
+/// 2026-09-26): a tile's flood clamps at the tile's edge as the twin's
+/// clamps at the render's, within 1e-3 of an alpha of one tile.
 pub(crate) fn tile_side(plan: &Plan, budget: u64) -> u32 {
     let (_, grid) = plan.grid();
     let bytes = u64::from(grid.0) * u64::from(grid.1) * CELL_BYTES;
@@ -493,19 +534,22 @@ fn strips(outer: Rect, inner: Rect) -> Vec<Rect> {
     .collect()
 }
 
-/// The float targets of a frame, fourteen of cells.
+/// The float targets of a frame, sixteen of cells.
 pub(crate) struct Scratch {
     /// The source's moments: (I, rr), (rg, rb, gg, gb), (bb).
     r: [FloatTarget; SOURCE_TARGETS],
     /// Their box means, in the same layout.
     s: [FloatTarget; SOURCE_TARGETS],
     /// The far side of every box mean. While a mask is gathered `f[0]` holds
-    /// the means of (q, q I) and `f[2]` those of (p, p p).
+    /// the means of (wq, wq I) and `f[2]` those of (p, p p, p keep).
     f: [FloatTarget; FAR_TARGETS],
-    /// The far side of the box mean of (p, p p).
+    /// The far side of the box mean of (p, p p, p keep).
     g: FloatTarget,
     /// What a gather solved: 15 numbers a cell.
     v: [FloatTarget; SOLVED_TARGETS],
+    /// The reached field of the mask, R32Float: the passes of the flood take
+    /// turns between the two and the last writes `flood[0]`.
+    flood: [FloatTarget; FLOOD_TARGETS],
     /// The cells a side the targets of cells hold.
     size: (u32, u32),
     held: Option<Held>,
@@ -552,11 +596,19 @@ pub(crate) struct Refined {
 /// One bind group for each set of textures a pass reads. A texture is never
 /// in the group of a pass that writes it; `v` fills the places a pass does
 /// not read. The groups a box reads hold v0 and v1 third and fourth, where a
-/// box of blocks reads the sums of its block pass.
+/// box of blocks reads the sums of its block pass. Binding 3 holds the
+/// reached field, `flood[0]`, in the groups of the passes that read it and
+/// the alpha in every other.
 struct Binds {
     /// f1, g: the passes over the pixels of a cell, which read no target of
-    /// cells, and the box down of a gather.
+    /// cells but the reached field, and the box down of a gather.
     cells: wgpu::BindGroup,
+    /// f1, g and no reached field: the seed of the flood, which writes
+    /// either flood target.
+    seed: wgpu::BindGroup,
+    /// flood0 or flood1, then r0: a pass of the flood that reads that flood
+    /// target and writes the other.
+    flood_from: [wgpu::BindGroup; FLOOD_TARGETS],
     /// r0, r1 and r2: the box across of the source's moments.
     source_pair: wgpu::BindGroup,
     source_one: wgpu::BindGroup,
@@ -565,10 +617,11 @@ struct Binds {
     far_one: wgpu::BindGroup,
     /// f0, f2: the box across of a gather.
     gather_across: wgpu::BindGroup,
-    /// s0, s1, s2, f0, f2: the solve.
+    /// s0, s1, s2, f0, f2 and the reached field: the solve, which carries
+    /// each cell's reached field in the fourth channel of v3.
     solve: wgpu::BindGroup,
     /// v0 to v3: a later gather, which moves the mask as it sums, and the
-    /// apply.
+    /// apply; they read the reached field from v3.
     moving: wgpu::BindGroup,
     /// What the block pass before each box reads, the same targets first
     /// and never v0 or v1, which it writes.
@@ -587,6 +640,8 @@ enum Pipe {
     Source,
     SourceA,
     SourceB,
+    FloodSeed,
+    Flood,
     GatherFirst,
     GatherMoved,
     BoxH2,
@@ -607,6 +662,9 @@ enum Pipe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Group {
     Cells,
+    Seed,
+    /// A pass of the flood that reads that flood target.
+    FloodFrom(usize),
     SourcePair,
     SourceOne,
     FarPair,
@@ -631,6 +689,7 @@ enum Place {
     F(usize),
     G,
     V(usize),
+    Flood(usize),
     Refined,
 }
 
@@ -709,34 +768,43 @@ pub(crate) struct RefineWork {
 ///
 /// - the moments of the source read the cell's pixels and write 3 targets,
 ///   cell + 3 (cell + 2 and cell + 1 in two passes);
-/// - the first gather reads the alpha and the working texture at each pixel
-///   and writes 2, 2 cell + 2;
+/// - the seed of the flood reads the alpha at each pixel and writes 1,
+///   cell + 1;
+/// - a pass of the flood reads 9 cells of the field and 9 of the source's
+///   moments and writes 1, 19;
+/// - the first gather reads the alpha, the working texture and 4 cells of
+///   the reached field at each pixel and writes 2, 6 cell + 2;
 /// - a moved gather reads 18 a pixel (the alpha, the working texture and 4
-///   bilinear reads of the 4 solved targets) and writes 1, 18 cell + 1;
+///   bilinear reads of the 4 solved targets, the reached field riding in the
+///   fourth) and writes 1, 18 cell + 1;
 /// - a box of t targets reads its cells of each and writes each, t
 ///   (box_reads + 1): 2 c + 1 cells in the direct loop, c its radius, and
 ///   the block sums and the cells left over from blocks;
 /// - a block pass of t targets reads 8 cells of each and writes each, 9 t;
-/// - the solve reads 5 targets and writes 4, 9 (5 + 2 in each of two);
+/// - the solve reads 5 targets and the reached field and writes 4, 10 (6 + 2
+///   in each of two);
 /// - the apply reads 18 and writes 1 at each pixel, 19.
 ///
-/// Over one tile of p pixels of work in n cells, o pixels of the apply, the
-/// fused family with every box in the direct loop sums to 39 p + 19 o +
-/// (28 c + 62) n: the ten boxes read 14 targets.
+/// Over one tile of p pixels of work in n cells, o pixels of the apply and k
+/// passes of the flood, the fused family with every box in the direct loop
+/// sums to 44 p + 19 o + (28 c + 66 + 19 k) n: the ten boxes read 14
+/// targets.
 fn texel_cost(pipe: Pipe, cell: u64, box_reads: u64) -> u64 {
     let block = u64::from(BLOCK);
     match pipe {
         Pipe::Source => cell + 3,
         Pipe::SourceA => cell + 2,
         Pipe::SourceB => cell + 1,
-        Pipe::GatherFirst => 2 * cell + 2,
+        Pipe::FloodSeed => cell + 1,
+        Pipe::Flood => 19,
+        Pipe::GatherFirst => 6 * cell + 2,
         Pipe::GatherMoved => 18 * cell + 1,
         Pipe::BoxH2 | Pipe::BoxV2 => 2 * (box_reads + 1),
         Pipe::BoxH1 | Pipe::BoxV1 => box_reads + 1,
         Pipe::BlockH2 | Pipe::BlockV2 => 2 * (block + 1),
         Pipe::BlockH1 | Pipe::BlockV1 => block + 1,
-        Pipe::Solve => 9,
-        Pipe::SolveA | Pipe::SolveB => 7,
+        Pipe::Solve => 10,
+        Pipe::SolveA | Pipe::SolveB => 8,
         Pipe::Apply => 19,
     }
 }
@@ -750,6 +818,9 @@ pub(crate) struct RefinePass {
     /// one, when there is no `source`.
     source_a: Option<wgpu::RenderPipeline>,
     source_b: Option<wgpu::RenderPipeline>,
+    flood_seed: wgpu::RenderPipeline,
+    /// Every pass of the flood, its step in the uniform.
+    flood: wgpu::RenderPipeline,
     gather_first: wgpu::RenderPipeline,
     gather_moved: wgpu::RenderPipeline,
     box_h2: wgpu::RenderPipeline,
@@ -885,6 +956,8 @@ impl RefinePass {
             source: fused.then(|| pipeline("fs_source", &[MOMENT_FORMAT; SOURCE_TARGETS])),
             source_a: split("fs_source_a", &pair),
             source_b: split("fs_source_b", &one),
+            flood_seed: pipeline("fs_flood_seed", &[FLOOD_FORMAT]),
+            flood: pipeline("fs_flood", &[FLOOD_FORMAT]),
             gather_first: pipeline("fs_gather_first", &pair),
             gather_moved: pipeline("fs_gather_moved", &one),
             box_h2: pipeline("fs_box_h2", &pair),
@@ -1032,12 +1105,16 @@ impl RefinePass {
             let float = |label: &str| FloatTarget {
                 view: target(device, label, MOMENT_FORMAT, size.0, size.1).view,
             };
+            let field = |label: &str| FloatTarget {
+                view: target(device, label, FLOOD_FORMAT, size.0, size.1).view,
+            };
             *scratch = Some(Scratch {
                 r: [0; SOURCE_TARGETS].map(|_| float("refine source moments")),
                 s: [0; SOURCE_TARGETS].map(|_| float("refine source means")),
                 f: [0; FAR_TARGETS].map(|_| float("refine means")),
                 g: float("refine mask means"),
                 v: [0; SOLVED_TARGETS].map(|_| float("refine solved")),
+                flood: [0; FLOOD_TARGETS].map(|_| field("refine flood")),
                 size,
                 held: None,
                 id: self.scratches,
@@ -1045,8 +1122,12 @@ impl RefinePass {
         }
         let scratch = scratch.as_mut().expect("made above");
         let tiles = tiles(plan, over, hold.side);
-        if refined.slots < tiles.len() as u32 {
-            refined.slots = (tiles.len() as u32).next_power_of_two();
+        // A tile takes one uniform for its passes and one for each pass of
+        // the flood, which carries its step.
+        let steps = flood_steps(plan.flood);
+        let per_tile = 1 + steps.len() as u32;
+        if refined.slots < tiles.len() as u32 * per_tile {
+            refined.slots = (tiles.len() as u32 * per_tile).next_power_of_two();
             refined.uniform = self.uniform_buffer(device, refined.slots);
             refined.binds = None;
         }
@@ -1055,44 +1136,61 @@ impl RefinePass {
             .as_ref()
             .is_none_or(|(id, _)| *id != scratch.id)
         {
-            // Binding 3 is read by no pass; every group binds the alpha there.
-            let group = |label: &str, textures: [&FloatTarget; 5]| {
-                fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-                    wgpu::BindGroupEntry {
-                        binding,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    }
-                }
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout: &self.layout,
-                    entries: &[
+            // Binding 3 holds the reached field for the passes that read it,
+            // and the alpha for every other.
+            let group_with =
+                |label: &str, reached: &wgpu::TextureView, textures: [&FloatTarget; 5]| {
+                    fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
                         wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &refined.uniform,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(
-                                    std::mem::size_of::<RefineUniform>() as u64
-                                ),
-                            }),
-                        },
-                        view(1, working),
-                        view(2, alpha),
-                        view(3, alpha),
-                        view(4, &textures[0].view),
-                        view(5, &textures[1].view),
-                        view(6, &textures[2].view),
-                        view(7, &textures[3].view),
-                        view(8, &textures[4].view),
-                    ],
-                })
-            };
+                            binding,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        }
+                    }
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &self.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &refined.uniform,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(
+                                        std::mem::size_of::<RefineUniform>() as u64,
+                                    ),
+                                }),
+                            },
+                            view(1, working),
+                            view(2, alpha),
+                            view(3, reached),
+                            view(4, &textures[0].view),
+                            view(5, &textures[1].view),
+                            view(6, &textures[2].view),
+                            view(7, &textures[3].view),
+                            view(8, &textures[4].view),
+                        ],
+                    })
+                };
+            let group =
+                |label: &str, textures: [&FloatTarget; 5]| group_with(label, alpha, textures);
             let (r, s, f, g, v) = (&scratch.r, &scratch.s, &scratch.f, &scratch.g, &scratch.v);
+            let flood = &scratch.flood;
+            let reached = &flood[0].view;
             refined.binds = Some((
                 scratch.id,
                 Binds {
-                    cells: group("refine cells", [&f[1], g, &v[0], &v[1], &v[2]]),
+                    cells: group_with("refine cells", reached, [&f[1], g, &v[0], &v[1], &v[2]]),
+                    seed: group("refine flood seed", [&f[1], g, &v[0], &v[1], &v[2]]),
+                    flood_from: [
+                        group(
+                            "refine flood from 0",
+                            [&flood[0], &r[0], &v[0], &v[1], &v[2]],
+                        ),
+                        group(
+                            "refine flood from 1",
+                            [&flood[1], &r[0], &v[0], &v[1], &v[2]],
+                        ),
+                    ],
                     source_pair: group("refine source pair", [&r[0], &r[1], &v[0], &v[1], &v[2]]),
                     source_one: group("refine source one", [&r[2], &v[2], &v[0], &v[1], &v[3]]),
                     far_pair: group("refine far pair", [&f[0], &f[1], &v[0], &v[1], &v[2]]),
@@ -1101,8 +1199,8 @@ impl RefinePass {
                         "refine gather across",
                         [&f[0], &f[2], &v[0], &v[1], &v[2]],
                     ),
-                    solve: group("refine solve", [&s[0], &s[1], &s[2], &f[0], &f[2]]),
-                    moving: group("refine move", [&v[0], &v[1], &v[2], &v[3], &f[1]]),
+                    solve: group_with("refine solve", reached, [&s[0], &s[1], &s[2], &f[0], &f[2]]),
+                    moving: group_with("refine move", reached, [&v[0], &v[1], &v[2], &v[3], &f[1]]),
                     block_cells: group("refine block cells", [&f[1], g, &v[2], &v[3], &s[2]]),
                     block_source_pair: group(
                         "refine block source pair",
@@ -1140,7 +1238,9 @@ impl RefinePass {
         };
         let mut draws: Vec<RefineDraw> = Vec::new();
         for (slot, tile) in tiles.iter().enumerate() {
-            let offset = slot as u32 * self.stride;
+            // The tile's uniform, then one for each pass of the flood.
+            let base = slot as u32 * per_tile;
+            let offset = base * self.stride;
             let uniform = RefineUniform {
                 blocks,
                 ..tile.uniform(plan)
@@ -1150,6 +1250,19 @@ impl RefinePass {
                 u64::from(offset),
                 bytemuck::bytes_of(&uniform),
             );
+            for (j, step) in steps.iter().enumerate() {
+                queue.write_buffer(
+                    &refined.uniform,
+                    u64::from((base + 1 + j as u32) * self.stride),
+                    bytemuck::bytes_of(&RefineUniform {
+                        flood_step: *step,
+                        ..uniform
+                    }),
+                );
+            }
+            // The uniform the next pass reads: the tile's, but in a pass of
+            // the flood.
+            let at = std::cell::Cell::new(offset);
             // A box pass of blocks has its block pass first, into v0 (and v1
             // for a pair). Both are free at every box: the solve writes them
             // after the last box of a gather, and the moments of the next
@@ -1168,7 +1281,7 @@ impl RefinePass {
                         pipe: block.pipe,
                         group: block.group,
                         targets: sums[..targets.len()].to_vec(),
-                        offset,
+                        offset: at.get(),
                         area: block_area(area, block.down, plan.cells, count),
                         unit: texel_cost(block.pipe, cell, box_reads),
                     });
@@ -1178,7 +1291,7 @@ impl RefinePass {
                     pipe,
                     group,
                     targets: targets.to_vec(),
-                    offset,
+                    offset: at.get(),
                     area,
                     unit: texel_cost(pipe, cell, box_reads),
                 });
@@ -1298,6 +1411,34 @@ impl RefinePass {
                     Block::down("refine source v b block", Pipe::BlockV1, Group::BlockFarOne),
                 );
             }
+            // The reached field of the mask, over the cells the gathers work
+            // over: the seed, then a pass a doubling step reading `Ec[I]` from
+            // r0, the two flood targets taking turns so that the last pass
+            // writes flood0, which the gathers and the apply read. The seed
+            // goes into flood0 when the passes are even in number and into
+            // flood1 when odd.
+            let first = steps.len() % FLOOD_TARGETS;
+            pass(
+                "refine flood seed",
+                Pipe::FloodSeed,
+                Group::Seed,
+                &[Place::Flood(first)],
+                work,
+                None,
+            );
+            for j in 0..steps.len() {
+                let from = (first + j) % FLOOD_TARGETS;
+                at.set((base + 1 + j as u32) * self.stride);
+                pass(
+                    "refine flood",
+                    Pipe::Flood,
+                    Group::FloodFrom(from),
+                    &[Place::Flood(1 - from)],
+                    work,
+                    None,
+                );
+            }
+            at.set(offset);
             for gather in 0..GATHERS {
                 if gather == 0 {
                     // With the moments of the mask itself, which the solve
@@ -1430,6 +1571,8 @@ impl RefinePass {
             Pipe::Source => self.source.as_ref().expect("made with a fused source"),
             Pipe::SourceA => self.source_a.as_ref().expect("made without a fused source"),
             Pipe::SourceB => self.source_b.as_ref().expect("made without a fused source"),
+            Pipe::FloodSeed => &self.flood_seed,
+            Pipe::Flood => &self.flood,
             Pipe::GatherFirst => &self.gather_first,
             Pipe::GatherMoved => &self.gather_moved,
             Pipe::BoxH2 => &self.box_h2,
@@ -1447,6 +1590,8 @@ impl RefinePass {
         };
         let bind = match pass.group {
             Group::Cells => &binds.cells,
+            Group::Seed => &binds.seed,
+            Group::FloodFrom(from) => &binds.flood_from[from],
             Group::SourcePair => &binds.source_pair,
             Group::SourceOne => &binds.source_one,
             Group::FarPair => &binds.far_pair,
@@ -1470,6 +1615,7 @@ impl RefinePass {
                 Place::F(i) => &scratch.f[i].view,
                 Place::G => &scratch.g.view,
                 Place::V(i) => &scratch.v[i].view,
+                Place::Flood(i) => &scratch.flood[i].view,
                 Place::Refined => &refined.alpha,
             })
             .collect();
@@ -1697,9 +1843,12 @@ mod tests {
         assert_eq!(offset("eps"), offset_of!(RefineUniform, eps));
         assert_eq!(offset("amount"), offset_of!(RefineUniform, amount));
         assert_eq!(offset("blocks"), offset_of!(RefineUniform, blocks));
-        // The pad fills the shader struct to its 8 byte alignment.
-        assert_eq!(offset_of!(RefineUniform, pad), 68);
-        assert_eq!(members.len(), 11);
+        assert_eq!(offset("flood_step"), offset_of!(RefineUniform, flood_step));
+        // The step of the flood fills the shader struct to its 8 byte
+        // alignment: 18 numbers of 4 bytes.
+        assert_eq!(offset_of!(RefineUniform, flood_step), 68);
+        assert_eq!(size_of::<RefineUniform>(), 72);
+        assert_eq!(members.len(), 12);
     }
 
     /// The value of `const NAME: f32 = value;` in the shader.
@@ -1747,6 +1896,13 @@ mod tests {
         assert_eq!(wgsl_constant("IN_HIGH"), twin::IN_HIGH);
         assert_eq!(wgsl_constant("SHARE_FLOOR"), twin::SHARE_FLOOR);
         assert_eq!(wgsl_constant("SEPARATION_FLOOR"), twin::SEPARATION_FLOOR);
+        assert_eq!(wgsl_constant("LIKENESS"), twin::LIKENESS);
+        assert_eq!(wgsl_constant("KEEP_LOW"), twin::KEEP_LOW);
+        assert_eq!(wgsl_constant("KEEP_HIGH"), twin::KEEP_HIGH);
+        assert_eq!(wgsl_constant("UNREACHED_LOW"), twin::UNREACHED_LOW);
+        assert_eq!(wgsl_constant("UNREACHED_HIGH"), twin::UNREACHED_HIGH);
+        assert_eq!(wgsl_constant("LEAVE_LOW"), twin::LEAVE_LOW);
+        assert_eq!(wgsl_constant("LEAVE_HIGH"), twin::LEAVE_HIGH);
         assert_eq!(wgsl_u32_constant("BLOCK"), BLOCK);
         assert_eq!(wgsl_u32_constant("BLOCK_TAPS"), BLOCK_TAPS);
         // The shader writes the three gathers out as the loop of `run`, the
@@ -1769,6 +1925,35 @@ mod tests {
         assert_eq!(SOURCE_TARGETS, twin::SOURCE_MOMENTS.div_ceil(4));
         assert_eq!(SOLVED_TARGETS, twin::SOLVED.div_ceil(4));
         assert_eq!(FAR_TARGETS, 3);
+        // The reached field is one number a cell, in two targets that take
+        // turns.
+        assert_eq!(FLOOD_FORMAT.target_pixel_byte_cost(), Some(4));
+        assert_eq!(FLOOD_BYTES, 4);
+        assert_eq!(FLOOD_TARGETS, 2);
+    }
+
+    /// The passes of the flood step 1, 2, 4, ... cells while the steps sum to
+    /// at most the flood of the plan, the radius in cells, as the twin's
+    /// `reached` steps.
+    #[test]
+    fn the_flood_steps_double_while_they_sum_to_the_radius_in_cells() {
+        assert_eq!(flood_steps(0), Vec::<u32>::new());
+        assert_eq!(flood_steps(1), vec![1]);
+        assert_eq!(flood_steps(2), vec![1]);
+        assert_eq!(flood_steps(3), vec![1, 2]);
+        assert_eq!(flood_steps(7), vec![1, 2, 4]);
+        // On a longer side of 6000 pixels, cells of 4: Radius 0.05 is 300
+        // pixels, 75 cells, 1 + 2 + 4 + 8 + 16 + 32 = 63 and 64 more is 127;
+        // 0.03 is 180 pixels, 45 cells, 31 and 32 more is 63; 0.01 is 60
+        // pixels, 15 cells, 15 and 16 more is 31.
+        for (radius, flood, passes) in [(0.05, 75, 6), (0.03, 45, 5), (0.01, 15, 4)] {
+            let plan = plan(radius, (6000, 4000), (0, 0), (6000, 4000));
+            assert_eq!((plan.step, plan.flood), (4, flood), "Radius {radius}");
+            let steps = flood_steps(plan.flood);
+            assert_eq!(steps.len(), passes, "Radius {radius}");
+            assert!(steps.iter().sum::<u32>() <= plan.flood);
+            assert!(steps.iter().sum::<u32>() + 2 * steps[passes - 1] > plan.flood);
+        }
     }
 
     #[test]
@@ -1810,7 +1995,12 @@ mod tests {
         assert_eq!((uniform.step, uniform.cells), (4, 14));
         // A patch of the same render keeps the tile and works on the cells
         // it needs alone: the cells its pixels lie among, 49 to 62 across and
-        // 74 to 85 down, and 44 cells of margin around them.
+        // 74 to 85 down, and 44 cells of margin around them, three boxes of
+        // 14 and the 2 cells beside of the gathers, 42 + 2 = 44. The flood of
+        // the reached field, 20 cells (80 pixels of radius in cells of 4), is
+        // not in the margin (ruled 2026-09-26). Across, 49 - 44 = 5 to
+        // 62 + 44 = 106, 102 cells; down, 74 - 44 = 30 to 85 + 44 = 129,
+        // 100 cells.
         let patch = self::tiles(
             &plan,
             (200, 300, 50, 40),
@@ -1818,6 +2008,8 @@ mod tests {
         );
         assert_eq!(patch.len(), 1);
         assert_eq!((patch[0].first, patch[0].count), ((0, 0), (320, 400)));
+        assert_eq!(plan.flood, 20);
+        assert_eq!(plan.margin(), 3 * 14 + 2);
         assert_eq!(plan.margin(), 44);
         assert_eq!(patch[0].work, (5, 30, 102, 100));
     }
@@ -1992,11 +2184,16 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_costs_the_scratch_its_fourteen_float_targets() {
-        // 14 targets of 16 bytes, at every step: `q` is never stored.
-        assert_eq!(CELL_BYTES, 224);
+    fn a_cell_costs_the_scratch_its_sixteen_float_targets() {
+        // 14 targets of 16 bytes and the 2 flood targets of 4, at every
+        // step: 224 + 8 = 232. `q` is never stored.
+        assert_eq!(2 * SOURCE_TARGETS + FAR_TARGETS + 1 + SOLVED_TARGETS, 14);
+        assert_eq!(FLOOD_TARGETS, 2);
+        assert_eq!(CELL_BYTES, 14 * 16 + 2 * 4);
+        assert_eq!(CELL_BYTES, 232);
         assert_eq!(SCRATCH_BUDGET_BYTES, 402_653_184);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1340);
+        // 402,653,184 / 232 = 1,735,574 cells, and 1317 squared is 1,734,489.
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1317);
     }
 
     /// The window of timing_24mp.jpg at 100 percent at Radius 0.05: 2624 by
@@ -2022,15 +2219,15 @@ mod tests {
     }
 
     /// An export of 6000 by 4000 pixels at Radius 0.05 is 1500 by 1000 cells
-    /// of 4 pixels, 336 MB of scratch under the budget of 384 MiB, and
+    /// of 4 pixels, 348 MB of scratch under the budget of 384 MiB, and
     /// targets of 1500 by 1000 cells under the texture limit: one tile.
     #[test]
     fn a_24_megapixel_export_at_step_4_is_one_tile() {
         let plan = plan(0.05, (6000, 4000), (0, 0), (6000, 4000));
         assert_eq!((plan.step, plan.cells), (4, 53));
         assert_eq!(plan.grid(), ((0, 0), (1500, 1000)));
-        assert_eq!(1500 * 1000 * CELL_BYTES, 336_000_000);
-        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1340);
+        assert_eq!(1500 * 1000 * CELL_BYTES, 348_000_000);
+        assert_eq!(budget_side(SCRATCH_BUDGET_BYTES), 1317);
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
         assert_eq!(side, 1500);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
@@ -2054,7 +2251,7 @@ mod tests {
         assert_eq!(TEXTURE_SIDE_LIMIT, 8192);
         // A grid of 2100 by 500 cells of 4 pixels, 8400 pixels wide, fits
         // the budget and the limit: one tile of the whole grid, though a
-        // square of the budget holds only 1340 cells a side.
+        // square of the budget holds only 1317 cells a side.
         let plan = plan(0.05, (8400, 2000), (0, 0), (8400, 2000));
         assert_eq!(plan.step, 4);
         let (_, grid) = plan.grid();
@@ -2068,7 +2265,7 @@ mod tests {
         let (_, grid) = plan.grid();
         assert_eq!(grid, (9000, 150));
         assert!(u64::from(grid.0 * grid.1) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
-        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1340);
+        assert_eq!(tile_side(&plan, SCRATCH_BUDGET_BYTES), 1317);
     }
 
     /// An export of 6000 by 4000 pixels in cells of one pixel is 24 million
@@ -2079,7 +2276,7 @@ mod tests {
         assert_eq!((plan.step, plan.cells), (1, 5));
         assert_eq!(plan.grid(), ((0, 0), (6000, 4000)));
         let side = tile_side(&plan, SCRATCH_BUDGET_BYTES);
-        assert_eq!(side, 1340);
+        assert_eq!(side, 1317);
         assert!(u64::from(side * side) * CELL_BYTES <= SCRATCH_BUDGET_BYTES);
         let tiles = tiles(&plan, (0, 0, 6000, 4000), side);
         assert!(tiles.len() > 1);
@@ -2233,87 +2430,128 @@ mod tests {
         }
         let budget = SCRATCH_BUDGET_BYTES;
         let small = 16 * 1024 * 1024;
+        // The sizes below are at CELL_BYTES 232 and the margin of 3 cells a
+        // box and 2 cells beside; the flood's cells left the margin, ruled
+        // 2026-09-26. The floor of a tile is the margin twice and 64. The budget holds 402,653,184 / 232 = 1,735,574
+        // cells, a square of 1317 (1317 squared is 1,734,489, 1317 by 1318
+        // is 1,735,806). At 224 bytes and the margin of 3 cells a box and 2
+        // it held 1,797,558 cells, a square of 1340 and one column more.
         let cases = [
             // The 24 megapixel photo: step 4 whole, then step 1 cut at the
-            // rows 1500 columns leave the budget.
+            // rows 1500 columns leave the budget. 0.05 is 300 pixels: step
+            // 4, 53 cells, margin 3 x 53 + 2 = 161, floor 386; its grid of
+            // 1500 by 1000 is 348,000,000 bytes, whole. 0.0012 is 7.2
+            // pixels: step 1, 5 cells, margin 3 x 5 + 2 = 17, floor 98, grid
+            // 6000 by 4000, side 1317. 1500 by 1317 is 458,316,000 bytes, so the
+            // rows are cut at 402,653,184 / (1500 * 232) = 1157.05: 1157,
+            // 402,636,000 bytes. At 224 the cut was 1198.
             Case {
                 name: "A 0.05 then 0.0012",
                 photo: (6000, 4000),
                 radii: vec![0.05, 0.0012],
                 budget,
-                held: vec![((1500, 1000), 1500), ((1500, 1198), 1198)],
+                held: vec![((1500, 1000), 1500), ((1500, 1157), 1157)],
                 made: 2,
             },
+            // Step 1 first holds 1317 by 1317 (402,401,448 bytes). Step 4
+            // wants 1500 by 1000; 1318 by 1317 is 402,706,992 bytes, over,
+            // so its tiles are cut at 1317 and the scratch is kept. At 224
+            // the held square was 1340 and the cut 1341 by 1340, made.
             Case {
                 name: "A 0.0012 then 0.05",
                 photo: (6000, 4000),
                 radii: vec![0.0012, 0.05],
                 budget,
-                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
-                made: 2,
+                held: vec![((1317, 1317), 1317), ((1317, 1317), 1317)],
+                made: 1,
             },
-            // The worst found: a step 3 grid of 2731 by 658 cells, whole.
+            // The worst found at 224: a step 3 grid of 2731 by 658 cells,
+            // whole at 402,527,552 bytes. At 232 it is 416,903,536 bytes and
+            // not whole: 0.0035 is 28.672 pixels, step 3, 7 cells, margin
+            // 3 x 7 + 2 = 23, floor 110, side 1317, 1317 by 658. 0.001 is
+            // 8.192 pixels, step 1, 6 cells, margin 3 x 6 + 2 = 20, floor
+            // 104, and wants 1317 by 1317, which fits: made again at 1317 by
+            // 1317.
+            // At 224 the second plan cut at 658 inside 2731 by 658, kept.
             Case {
                 name: "B 0.0035 then 0.001",
                 photo: (8192, 1974),
                 radii: vec![0.0035, 0.001],
                 budget,
-                held: vec![((2731, 658), 2731), ((2731, 658), 658)],
-                made: 1,
+                held: vec![((1317, 658), 1317), ((1317, 1317), 1317)],
+                made: 2,
             },
+            // 0.05 is 409.6 pixels: step 4, 73 cells, margin 3 x 73 + 2 =
+            // 221, floor 506; its grid of 2048 by 494 is whole, and 2048 by
+            // 1317 is over, so it is cut at 1317 and kept. 0.0025 is 20.48
+            // pixels: step 2, 7 cells, margin 3 x 7 + 2 = 23, floor 110, and
+            // wants 1317 by 987, inside what is held. At 224 every plan kept
+            // 2731 by 658 at sides 2731, 658, 2048 and 658.
             Case {
                 name: "B 0.0035, 0.001, 0.05, 0.0025",
                 photo: (8192, 1974),
                 radii: vec![0.0035, 0.001, 0.05, 0.0025],
                 budget,
                 held: vec![
-                    ((2731, 658), 2731),
-                    ((2731, 658), 658),
-                    ((2731, 658), 2048),
-                    ((2731, 658), 658),
+                    ((1317, 658), 1317),
+                    ((1317, 1317), 1317),
+                    ((1317, 1317), 1317),
+                    ((1317, 1317), 1317),
                 ],
-                made: 1,
+                made: 2,
             },
+            // Step 1 first holds 1317 by 1317; step 3 wants 1317 by 658
+            // inside it. At 224 the second plan cut at 1341, made.
             Case {
                 name: "B 0.001 then 0.0035",
                 photo: (8192, 1974),
                 radii: vec![0.001, 0.0035],
                 budget,
-                held: vec![((1340, 1340), 1340), ((1341, 1340), 1341)],
-                made: 2,
+                held: vec![((1317, 1317), 1317); 2],
+                made: 1,
             },
             // The control: no grid of the largest square photo is whole.
+            // 1317 by 1317 at every step; 1340 by 1340 at 224.
             Case {
                 name: "C 0.05, 0.001, 0.0025, 0.0035",
                 photo: (8192, 8192),
                 radii: vec![0.05, 0.001, 0.0025, 0.0035],
                 budget,
-                held: vec![((1340, 1340), 1340); 4],
+                held: vec![((1317, 1317), 1317); 4],
                 made: 1,
             },
             // Two masks on the 24 megapixel photo, rendered alternately ten
-            // times: made twice, then held.
+            // times: made twice, then held, at the sizes of case A's first
+            // order (1157 rows; 1198 at 224).
             Case {
                 name: "D 0.05 and 0.0012 ten times",
                 photo: (6000, 4000),
                 radii: [0.05, 0.0012].repeat(10),
                 budget,
-                held: [((1500, 1000), 1500), ((1500, 1198), 1198)]
+                held: [((1500, 1000), 1500), ((1500, 1157), 1157)]
                     .into_iter()
-                    .chain([((1500, 1198), 1500), ((1500, 1198), 1198)].repeat(9))
+                    .chain([((1500, 1157), 1500), ((1500, 1157), 1157)].repeat(9))
                     .collect(),
                 made: 2,
             },
-            // The floor branch: at 16 MiB the box of step 4 at 0.049 needs
-            // 278 cells a side, and 278 by 278 passes the budget alone. The
-            // same plan three more times keeps what the floor branch made.
+            // The floor branch: 16 MiB holds 16,777,216 / 232 = 72,315
+            // cells, a square of 268 (268 squared is 71,824, 269 squared is
+            // 72,361). 0.03 is 120 pixels: step 4, 21 cells, margin
+            // 3 x 21 + 2 = 65, floor 194, so 268 by 268. 0.049 is 196
+            // pixels: step 4, 35 cells, margin 3 x 35 + 2 = 107, and the box
+            // needs a floor of 107 * 2 + 64 = 278 cells a side; the grid is
+            // 320 cells wide, and 278 by 278 (17,929,888 bytes) passes the
+            // budget alone. The same plan three more times keeps what the
+            // floor branch made. With the flood's 49 cells in the margin it
+            // was 156, the floor 376 and 320 by 376 (27,914,240 bytes). At
+            // 224 the square was 273 and the floor 278 (margin 107).
             Case {
                 name: "E 0.03 then 0.049 at 16 MiB",
                 photo: (1280, 4000),
                 radii: vec![0.03, 0.049, 0.049, 0.049, 0.049],
                 budget: small,
                 held: vec![
-                    ((273, 273), 273),
+                    ((268, 268), 268),
                     ((278, 278), 278),
                     ((278, 278), 278),
                     ((278, 278), 278),

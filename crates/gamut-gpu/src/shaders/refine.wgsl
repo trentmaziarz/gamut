@@ -13,6 +13,13 @@
 // weighs the classes by p and each later one by q, the mask moved by what the
 // gather before solved, which is only ever a weight.
 //
+// A reached field rf on the cell grid says how far each cell is joined to the
+// outside of the mask through like colour: seeded by the outside as drawn,
+// 1 - Ec[p], and spread by passes of doubling steps. A pixel weighs the inside
+// class by wq = q keep + max(q - p, 0) (1 - keep), keep 1 less the smoothstep
+// of rf from 0.7 to 1.0, the move comes in only where some of the inside in
+// the box is unreached, and a pixel leaves the mask only where rf reaches it.
+//
 // The moments are taken on a grid of cells that lies on the pixel grid of the
 // whole picture at the scale of the render. They live in 32 bit float
 // targets: they are differences of near-equal numbers, and a half float would
@@ -29,10 +36,18 @@
 //                                 device that draws into 32 bytes a sample
 //     fs_box_h2, fs_box_h1        their means over the box, across
 //     fs_box_v2, fs_box_v1        and down
+//   once a mask
+//     fs_flood_seed               the seed of the reached field, 1 - Ec[p],
+//                                 into one of the two flood targets
+//     fs_flood                    one pass a doubling step s = 1, 2, 4, ...
+//                                 cells while the steps sum to at most the
+//                                 flood of the plan, from one flood target
+//                                 into the other, the last into flood 0
 //   each of the three gathers
-//     fs_gather_first             the means of q and q I over each cell, and
-//       / fs_gather_moved         of p and p p, with the first; a later
-//                                 gather moves each pixel into q as it sums
+//     fs_gather_first             the means of wq and wq I over each cell,
+//       / fs_gather_moved         and of p, p p and p keep with the first; a
+//                                 later gather moves each pixel into q as it
+//                                 sums
 //     fs_box_h2 / fs_box_h1       their means over the box, across
 //     fs_box_v2 / fs_box_v1       and down
 //     fs_solve                    the 15 numbers of each cell, in four
@@ -71,12 +86,18 @@ struct Uniform {
     // How many blocks of BLOCK cells a box adds, and 0 when it sums every
     // cell in the direct loop.
     blocks: u32,
+    // The step of a pass of fs_flood in cells, and 0 in every other pass.
+    flood_step: u32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniform;
 @group(0) @binding(1) var working: texture_2d<f32>;
 @group(0) @binding(2) var alpha: texture_2d<f32>;
-// Binding 3 is read by no pass; every group binds the alpha there.
+// The reached field on the cell grid, flood 0 after the last pass of
+// fs_flood: read by fs_gather_first, and by fs_solve, which carries each
+// cell's into the fourth channel of mid for fs_gather_moved and fs_apply. A
+// group whose pass reads no reached field binds the alpha here.
+@group(0) @binding(3) var reached_field: texture_2d<f32>;
 @group(0) @binding(4) var tex_a: texture_2d<f32>;
 @group(0) @binding(5) var tex_b: texture_2d<f32>;
 @group(0) @binding(6) var tex_c: texture_2d<f32>;
@@ -118,6 +139,13 @@ const IN_LOW: f32 = 0.6;
 const IN_HIGH: f32 = 0.85;
 const SHARE_FLOOR: f32 = 0.000001;
 const SEPARATION_FLOOR: f32 = 0.000000001;
+const LIKENESS: f32 = 2.0;
+const KEEP_LOW: f32 = 0.7;
+const KEEP_HIGH: f32 = 1.0;
+const UNREACHED_LOW: f32 = 0.0;
+const UNREACHED_HIGH: f32 = 0.02;
+const LEAVE_LOW: f32 = 0.2;
+const LEAVE_HIGH: f32 = 0.5;
 
 // The cells a block pass sums, and the fewest cells a box adds from block
 // sums (refine.rs in gamut-gpu).
@@ -241,46 +269,154 @@ fn fs_source_b(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(m.ii_g.z, 0.0, 0.0, 0.0);
 }
 
-// The first gather weighs the classes by the mask as drawn: (q, q I) with q
-// the alpha, and the moments of the mask itself, (p, p p).
+// The seed of the reached field in one cell: the outside as drawn, 1 - Ec[p],
+// with Ec[p] the mean of the alpha over the cell's pixels summed as
+// fs_gather_first sums it.
+@fragment
+fn fs_flood_seed(in: VertexOutput) -> @location(0) vec4<f32> {
+    let span = cell_span(vec2<u32>(in.position.xy));
+    var p = 0.0;
+    for (var y = span.low.y; y < span.high.y; y = y + 1u) {
+        for (var x = span.low.x; x < span.high.x; x = x + 1u) {
+            p = p + textureLoad(alpha, vec2<i32>(i32(x), i32(y)), 0).r;
+        }
+    }
+    return vec4<f32>(1.0 - p / span_count(span), 0.0, 0.0, 0.0);
+}
+
+// The reached field of the cell `direction` times the step from the one at
+// `texel`, weighed by the likeness of the two cells' mean colours: `tex_a`
+// holds the field of the pass before and `tex_b` the source's moments, whose
+// first three are Ec[I]. Reads are held to the grid of the render as the
+// twin clamps them.
+fn likened(texel: vec2<u32>, here: vec3<f32>, direction: vec2<i32>, scale: f32) -> f32 {
+    let at = beside(texel, direction, i32(u.flood_step));
+    let there = textureLoad(tex_b, at, 0).xyz;
+    let d = here - there;
+    let like = exp(-(d.x * d.x + d.y * d.y + d.z * d.z) / scale);
+    return textureLoad(tex_a, at, 0).r * like;
+}
+
+// One pass of the flood at the step `flood_step`: the most of the cell's own
+// field and of the 8 cells a step away across, down and on the diagonals,
+// each weighed by its likeness exp(-|Ec[I](x) - Ec[I](n)|^2 / (2 eps)), in
+// the order of the twin.
+@fragment
+fn fs_flood(in: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = vec2<u32>(in.position.xy);
+    let scale = LIKENESS * u.eps;
+    let here = textureLoad(tex_b, vec2<i32>(texel), 0).xyz;
+    var most = textureLoad(tex_a, vec2<i32>(texel), 0).r;
+    most = max(most, likened(texel, here, vec2<i32>(1, 0), scale));
+    most = max(most, likened(texel, here, vec2<i32>(-1, 0), scale));
+    most = max(most, likened(texel, here, vec2<i32>(0, 1), scale));
+    most = max(most, likened(texel, here, vec2<i32>(0, -1), scale));
+    most = max(most, likened(texel, here, vec2<i32>(1, 1), scale));
+    most = max(most, likened(texel, here, vec2<i32>(1, -1), scale));
+    most = max(most, likened(texel, here, vec2<i32>(-1, 1), scale));
+    most = max(most, likened(texel, here, vec2<i32>(-1, -1), scale));
+    return vec4<f32>(most, 0.0, 0.0, 0.0);
+}
+
+// How much of a pixel the inside class keeps where the reached field is `rf`.
+fn keep_of(rf: f32) -> f32 {
+    return 1.0 - smooth_between(rf, KEEP_LOW, KEEP_HIGH);
+}
+
+// The weight of the inside class at a pixel: the mask so far `q` where the
+// outside does not reach it, and alpha a move added above the mask as drawn
+// `p` whether reached or not.
+fn weight(q: f32, p: f32, keep: f32) -> f32 {
+    return q * keep + max(q - p, 0.0) * (1.0 - keep);
+}
+
+// The first gather weighs the classes by the mask as drawn where the outside
+// does not reach it: (wq, wq I) with wq = p keep, and the moments of the mask
+// itself with the mean of that weight, (p, p p, p keep), which every solve
+// takes the gate of the move from.
 @fragment
 fn fs_gather_first(in: VertexOutput) -> Pair {
     let span = cell_span(vec2<u32>(in.position.xy));
     var q = 0.0;
     var qi = vec3<f32>(0.0);
+    var p = 0.0;
     var pp = 0.0;
+    // The four cells of the reached field last read: the pixels that lie
+    // among the same four read them once.
+    var held = vec4<f32>(-1.0);
+    var rf = vec4<f32>(0.0);
     for (var y = span.low.y; y < span.high.y; y = y + 1u) {
+        let cy = among(y, u.origin.y, u.grid_first.y, u.grid_count.y, u.tile_first.y);
         for (var x = span.low.x; x < span.high.x; x = x + 1u) {
             let at = vec2<i32>(i32(x), i32(y));
+            let cx = among(x, u.origin.x, u.grid_first.x, u.grid_count.x, u.tile_first.x);
+            let cells = vec4<f32>(cx.x, cx.y, cy.x, cy.y);
+            if any(cells != held) {
+                held = cells;
+                rf = corners_r(reached_field, cx, cy);
+            }
             let a = textureLoad(alpha, at, 0).r;
             let g = acescct_encode(textureLoad(working, at, 0).rgb);
-            q = q + a;
-            qi = qi + g * a;
+            let wq = weight(a, a, keep_of(mix_r(rf, cx.z, cy.z)));
+            q = q + wq;
+            qi = qi + g * wq;
+            p = p + a;
             pp = pp + a * a;
         }
     }
     let count = span_count(span);
     var out: Pair;
     out.one = vec4<f32>(q / count, qi / count);
-    out.two = vec4<f32>(q / count, pp / count, 0.0, 0.0);
+    out.two = vec4<f32>(p / count, pp / count, q / count, 0.0);
     return out;
 }
 
-// A later gather weighs them by q, the mask moved at each pixel by what the
-// gather before solved, `tex_a` to `tex_d`: (q, q I). q is taken here and
-// never stored.
+// A later gather weighs them by wq of q, the mask moved at each pixel by what
+// the gather before solved, `tex_a` to `tex_d`: (wq, wq I). q is taken here
+// and never stored. It is moved() at each pixel, the same sums in the same
+// order, with the four cells' texels read once for the pixels that lie among
+// the same four.
 @fragment
 fn fs_gather_moved(in: VertexOutput) -> @location(0) vec4<f32> {
     let span = cell_span(vec2<u32>(in.position.xy));
     var q = 0.0;
     var qi = vec3<f32>(0.0);
+    // The four cells last read in the four solved targets, the reached
+    // field riding in mid's fourth channel: the pixels that lie among the
+    // same four read them once.
+    var held = vec4<f32>(-1.0);
+    var a_s: Corners;
+    var d2_c_p: Corners;
+    var rest: Corners;
+    var mid: Corners;
     for (var y = span.low.y; y < span.high.y; y = y + 1u) {
+        let cy = among(y, u.origin.y, u.grid_first.y, u.grid_count.y, u.tile_first.y);
         for (var x = span.low.x; x < span.high.x; x = x + 1u) {
             let at = vec2<i32>(i32(x), i32(y));
-            let a = moved(vec2<u32>(at)).y;
+            let cx = among(x, u.origin.x, u.grid_first.x, u.grid_count.x, u.tile_first.x);
+            let cells = vec4<f32>(cx.x, cx.y, cy.x, cy.y);
+            if any(cells != held) {
+                held = cells;
+                a_s = corners(tex_a, cx, cy);
+                d2_c_p = corners(tex_b, cx, cy);
+                rest = corners(tex_c, cx, cy);
+                mid = corners(tex_d, cx, cy);
+            }
+            let p = textureLoad(alpha, at, 0).r;
             let g = acescct_encode(textureLoad(working, at, 0).rgb);
-            q = q + a;
-            qi = qi + g * a;
+            let mid_here = mix_corners(mid, cx.z, cy.z);
+            let pqr = moved_from(
+                p,
+                g,
+                mid_here.w,
+                mix_corners(a_s, cx.z, cy.z),
+                mix_corners(d2_c_p, cx.z, cy.z),
+                mix_corners(rest, cx.z, cy.z),
+                mid_here,
+            );
+            let wq = weight(pqr.y, pqr.x, keep_of(pqr.z));
+            q = q + wq;
+            qi = qi + g * wq;
         }
     }
     let count = span_count(span);
@@ -490,9 +626,19 @@ fn both(p: f32, pp: f32) -> f32 {
         * smooth_between(hardness, HARD_LOW, HARD_HIGH);
 }
 
+// bothA, how far the move comes in over a box: both() of the mask's moments,
+// times how much of the inside the outside does not reach, E[p keep], which
+// is gather 1's own mean weight. The same number in every gather: E[p keep]
+// is carried in the mask's means, which no later gather writes.
+fn gate(p: f32, pp: f32, unreached: f32) -> f32 {
+    return both(p, pp) * smooth_between(unreached, UNREACHED_LOW, UNREACHED_HIGH);
+}
+
 // `tex_a` to `tex_c` hold the means of the source's moments, (I, rr),
-// (rg, rb, gg, gb) and (bb); `tex_d` those of the gather, (q, q I); `tex_e`
-// those of the mask, (p, p p).
+// (rg, rb, gg, gb) and (bb); `tex_d` those of the gather, (wq, wq I);
+// `tex_e` those of the mask, (p, p p, p keep). The cell's reached field
+// rides in mid's fourth channel, which holds no solved number, so moved()
+// mixes it from the four cells it reads for mid.
 fn solve(at: vec2<i32>) -> Solved {
     let s0 = textureLoad(tex_a, at, 0);
     let s1 = textureLoad(tex_b, at, 0);
@@ -534,7 +680,7 @@ fn solve(at: vec2<i32>) -> Solved {
         i_rb * delta.x + i_gb * delta.y + i_bb * delta.z,
     );
     let d2 = max(delta.x * a.x + delta.y * a.y + delta.z * a.z, 0.0);
-    let c = smooth_between(d2, SEPARATE_LOW, SEPARATE_HIGH) * both(mask.x, mask.y);
+    let c = smooth_between(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate(mask.x, mask.y, mask.z);
     let over = max(d2, SEPARATION_FLOOR);
     let mid = (mu1 + mu0) / 2.0;
     let s = a.x * mid.x + a.y * mid.y + a.z * mid.z;
@@ -547,7 +693,7 @@ fn solve(at: vec2<i32>) -> Solved {
         i_gb - a.y * a.z / over,
         i_bb - a.z * a.z / over,
     );
-    out.mid = vec4<f32>(mid, 0.0);
+    out.mid = vec4<f32>(mid, textureLoad(reached_field, at, 0).r);
     return out;
 }
 
@@ -599,21 +745,60 @@ fn among(pixel: u32, origin: u32, grid_first: u32, grid_count: u32, tile_first: 
     );
 }
 
+// The texels of the four cells around a pixel in one target: top left, top
+// right, bottom left and bottom right.
+struct Corners {
+    tl: vec4<f32>,
+    tr: vec4<f32>,
+    bl: vec4<f32>,
+    br: vec4<f32>,
+}
+
+fn corners(solved: texture_2d<f32>, x: vec3<f32>, y: vec3<f32>) -> Corners {
+    var c: Corners;
+    c.tl = textureLoad(solved, vec2<i32>(i32(x.x), i32(y.x)), 0);
+    c.tr = textureLoad(solved, vec2<i32>(i32(x.y), i32(y.x)), 0);
+    c.bl = textureLoad(solved, vec2<i32>(i32(x.x), i32(y.y)), 0);
+    c.br = textureLoad(solved, vec2<i32>(i32(x.y), i32(y.y)), 0);
+    return c;
+}
+
+// The four cells' texels mixed at the shares `sx` across and `sy` down.
+fn mix_corners(c: Corners, sx: f32, sy: f32) -> vec4<f32> {
+    let top = c.tl + (c.tr - c.tl) * sx;
+    let bottom = c.bl + (c.br - c.bl) * sx;
+    return top + (bottom - top) * sy;
+}
+
 // One of the four targets of what was solved, mixed from the four cells
 // around a pixel.
 fn mixed(solved: texture_2d<f32>, x: vec3<f32>, y: vec3<f32>) -> vec4<f32> {
-    let tl = textureLoad(solved, vec2<i32>(i32(x.x), i32(y.x)), 0);
-    let tr = textureLoad(solved, vec2<i32>(i32(x.y), i32(y.x)), 0);
-    let bl = textureLoad(solved, vec2<i32>(i32(x.x), i32(y.y)), 0);
-    let br = textureLoad(solved, vec2<i32>(i32(x.y), i32(y.y)), 0);
-    let top = tl + (tr - tl) * x.z;
-    let bottom = bl + (br - bl) * x.z;
-    return top + (bottom - top) * y.z;
+    return mix_corners(corners(solved, x, y), x.z, y.z);
 }
 
-// The mask as drawn moved at the pixel `pixel` of the render. `tex_a` to
-// `tex_d` hold what the gather solved.
-fn moved(pixel: vec2<u32>) -> vec2<f32> {
+// The first channel of the four cells around a pixel, in the order of
+// Corners, and the same mix of them.
+fn corners_r(field: texture_2d<f32>, x: vec3<f32>, y: vec3<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        textureLoad(field, vec2<i32>(i32(x.x), i32(y.x)), 0).r,
+        textureLoad(field, vec2<i32>(i32(x.y), i32(y.x)), 0).r,
+        textureLoad(field, vec2<i32>(i32(x.x), i32(y.y)), 0).r,
+        textureLoad(field, vec2<i32>(i32(x.y), i32(y.y)), 0).r,
+    );
+}
+
+fn mix_r(c: vec4<f32>, sx: f32, sy: f32) -> f32 {
+    let top = c.x + (c.y - c.x) * sx;
+    let bottom = c.z + (c.w - c.z) * sx;
+    return top + (bottom - top) * sy;
+}
+
+// The mask as drawn moved at the pixel `pixel` of the render: p, q and the
+// reached field there. `tex_a` to `tex_d` hold what the gather solved, and
+// `tex_d` the cells' reached field in its fourth channel: mixed from the four
+// cells around the pixel as fs_gather_first mixes it, the same number. A pixel
+// leaves the mask only where the reached field reaches it.
+fn moved(pixel: vec2<u32>) -> vec3<f32> {
     let at = vec2<i32>(pixel);
     let p = textureLoad(alpha, at, 0).r;
     let g = acescct_encode(textureLoad(working, at, 0).rgb);
@@ -623,6 +808,20 @@ fn moved(pixel: vec2<u32>) -> vec2<f32> {
     let d2_c_p = mixed(tex_b, x, y);
     let rest = mixed(tex_c, x, y);
     let mid = mixed(tex_d, x, y);
+    return moved_from(p, g, mid.w, a_s, d2_c_p, rest, mid);
+}
+
+// moved() from the numbers it reads and mixes: p, the guide g, the reached
+// field and the four solved targets mixed at the pixel.
+fn moved_from(
+    p: f32,
+    g: vec3<f32>,
+    rf: f32,
+    a_s: vec4<f32>,
+    d2_c_p: vec4<f32>,
+    rest: vec4<f32>,
+    mid: vec4<f32>,
+) -> vec3<f32> {
     let along = (a_s.x * g.r + a_s.y * g.g + a_s.z * g.b) - a_s.w;
     let est = clamp(0.5 + along / max(d2_c_p.x, SEPARATION_FLOOR), 0.0, 1.0);
     let e = g - mid.xyz;
@@ -632,9 +831,10 @@ fn moved(pixel: vec2<u32>) -> vec2<f32> {
         0.0,
     );
     let on_line = 1.0 - smooth_between(m, LINE_LOW, LINE_HIGH);
-    let out = on_line * (1.0 - smooth_between(est, OUT_LOW, OUT_HIGH));
+    let out = on_line * (1.0 - smooth_between(est, OUT_LOW, OUT_HIGH))
+        * smooth_between(rf, LEAVE_LOW, LEAVE_HIGH);
     let into = on_line * smooth_between(est, IN_LOW, IN_HIGH);
-    return vec2<f32>(p, p + d2_c_p.y * (into * (1.0 - p) - out * p));
+    return vec3<f32>(p, p + d2_c_p.y * (into * (1.0 - p) - out * p), rf);
 }
 
 // The q of the last gather, mixed into p by amount: the refined alpha.
