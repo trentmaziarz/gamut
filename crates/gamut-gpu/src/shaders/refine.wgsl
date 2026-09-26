@@ -146,6 +146,12 @@ const UNREACHED_LOW: f32 = 0.0;
 const UNREACHED_HIGH: f32 = 0.02;
 const LEAVE_LOW: f32 = 0.2;
 const LEAVE_HIGH: f32 = 0.5;
+const KAPPA: f32 = 0.12857144;
+const BETA_LOW: f32 = 0.95;
+const BETA_HIGH: f32 = 1.1;
+const GAIN_LOW: f32 = 0.45;
+const GAIN_HIGH: f32 = 0.6;
+const GAIN_ROOT: f32 = 0.0223607;
 
 // The cells a block pass sums, and the fewest cells a box adds from block
 // sums (refine.rs in gamut-gpu).
@@ -634,11 +640,39 @@ fn gate(p: f32, pp: f32, unreached: f32) -> f32 {
     return both(p, pp) * smooth_between(unreached, UNREACHED_LOW, UNREACHED_HIGH);
 }
 
+// The box's half width against the mask's own ramp, from the means of the
+// mask's moments: E[p] - E[p p] is the box mean of p (1 - p), the ramp is
+// spp (2 b + 1) step / KAPPA pixels wide, and beta is b step over it, with b
+// the box's radius in cells. The twin takes it once a mask; every solve here
+// forms it again from the same means, as it does the gate.
+fn beta_of(p: f32, pp: f32) -> f32 {
+    let spp = max(p - pp, 0.0);
+    let width = spp * f32(2u * u.cells + 1u) * f32(u.step) / KAPPA;
+    return f32(u.cells) * f32(u.step) / max(width, SHARE_FLOOR);
+}
+
+// The gain of the classes: GAIN_ROOT over the length of the class step
+// mu1 - mu0, summed as the twin sums it.
+fn gain_of(delta: vec3<f32>) -> f32 {
+    let apart = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    return GAIN_ROOT / max(apart, SEPARATION_FLOOR);
+}
+
+// How far a gather's move comes in over a soft rim, 0 to 1: 0 where the box
+// is no wider than the mask's ramp and the classes lie close, 1 where the box
+// is wider or the edge strong. A soft rim over a weak edge holds still.
+fn hold(beta: f32, gain: f32) -> f32 {
+    return 1.0
+        - (1.0 - smooth_between(beta, BETA_LOW, BETA_HIGH))
+            * smooth_between(gain, GAIN_LOW, GAIN_HIGH);
+}
+
 // `tex_a` to `tex_c` hold the means of the source's moments, (I, rr),
 // (rg, rb, gg, gb) and (bb); `tex_d` those of the gather, (wq, wq I);
 // `tex_e` those of the mask, (p, p p, p keep). The cell's reached field
 // rides in mid's fourth channel, which holds no solved number, so moved()
-// mixes it from the four cells it reads for mid.
+// mixes it from the four cells it reads for mid. The move c is scaled by
+// hold() of the mask's beta and the gather's own gain, as the twin's solve.
 fn solve(at: vec2<i32>) -> Solved {
     let s0 = textureLoad(tex_a, at, 0);
     let s1 = textureLoad(tex_b, at, 0);
@@ -680,7 +714,10 @@ fn solve(at: vec2<i32>) -> Solved {
         i_rb * delta.x + i_gb * delta.y + i_bb * delta.z,
     );
     let d2 = max(delta.x * a.x + delta.y * a.y + delta.z * a.z, 0.0);
-    let c = smooth_between(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate(mask.x, mask.y, mask.z);
+    let gain = gain_of(delta);
+    let beta = beta_of(mask.x, mask.y);
+    let c = smooth_between(d2, SEPARATE_LOW, SEPARATE_HIGH) * gate(mask.x, mask.y, mask.z)
+        * hold(beta, gain);
     let over = max(d2, SEPARATION_FLOOR);
     let mid = (mu1 + mu0) / 2.0;
     let s = a.x * mid.x + a.y * mid.y + a.z * mid.z;

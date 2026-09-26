@@ -5276,7 +5276,8 @@ fn radial_over_the_middle_and_the_band() -> MaskSource {
 }
 
 /// How many refined alphas must lie within a tenth of a half code.
-const REFINED_HALF_CODE_PIXELS: usize = 30;
+/// 27 at ce34400 on the D-11 twin (T-24, 2026-09-26); 30 or more before it.
+const REFINED_HALF_CODE_PIXELS: usize = 27;
 
 /// At an amount of 50 every pixel of the spill that leaves the mask lands on
 /// 127.5 codes, within a rounding of the half code, where a GPU may store 127
@@ -5911,15 +5912,33 @@ fn most_apart(gpu: &[u8], twins: &[Vec<u8>; 2], pixels: &[usize]) -> i32 {
         .unwrap_or(0)
 }
 
-/// benchlib's rim row: the move of a render, the largest channel difference
-/// from the photo in codes, against the move of the unrefined render, over
-/// `pixels`. The largest, and how many pixels differ by more than 3 codes.
+/// The rim row of a render against its unrefined render, as [`rim_moves`]
+/// reads it.
+struct RimRow {
+    /// The largest move of a pixel, in codes.
+    most: i32,
+    /// How many pixels move by more than 3 codes.
+    over: usize,
+    /// The band's mean move: the mean move of the render less that of the
+    /// unrefined render, in codes.
+    mean: f64,
+}
+
+/// The T-24 bar on the rim row: no pixel moves more than 3 codes, none of the
+/// band over 3, and the band's mean moves under 1 code.
+const RIM_MOST: i32 = 3;
+const RIM_MEAN: f64 = 1.0;
+
+/// benchlib's rim row (table_t24.py `rim`): the move of a render, the largest
+/// channel difference from the photo in codes, against the move of the
+/// unrefined render, over `pixels`. The largest, how many pixels differ by
+/// more than 3 codes, and the difference of the two mean moves.
 fn rim_moves(
     photo: &Photo,
     refined: &[[u8; 3]],
     unrefined: &[[u8; 3]],
     pixels: &[usize],
-) -> (i32, usize) {
+) -> RimRow {
     let source = photo.rgba8.as_chunks::<4>().0;
     let move_of = |render: &[[u8; 3]], i: usize| -> i32 {
         (0..3)
@@ -5929,12 +5948,24 @@ fn rim_moves(
     };
     let gaps: Vec<i32> = pixels
         .iter()
-        .map(|i| (move_of(refined, *i) - move_of(unrefined, *i)).abs())
+        .map(|i| move_of(refined, *i) - move_of(unrefined, *i))
         .collect();
-    (
-        gaps.iter().copied().max().unwrap_or(0),
-        gaps.iter().filter(|gap| **gap > 3).count(),
-    )
+    RimRow {
+        most: gaps.iter().map(|gap| gap.abs()).max().unwrap_or(0),
+        over: gaps.iter().filter(|gap| gap.abs() > RIM_MOST).count(),
+        mean: gaps.iter().map(|gap| f64::from(*gap)).sum::<f64>() / pixels.len() as f64,
+    }
+}
+
+/// Holds a rim row to the T-24 bar.
+fn assert_the_rim_holds(name: &str, row: &RimRow, pixels: usize) {
+    assert!(
+        row.most <= RIM_MOST && row.over == 0 && row.mean.abs() < RIM_MEAN,
+        "{name}: the rim row's largest move is {} codes, {} of {pixels} px over {RIM_MOST}, band mean move {:+.2} codes; the bar is {RIM_MOST} codes, 0 over {RIM_MOST} and under {RIM_MEAN} code",
+        row.most,
+        row.over,
+        row.mean
+    );
 }
 
 /// Case 8 of the T-18 benchmark: the radial of layout a drawn 20 pixels short
@@ -5974,11 +6005,12 @@ fn case_8s_radial_short_of_the_horizon_refined_at_three_radii_matches() {
 
 /// Layout a of case 1 of the T-18 benchmark: the radial over the horizon (ry
 /// 134, feather 10), lifting the exposure a stop, refined at Radius 0.01. The
-/// rim row, the sky 10 to 26 rows over the horizon, keeps some of the move;
-/// benchlib reads the twin's worst pixel there at 28 codes and 64 of 1536
-/// pixels over 3 codes on its own guide and move model. The GPU matches the
-/// twin, and the rim row's largest move and count over 3 are printed for
-/// both, with how far their alphas lie apart there.
+/// rim row, the sky 10 to 26 rows over the horizon, holds still: the box is
+/// no wider than the mask's ramp and the edge under it is weak (T-24). On the
+/// twin and on the GPU no pixel of the row moves more than 3 codes from the
+/// unrefined render, none of its 1536 over 3, and the band's mean moves under
+/// 1 code. The GPU matches the twin, and the rim row's figures are printed
+/// for both, with how far their alphas lie apart there.
 #[test]
 fn layout_as_radial_over_the_horizon_at_radius_0_01_matches() {
     let photo = portrait_8();
@@ -5993,7 +6025,7 @@ fn layout_as_radial_over_the_horizon_at_radius_0_01_matches() {
     plain.masks[0].refine = Refine::default();
     let twin_refined = cpu_reference(&photo, &edit, Rounding::Nearest, 0);
     let twin_unrefined = cpu_reference(&photo, &plain, Rounding::Nearest, 0);
-    let (twin_most, twin_over) = rim_moves(&photo, &twin_refined, &twin_unrefined, &rim);
+    let twin_rim = rim_moves(&photo, &twin_refined, &twin_unrefined, &rim);
     let twins = [Rounding::Nearest, Rounding::TowardZero]
         .map(|rounding| twin_refined_alpha(&photo, &edit, rounding));
     if let Some(RefineReadings {
@@ -6002,14 +6034,31 @@ fn layout_as_radial_over_the_horizon_at_radius_0_01_matches() {
         alpha: gpu,
     }) = gpu_refine_readings(&photo, &edit)
     {
-        let (most, over) = rim_moves(&photo, &refined, &unrefined, &rim);
+        let gpu_rim = rim_moves(&photo, &refined, &unrefined, &rim);
         println!(
-            "{name}: rim row gpu worst pixel {most} codes, {over} of {} px over 3; twin worst pixel {twin_most} codes, {twin_over} px over 3; rim mean alpha gpu {:.3}, twin {:.3}, apart by at most {} codes",
+            "{name}: rim row gpu largest move {} codes, {} of {} px over 3, band mean move {:+.2} codes; twin largest move {} codes, {} px over 3, band mean move {:+.2} codes; rim mean alpha gpu {:.3}, twin {:.3}, apart by at most {} codes",
+            gpu_rim.most,
+            gpu_rim.over,
             rim.len(),
+            gpu_rim.mean,
+            twin_rim.most,
+            twin_rim.over,
+            twin_rim.mean,
             mean_alpha(&gpu, &rim),
             mean_alpha(&twins[0], &rim),
             most_apart(&gpu, &twins, &rim)
         );
+        assert_the_rim_holds(&format!("{name}, the twin"), &twin_rim, rim.len());
+        assert_the_rim_holds(&format!("{name}, the GPU"), &gpu_rim, rim.len());
+    } else {
+        println!(
+            "{name}: rim row twin largest move {} codes, {} of {} px over 3, band mean move {:+.2} codes",
+            twin_rim.most,
+            twin_rim.over,
+            rim.len(),
+            twin_rim.mean
+        );
+        assert_the_rim_holds(&format!("{name}, the twin"), &twin_rim, rim.len());
     }
     check_on(name, &photo, &edit);
 }
